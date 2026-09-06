@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { COMPACTION_ENABLED_CHOICE } from "../src/compaction.ts";
 import implementExtension, { readMarkdownInput } from "../src/index.ts";
+import { STATE_FILE_NAME, deleteState, loadState, saveState, type ImplementationState } from "../src/state.ts";
 import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
 
 type Handler = (event: any, ctx?: any) => void | Promise<void>;
@@ -21,6 +23,7 @@ type GitResult = {
 };
 
 const gitResult = (stdout = "", code = 0, stderr = ""): GitResult => ({ stdout, stderr, code, killed: false });
+const stateExclusion = ":(top,exclude).pi-implement-state.json";
 
 function assertNoRemoteGit(calls: Array<{ command: string; args: string[] }>): void {
 	const forbidden = ["fetch", "pull", "push", "clone", "ls-remote", "remote"];
@@ -39,7 +42,7 @@ async function waitFor(condition: () => boolean): Promise<void> {
 }
 
 async function withTempDir(run: (directory: string) => Promise<void>): Promise<void> {
-	const directory = await mkdtemp(join(process.cwd(), ".implement-test-"));
+	const directory = await mkdtemp(join(tmpdir(), "pi-implement-test-"));
 	try {
 		await run(directory);
 	} finally {
@@ -57,6 +60,8 @@ function fakeRuntime(options: {
 	inputs?: string[];
 	contextUsages?: Array<{ tokens: number | null; contextWindow: number; percent: number | null } | undefined>;
 	compactionOutcomes?: Array<"complete" | "error" | "manual">;
+	ignoreStateChoice?: "Yes" | "No";
+	manualTurns?: boolean;
 }) {
 	const commands = new Map<string, Handler>();
 	const handlers = new Map<string, Handler[]>();
@@ -68,6 +73,7 @@ function fakeRuntime(options: {
 	const workingMessages: Array<string | undefined> = [];
 	const execCalls: Array<{ command: string; args: string[]; cwd?: string }> = [];
 	const inputPrompts: Array<{ title: string; placeholder?: string }> = [];
+	const ignoreStatePrompts: Array<{ title: string; choices: string[] }> = [];
 	const compactCalls: CompactCallbacks[] = [];
 	let contextUsageCalls = 0;
 	const stopReasons = [...(options.turnStopReasons ?? [])];
@@ -78,11 +84,29 @@ function fakeRuntime(options: {
 	const contextUsages = [...(options.contextUsages ?? [])];
 	const compactionOutcomes = [...(options.compactionOutcomes ?? [])];
 	const sessionHistory = [{ role: "user", content: "existing context" }];
+	const pendingTurnReasons: string[] = [];
 
 	const emit = async (name: string, event: unknown = {}) => {
 		for (const handler of handlers.get(name) ?? []) {
 			await handler(event, ctx);
 		}
+	};
+
+	const settleTurn = async (override?: string) => {
+		const queuedStopReason = pendingTurnReasons.shift();
+		const stopReason = override ?? queuedStopReason ?? "stop";
+		await emit("agent_start", { type: "agent_start" });
+		await emit("agent_end", {
+			type: "agent_end",
+			messages: [
+				{
+					role: "assistant",
+					stopReason,
+					errorMessage: stopReason === "error" ? "provider failed" : undefined,
+				},
+			],
+		});
+		await emit("agent_settled", { type: "agent_settled" });
 	};
 
 	const pi = {
@@ -101,21 +125,10 @@ function fakeRuntime(options: {
 		},
 		sendUserMessage(message: string) {
 			sent.push(message);
-			const stopReason = stopReasons.shift() ?? "stop";
-			queueMicrotask(async () => {
-				await emit("agent_start", { type: "agent_start" });
-				await emit("agent_end", {
-					type: "agent_end",
-					messages: [
-						{
-							role: "assistant",
-							stopReason,
-							errorMessage: stopReason === "error" ? "provider failed" : undefined,
-						},
-					],
-				});
-				await emit("agent_settled", { type: "agent_settled" });
-			});
+			pendingTurnReasons.push(stopReasons.shift() ?? "stop");
+			if (!options.manualTurns) {
+				queueMicrotask(() => void settleTurn());
+			}
 		},
 	};
 
@@ -140,6 +153,10 @@ function fakeRuntime(options: {
 				notifications.push({ message, type });
 			},
 			async select(title: string, selectChoices: string[]) {
+				if (title.includes(".pi-implement-state.json")) {
+					ignoreStatePrompts.push({ title, choices: selectChoices });
+					return options.ignoreStateChoice ?? "Yes";
+				}
 				selections.push({ title, choices: selectChoices });
 				const choice = choices.shift();
 				return choice ?? (title === "Automatic compaction between tasks?" ? "No" : undefined);
@@ -181,17 +198,37 @@ function fakeRuntime(options: {
 		ctx,
 		execCalls,
 		inputPrompts,
+		ignoreStatePrompts,
 		notifications,
 		selections,
 		sent,
 		sessionHistory,
 		widgets,
 		workingMessages,
+		settleTurn,
 		async run(command: string, argument: string) {
 			const handler = commands.get(command);
 			assert.ok(handler, `/${command} should be registered`);
 			await handler(argument, ctx);
 		},
+	};
+}
+
+function savedState(overrides: Partial<ImplementationState> = {}): ImplementationState {
+	return {
+		version: 1,
+		workflow: "tasks",
+		sourcePath: "tasks.md",
+		tasks: [
+			{ title: "One", prompt: "saved prompt one" },
+			{ title: "Two", prompt: "saved prompt two" },
+			{ title: "Three", prompt: "saved prompt three" },
+		],
+		nextTaskIndex: 1,
+		status: "running",
+		checkpoint: false,
+		automaticCompaction: false,
+		...overrides,
 	};
 }
 
@@ -215,6 +252,86 @@ test("file handling rejects nonexistent, directory, and empty paths", async () =
 		await assert.rejects(readMarkdownInput("directory", directory, "/implement-tasks"), /not a file/);
 		await writeFile(join(directory, "empty.md"), " \n");
 		await assert.rejects(readMarkdownInput("empty.md", directory, "/implement-tasks"), /is empty/);
+	});
+});
+
+for (const status of ["running", "failed"] as const) {
+	test(`restore resumes ${status} state from the saved task without model preparation`, async () => {
+		await withTempDir(async (directory) => {
+			const state = savedState({ status, error: status === "failed" ? "previous failure" : undefined });
+			await saveState(directory, state);
+			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], gitUnavailable: true });
+
+			await runtime.run("implement-plan", "missing-plan.md");
+
+			assert.deepEqual(runtime.sent, ["saved prompt two", "saved prompt three"]);
+			assert.equal(runtime.completeCalls.length, 0);
+			assert.equal(runtime.execCalls.length, 0);
+			assert.equal(runtime.ignoreStatePrompts.length, 0);
+			assert.match(runtime.selections[0].title, new RegExp(`Status: ${status}`));
+			if (status === "failed") assert.match(runtime.selections[0].title, /Error: previous failure/);
+			assert.equal(await loadState(directory), undefined);
+		});
+	});
+}
+
+test("discard deletes saved state and starts the newly requested workflow", async () => {
+	await withTempDir(async (directory) => {
+		await saveState(directory, savedState());
+		await writeFile(join(directory, "tasks.md"), "## Task 1 - New\nImplement it.");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Discard and start new", "Implement", "No"],
+			modelOutputs: [{ tasks: [{ title: "New" }] }],
+		});
+
+		await runtime.run("implement-tasks", "tasks.md");
+
+		assert.equal(runtime.completeCalls.length, 1);
+		assert.equal(runtime.sent.length, 1);
+		assert.match(runtime.sent[0], /task #1 \("New"\)/);
+		assert.equal(runtime.sent.includes("saved prompt two"), false);
+		assert.equal(runtime.ignoreStatePrompts.length, 1);
+		assert.equal(await loadState(directory), undefined);
+	});
+});
+
+test("restore cancellation leaves state unchanged", async () => {
+	await withTempDir(async (directory) => {
+		const state = savedState({ status: "failed", error: "keep this" });
+		await saveState(directory, state);
+		const before = await readFile(join(directory, STATE_FILE_NAME), "utf8");
+		const runtime = fakeRuntime({ cwd: directory, choices: ["Cancel"] });
+
+		await runtime.run("implement-rewrite", "missing.md");
+
+		assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), before);
+		assert.equal(runtime.completeCalls.length, 0);
+		assert.deepEqual(runtime.sent, []);
+		assert.equal(runtime.ignoreStatePrompts.length, 0);
+	});
+});
+
+test("checkpoint restore validates the saved branch without switching", async () => {
+	await withTempDir(async (directory) => {
+		await saveState(
+			directory,
+			savedState({ checkpoint: true, branchName: "feature/saved", status: "failed", error: "commit failed" }),
+		);
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Resume"],
+			gitResults: [gitResult("feature/other\n")],
+		});
+
+		await runtime.run("implement-tasks", "tasks.md");
+
+		assert.deepEqual(runtime.execCalls.map(({ args }) => args), [["branch", "--show-current"]]);
+		assert.equal(runtime.execCalls.some(({ args }) => args[0] === "switch"), false);
+		assert.deepEqual(runtime.sent, []);
+		assert.equal(runtime.completeCalls.length, 0);
+		assert.ok(runtime.notifications.some(({ message }) => message.includes("expected local branch")));
+		assert.equal((await loadState(directory))?.status, "failed");
 	});
 });
 
@@ -251,7 +368,41 @@ test("/implement-rewrite preserves self-contained rewrite execution", async () =
 		assert.ok(runtime.sent.every((prompt) => prompt.includes("Do not create commits")));
 		assert.deepEqual(runtime.sessionHistory, [{ role: "user", content: "existing context" }]);
 		assert.equal(await readFile(join(directory, "notes.md"), "utf8"), source);
+		assert.deepEqual(runtime.ignoreStatePrompts[0].choices, ["Yes", "No"]);
+		assert.match(await readFile(join(directory, ".gitignore"), "utf8"), /^\.pi-implement-state\.json$/m);
+		assert.equal(await loadState(directory), undefined);
 		assert.ok(runtime.notifications.some(({ message }) => message === "Implementation complete."));
+	});
+});
+
+test("workflow state is saved before each task, advances without Git, and is deleted after success", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", "No"],
+			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
+			manualTurns: true,
+		});
+
+		const execution = runtime.run("implement-tasks", "tasks.md");
+		await waitFor(() => runtime.sent.length === 1);
+		const started = await loadState(directory);
+		assert.equal(started?.workflow, "tasks");
+		assert.equal(started?.status, "running");
+		assert.equal(started?.nextTaskIndex, 0);
+		assert.deepEqual(started?.tasks.map(({ title }) => title), ["One", "Two"]);
+		assert.deepEqual(started?.tasks.map(({ prompt }) => prompt), [runtime.sent[0], runtime.sent[0].replace("#1 (\"One\")", "#2 (\"Two\")")]);
+
+		await runtime.settleTurn();
+		await waitFor(() => runtime.sent.length === 2);
+		const advanced = await loadState(directory);
+		assert.equal(advanced?.status, "running");
+		assert.equal(advanced?.nextTaskIndex, 1);
+
+		await runtime.settleTurn();
+		await execution;
+		assert.equal(await loadState(directory), undefined);
 	});
 });
 
@@ -262,6 +413,8 @@ test("rewrite checkpoint mode creates a local branch and commits only tasks with
 			cwd: directory,
 			choices: ["New local branch + commit after each task", "No"],
 			inputs: ["feature/rewrite-checkpoints"],
+			ignoreStateChoice: "No",
+			manualTurns: true,
 			modelOutputs: [
 				{
 					tasks: [
@@ -281,7 +434,15 @@ test("rewrite checkpoint mode creates a local branch and commits only tasks with
 			],
 		});
 
-		await runtime.run("implement-rewrite", "notes.md");
+		const execution = runtime.run("implement-rewrite", "notes.md");
+		await waitFor(() => runtime.sent.length === 1);
+		await runtime.settleTurn();
+		await waitFor(() => runtime.sent.length === 2);
+		const advanced = await loadState(directory);
+		assert.equal(advanced?.nextTaskIndex, 1);
+		assert.equal(advanced?.status, "running");
+		await runtime.settleTurn();
+		await execution;
 
 		assert.deepEqual(runtime.selections[0].choices, [
 			"Implement only",
@@ -292,10 +453,10 @@ test("rewrite checkpoint mode creates a local branch and commits only tasks with
 			["rev-parse", "--is-inside-work-tree"],
 			["status", "--porcelain"],
 			["switch", "-c", "feature/rewrite-checkpoints"],
-			["status", "--porcelain"],
-			["add", "-A"],
-			["commit", "-m", "Task 1: One"],
-			["status", "--porcelain"],
+			["status", "--porcelain", "--", ".", stateExclusion],
+			["add", "-A", "--", ".", stateExclusion],
+			["commit", "-m", "Task 1: One", "--", ".", stateExclusion],
+			["status", "--porcelain", "--", ".", stateExclusion],
 		]);
 		assert.equal(runtime.sent.length, 2);
 		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 1);
@@ -350,6 +511,13 @@ test("Git checkpoint failure stops rewrite execution before the next task", asyn
 
 		assert.equal(runtime.sent.length, 1);
 		assert.ok(runtime.notifications.some(({ message }) => message.includes("Git commit failed")));
+		const saved = await loadState(directory);
+		assert.equal(saved?.workflow, "rewrite");
+		assert.equal(saved?.nextTaskIndex, 0);
+		assert.equal(saved?.status, "failed");
+		assert.equal(saved?.error, "Git commit failed: commit failed");
+		assert.equal(saved?.branchName, "feature/rewrite-failure");
+		assert.match(saved?.tasks[1].prompt ?? "", /Instructions:\nImplement two\./);
 		assertNoRemoteGit(runtime.execCalls);
 	});
 });
@@ -405,7 +573,12 @@ test("rewrite compaction failure stops execution and never compacts after the fi
 		await failed.run("implement-rewrite", "notes.md");
 		assert.equal(failed.sent.length, 1);
 		assert.ok(failed.notifications.some(({ message }) => message.includes("compaction failed")));
+		const saved = await loadState(directory);
+		assert.equal(saved?.status, "failed");
+		assert.equal(saved?.nextTaskIndex, 1);
+		assert.equal(saved?.error, "compaction failed");
 
+		await deleteState(directory);
 		const finalTask = fakeRuntime({
 			cwd: directory,
 			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
@@ -542,10 +715,10 @@ test("checkpoint mode creates a local branch and commits only successful tasks w
 			["rev-parse", "--is-inside-work-tree"],
 			["status", "--porcelain"],
 			["switch", "-c", "feature/local-checkpoints"],
-			["status", "--porcelain"],
-			["add", "-A"],
-			["commit", "-m", "Task 1: One"],
-			["status", "--porcelain"],
+			["status", "--porcelain", "--", ".", stateExclusion],
+			["add", "-A", "--", ".", stateExclusion],
+			["commit", "-m", "Task 1: One", "--", ".", stateExclusion],
+			["status", "--porcelain", "--", ".", stateExclusion],
 		]);
 		assert.equal(runtime.sent.length, 2);
 		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 1);
@@ -575,6 +748,10 @@ test("Git checkpoint failure stops before the next task", async () => {
 
 		assert.equal(runtime.sent.length, 1);
 		assert.ok(runtime.notifications.some(({ message }) => message.includes("Git commit failed")));
+		const saved = await loadState(directory);
+		assert.equal(saved?.status, "failed");
+		assert.equal(saved?.nextTaskIndex, 0);
+		assert.match(saved?.error ?? "", /Git commit failed/);
 		assertNoRemoteGit(runtime.execCalls);
 	});
 });
@@ -611,6 +788,10 @@ test("/implement-tasks stops after failure and does not start a subsequent task"
 		assert.equal(runtime.sent.length, 2);
 		assert.ok(runtime.widgets.some((lines) => lines?.some((line) => line.includes("✗") && line.includes("Two"))));
 		assert.ok(runtime.notifications.some(({ message }) => message.includes("Implementation stopped")));
+		const saved = await loadState(directory);
+		assert.equal(saved?.status, "failed");
+		assert.equal(saved?.nextTaskIndex, 1);
+		assert.equal(saved?.error, "provider failed");
 	});
 });
 
@@ -659,6 +840,10 @@ test("compaction failure stops before the next task", async () => {
 		assert.ok(runtime.notifications.some(({ message }) => message.includes("compaction failed")));
 		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("✓") && line.includes("One")));
 		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("○") && line.includes("Two")));
+		const saved = await loadState(directory);
+		assert.equal(saved?.status, "failed");
+		assert.equal(saved?.nextTaskIndex, 1);
+		assert.equal(saved?.error, "compaction failed");
 	});
 });
 

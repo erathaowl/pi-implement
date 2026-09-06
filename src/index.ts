@@ -16,6 +16,14 @@ import {
 	writeGeneratedTaskDocument,
 } from "./plan.ts";
 import { buildRewritePrompt, extractRewritePlan } from "./rewrite.ts";
+import {
+	STATE_FILE_NAME,
+	addStateFileToGitignore,
+	deleteState,
+	loadState,
+	saveState,
+	type ImplementationState,
+} from "./state.ts";
 import { buildTaskFilePrompt, indexTaskFile } from "./tasks.ts";
 
 const PROGRESS_WIDGET = "implement-progress";
@@ -24,6 +32,7 @@ const GIT_CHECKPOINT_CHOICE = "New local branch + commit after each task";
 type ExecutionOptions = {
 	checkpoint: boolean;
 	automaticCompaction: boolean;
+	branchName?: string;
 };
 
 type TitledTaskList = {
@@ -137,35 +146,64 @@ function updateProgressUi(
 	}
 }
 
+async function saveFailure(
+	ctx: ExtensionCommandContext,
+	commandName: string,
+	state: ImplementationState,
+	nextTaskIndex: number,
+	error: unknown,
+): Promise<void> {
+	const message = error instanceof Error ? error.message : String(error);
+	state.nextTaskIndex = nextTaskIndex;
+	state.status = "failed";
+	state.error = message;
+	try {
+		await saveState(ctx.cwd, state);
+		report(ctx, commandName, `Implementation stopped: ${message}`, "error");
+	} catch (saveError) {
+		report(
+			ctx,
+			commandName,
+			`Implementation stopped: ${message}. ${saveError instanceof Error ? saveError.message : String(saveError)}`,
+			"error",
+		);
+	}
+}
+
 async function executeTaskSet(
 	commandName: string,
 	progressTitle: string,
-	tasks: TitledTaskList,
-	prompts: readonly string[],
 	ctx: ExtensionCommandContext,
 	executor: ActiveSessionExecutor,
 	git: LocalGit,
-	options: ExecutionOptions,
+	state: ImplementationState,
 ): Promise<void> {
-	const statuses: TaskStatus[] = prompts.map(() => "pending");
+	const tasks = { tasks: state.tasks };
+	const statuses: TaskStatus[] = state.tasks.map((_, index) =>
+		index < state.nextTaskIndex ? "completed" : "pending",
+	);
 	const update = () => updateProgressUi(ctx, progressTitle, tasks, statuses);
 	update();
 
-	for (let index = 0; index < prompts.length; index++) {
+	for (let index = state.nextTaskIndex; index < state.tasks.length; index++) {
 		statuses[index] = "running";
 		update();
+		state.nextTaskIndex = index;
+		state.status = "running";
+		delete state.error;
+		try {
+			await saveState(ctx.cwd, state);
+		} catch (error) {
+			report(ctx, commandName, error instanceof Error ? error.message : String(error), "error");
+			return;
+		}
 
 		try {
-			await executor.execute(prompts[index]);
+			await executor.execute(state.tasks[index].prompt);
 		} catch (error) {
 			statuses[index] = "failed";
 			update();
-			report(
-				ctx,
-				commandName,
-				`Implementation stopped: ${error instanceof Error ? error.message : String(error)}`,
-				"error",
-			);
+			await saveFailure(ctx, commandName, state, index, error);
 			return;
 		}
 
@@ -173,31 +211,46 @@ async function executeTaskSet(
 		update();
 
 		try {
-			if (options.checkpoint && (await git.hasChanges(ctx.cwd))) {
-				const title = tasks.tasks[index].title.replace(/\s+/g, " ").trim();
+			if (state.checkpoint && (await git.hasChanges(ctx.cwd))) {
+				const title = state.tasks[index].title.replace(/\s+/g, " ").trim();
 				await git.commitChanges(ctx.cwd, `Task ${index + 1}: ${title}`);
 			}
+		} catch (error) {
+			await saveFailure(ctx, commandName, state, index, error);
+			return;
+		}
 
-			if (index + 1 < prompts.length) {
+		state.nextTaskIndex = index + 1;
+		state.status = "running";
+		delete state.error;
+		try {
+			await saveState(ctx.cwd, state);
+		} catch (error) {
+			report(ctx, commandName, error instanceof Error ? error.message : String(error), "error");
+			return;
+		}
+
+		if (index + 1 < state.tasks.length) {
+			try {
 				await compactIfNeeded(
 					ctx,
-					options.automaticCompaction,
+					state.automaticCompaction,
 					DEFAULT_COMPACTION_THRESHOLD_PERCENT,
 					index + 2,
 				);
+			} catch (error) {
+				await saveFailure(ctx, commandName, state, index + 1, error);
+				return;
 			}
-		} catch (error) {
-			report(
-				ctx,
-				commandName,
-				`Implementation stopped: ${error instanceof Error ? error.message : String(error)}`,
-				"error",
-			);
-			return;
 		}
 	}
 
-	report(ctx, commandName, "Implementation complete.", "info");
+	try {
+		await deleteState(ctx.cwd);
+		report(ctx, commandName, "Implementation complete.", "info");
+	} catch (error) {
+		report(ctx, commandName, error instanceof Error ? error.message : String(error), "error");
+	}
 }
 
 async function selectExecutionOptions(
@@ -228,8 +281,9 @@ async function selectExecutionOptions(
 		return undefined;
 	}
 
+	let branchName: string | undefined;
 	if (checkpoint) {
-		const branchName = (await ctx.ui.input("New local branch name", "feature/task-checkpoints"))?.trim();
+		branchName = (await ctx.ui.input("New local branch name", "feature/task-checkpoints"))?.trim();
 		if (!branchName) {
 			return undefined;
 		}
@@ -239,6 +293,27 @@ async function selectExecutionOptions(
 	return {
 		checkpoint,
 		automaticCompaction: compactionChoice === COMPACTION_ENABLED_CHOICE,
+		branchName,
+	};
+}
+
+function createImplementationState(
+	workflow: ImplementationState["workflow"],
+	sourcePath: string,
+	tasks: TitledTaskList,
+	prompts: readonly string[],
+	options: ExecutionOptions,
+): ImplementationState {
+	return {
+		version: 1,
+		workflow,
+		sourcePath,
+		tasks: tasks.tasks.map((task, index) => ({ title: task.title, prompt: prompts[index] })),
+		nextTaskIndex: 0,
+		status: "running",
+		checkpoint: options.checkpoint,
+		automaticCompaction: options.automaticCompaction,
+		branchName: options.branchName,
 	};
 }
 
@@ -247,6 +322,7 @@ async function runRewriteWorkflow(
 	ctx: ExtensionCommandContext,
 	executor: ActiveSessionExecutor,
 	git: LocalGit,
+	ignoreStateFile: boolean,
 ): Promise<void> {
 	const commandName = "/implement-rewrite";
 	const isRepository = await git.isRepository(ctx.cwd);
@@ -264,15 +340,17 @@ async function runRewriteWorkflow(
 		return;
 	}
 
+	if (ignoreStateFile) {
+		await addStateFileToGitignore(ctx.cwd);
+	}
+	const prompts = plan.tasks.map(buildRewritePrompt);
 	await executeTaskSet(
 		commandName,
 		"Rewrite implementation",
-		plan,
-		plan.tasks.map(buildRewritePrompt),
 		ctx,
 		executor,
 		git,
-		options,
+		createImplementationState("rewrite", input.sourcePath, plan, prompts, options),
 	);
 }
 
@@ -281,6 +359,7 @@ export async function runTasksWorkflow(
 	ctx: ExtensionCommandContext,
 	executor: ActiveSessionExecutor,
 	git: LocalGit,
+	ignoreStateFile: boolean,
 ): Promise<void> {
 	const commandName = "/implement-tasks";
 	const isRepository = await git.isRepository(ctx.cwd);
@@ -298,16 +377,68 @@ export async function runTasksWorkflow(
 		return;
 	}
 
+	if (ignoreStateFile) {
+		await addStateFileToGitignore(ctx.cwd);
+	}
+	const prompts = taskIndex.tasks.map((task, index) => buildTaskFilePrompt(input.sourcePath, index + 1, task));
 	await executeTaskSet(
 		commandName,
 		"Task-file implementation",
-		taskIndex,
-		taskIndex.tasks.map((task, index) => buildTaskFilePrompt(input.sourcePath, index + 1, task)),
 		ctx,
 		executor,
 		git,
-		options,
+		createImplementationState("tasks", input.sourcePath, taskIndex, prompts, options),
 	);
+}
+
+function formatRestorePrompt(state: ImplementationState): string {
+	const taskNumber = Math.min(state.nextTaskIndex + 1, state.tasks.length);
+	const lines = [
+		"Unfinished implementation found",
+		`Workflow: /implement-${state.workflow}`,
+		`Task: ${taskNumber}/${state.tasks.length}`,
+		`Status: ${state.status}`,
+	];
+	if (state.error) {
+		lines.push(`Error: ${state.error}`);
+	}
+	return lines.join("\n");
+}
+
+async function handleExistingState(
+	requestedCommand: string,
+	ctx: ExtensionCommandContext,
+	executor: ActiveSessionExecutor,
+	git: LocalGit,
+): Promise<boolean> {
+	const state = await loadState(ctx.cwd);
+	if (!state) {
+		return false;
+	}
+
+	const choice = await ctx.ui.select(formatRestorePrompt(state), ["Resume", "Discard and start new", "Cancel"]);
+	if (choice === "Discard and start new") {
+		await deleteState(ctx.cwd);
+		return false;
+	}
+	if (choice !== "Resume") {
+		report(ctx, requestedCommand, "Implementation resume cancelled.", "info");
+		return true;
+	}
+
+	if (state.checkpoint) {
+		const currentBranch = await git.currentBranch(ctx.cwd);
+		if (currentBranch !== state.branchName) {
+			throw new Error(
+				`Cannot resume: expected local branch ${JSON.stringify(state.branchName)}, but current branch is ${JSON.stringify(currentBranch || "detached HEAD")}. Switch branches manually and try again.`,
+			);
+		}
+	}
+
+	const commandName = state.workflow === "rewrite" ? "/implement-rewrite" : "/implement-tasks";
+	const progressTitle = state.workflow === "rewrite" ? "Rewrite implementation" : "Task-file implementation";
+	await executeTaskSet(commandName, progressTitle, ctx, executor, git, state);
+	return true;
 }
 
 export default function implementExtension(pi: ExtensionAPI): void {
@@ -323,7 +454,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 	const runCommand = async (
 		commandName: string,
 		ctx: ExtensionCommandContext,
-		workflow: () => Promise<void>,
+		workflow: (ignoreStateFile: boolean) => Promise<void>,
 	): Promise<void> => {
 		if (!ctx.hasUI) {
 			report(ctx, commandName, `${commandName} requires an interactive UI for confirmation.`, "error");
@@ -341,7 +472,11 @@ export default function implementExtension(pi: ExtensionAPI): void {
 		workflowRunning = true;
 		ctx.ui.setWidget(PROGRESS_WIDGET, undefined);
 		try {
-			await workflow();
+			if (await handleExistingState(commandName, ctx, executor, git)) {
+				return;
+			}
+			const ignoreStateFile = await ctx.ui.select(`Add ${STATE_FILE_NAME} to .gitignore?`, ["Yes", "No"]);
+			await workflow(ignoreStateFile === "Yes");
 		} catch (error) {
 			report(ctx, commandName, error instanceof Error ? error.message : String(error), "error");
 		} finally {
@@ -353,25 +488,25 @@ export default function implementExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("implement-rewrite", {
 		description: "Rewrite Markdown into self-contained tasks and implement them sequentially",
 		handler: async (args, ctx) =>
-			runCommand("/implement-rewrite", ctx, async () => {
+			runCommand("/implement-rewrite", ctx, async (ignoreStateFile) => {
 				const input = await readMarkdownInput(args, ctx.cwd, "/implement-rewrite");
-				await runRewriteWorkflow(input, ctx, executor, git);
+				await runRewriteWorkflow(input, ctx, executor, git, ignoreStateFile);
 			}),
 	});
 
 	pi.registerCommand("implement-tasks", {
 		description: "Implement tasks sequentially from an authoritative Markdown task file",
 		handler: async (args, ctx) =>
-			runCommand("/implement-tasks", ctx, async () => {
+			runCommand("/implement-tasks", ctx, async (ignoreStateFile) => {
 				const input = await readMarkdownInput(args, ctx.cwd, "/implement-tasks");
-				await runTasksWorkflow(input, ctx, executor, git);
+				await runTasksWorkflow(input, ctx, executor, git, ignoreStateFile);
 			}),
 	});
 
 	pi.registerCommand("implement-plan", {
 		description: "Convert a plan to tasks.md and implement it through the task-file workflow",
 		handler: async (args, ctx) =>
-			runCommand("/implement-plan", ctx, async () => {
+			runCommand("/implement-plan", ctx, async (ignoreStateFile) => {
 				const input = await readMarkdownInput(args, ctx.cwd, "/implement-plan");
 				if (!ctx.model) {
 					throw new Error("No model is selected.");
@@ -397,6 +532,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 					ctx,
 					executor,
 					git,
+					ignoreStateFile,
 				);
 			}),
 	});

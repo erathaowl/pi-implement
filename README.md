@@ -60,11 +60,17 @@ Before implementation, each workflow shows the detected task titles and offers *
 
 Input Markdown files are read-only. `/implement-plan` is the sole exception in that it intentionally creates or overwrites `tasks.md` after confirmation.
 
+## Recovery
+
+New implementation workflows ask whether `.pi-implement-state.json` should be listed in the repository-root `.gitignore`, with **Yes** as the default. The file stores only prepared task titles and prompts, the next task index, status, and the selected Git/compaction options. Writes are atomic, and extension-created Git checkpoints always exclude the state file independently of `.gitignore`.
+
+If a workflow is interrupted or fails, starting any implementation command offers **Resume**, **Discard and start new**, or **Cancel** before model extraction or plan conversion. Resume uses the saved prompts without repeating extraction or indexing. A task interrupted while running is rerun; a task completed before a compaction failure is not. Git checkpoint restores require the current branch to match the saved branch and never switch it automatically. State is deleted after complete success and preserved after failure or interruption.
+
 No dedicated task-file schema is required. Headings, checklists, numbered sections, and prose instructions are interpreted semantically by the selected model.
 
 ## Scope
 
-The extension provides preview/cancel, sequential execution, in-memory progress, stop-on-failure behavior, optional local Git checkpoints, and optional 70% context-aware compaction for task-file workflows. It does not provide task editing or reordering, persistence or resume, retries, parallelism, subagents, dependency graphs, model selection, or remote Git automation.
+The extension provides preview/cancel, sequential execution, in-memory progress, minimal single-file recovery, stop-on-failure behavior, optional local Git checkpoints, and optional 70% context-aware compaction for rewrite and task-file workflows. It does not provide task editing or reordering, state history or snapshots, retries, parallelism, subagents, dependency graphs, model selection, or remote Git automation.
 
 An interactive UI (TUI or RPC UI) is required so execution can be confirmed.
 

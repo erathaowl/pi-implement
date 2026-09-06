@@ -513,6 +513,259 @@ Run the full test suite and TypeScript typecheck after implementation.
 
 Keep the change focused: reuse the existing Git, compaction, executor, progress, and UI code rather than adding parallel implementations.
 
+## Task 5 - Add minimal workflow state save and restore
+
+Add lightweight recovery for interrupted `/implement-rewrite` and `/implement-tasks` workflows.
+
+`/implement-plan` inherits this behavior when it delegates to `/implement-tasks`.
+
+Keep the implementation minimal. Do not add a persistence framework, history, snapshots, multiple state files, retries, or new runtime dependencies.
+
+### State file
+
+Use one fixed state file in the repository root:
+
+```text
+.pi-implement-state.json
+```
+
+At the beginning of a new implementation workflow, ask whether this file should be added to `.gitignore`.
+
+Default choice: **Yes**.
+
+If selected:
+- add the exact filename only if it is not already ignored/listed;
+- do not add duplicate entries.
+
+The state file itself must never be included in workflow Git checkpoints, even if the user chooses not to add it to `.gitignore`.
+
+Delete the state file after the complete workflow finishes successfully.
+
+Do not delete it after an error or interruption.
+
+### State module
+
+Add one small isolated module, for example:
+
+```text
+src/state.ts
+```
+
+with only the necessary operations, such as:
+
+```typescript
+loadState(cwd)
+saveState(cwd, state)
+deleteState(cwd)
+```
+
+Use plain JSON and Node built-ins only.
+
+Prefer atomic writes using a temporary file followed by rename.
+
+### Minimal saved state
+
+Persist only what is necessary to resume deterministically.
+
+A suitable shape is:
+
+```typescript
+interface ImplementationState {
+    version: 1;
+    workflow: "rewrite" | "tasks";
+    sourcePath: string;
+    tasks: {
+        title: string;
+        prompt: string;
+    }[];
+    nextTaskIndex: number;
+    status: "running" | "failed";
+    error?: string;
+    checkpoint: boolean;
+    automaticCompaction: boolean;
+    branchName?: string;
+}
+```
+
+Saving the prepared prompts is intentional:
+
+- `/implement-rewrite` must not repeat model extraction on restore;
+- `/implement-tasks` must not repeat indexing unnecessarily;
+- restore should resume exactly the task sequence that originally started.
+
+Do not persist session history or model responses beyond these prepared prompts.
+
+### Saving progress
+
+Integrate state handling into the existing shared sequential task runner.
+
+Before task N starts:
+
+```text
+status = running
+nextTaskIndex = N
+error = undefined
+save state
+```
+
+Then execute the task.
+
+If task execution fails:
+
+```text
+status = failed
+nextTaskIndex = N
+error = task execution error
+save state
+stop
+```
+
+Task completion must work correctly whether Git checkpointing is enabled or disabled.
+
+If Git checkpointing is disabled:
+
+- successful completion of the agent turn is sufficient to advance to the next task.
+
+If Git checkpointing is enabled:
+
+- perform the optional task commit first;
+- advance to the next task only after the required Git checkpoint succeeds.
+
+After successful completion of task N:
+
+```text
+nextTaskIndex = N + 1
+status = running
+error = undefined
+save state
+```
+
+Then perform optional between-task compaction.
+
+If compaction fails:
+
+```text
+status = failed
+nextTaskIndex = N + 1
+error = compaction error
+save state
+stop
+```
+
+The completed task must not be repeated on restore merely because compaction failed afterward.
+
+If a Git checkpoint operation fails:
+
+- keep `nextTaskIndex` on the current task;
+- save the Git error;
+- stop the workflow.
+
+After the final task and all required post-task actions complete successfully:
+
+```text
+delete .pi-implement-state.json
+```
+
+### Restore behavior
+
+When `/implement-rewrite`, `/implement-tasks`, or `/implement-plan` starts, check for `.pi-implement-state.json` before performing extraction, indexing, or plan conversion.
+
+If no state exists, continue normally.
+
+If state exists, show a minimal prompt similar to:
+
+```text
+Unfinished implementation found
+
+Workflow: /implement-tasks
+Task: 3/5
+Status: failed
+Error: ...
+
+Resume
+Discard and start new
+Cancel
+```
+
+#### Resume
+
+Resume using the saved:
+
+- workflow type;
+- prepared task prompts;
+- task titles;
+- `nextTaskIndex`;
+- Git checkpoint setting;
+- compaction setting;
+- branch name when applicable.
+
+Do not redo extraction/indexing.
+
+If Git checkpoint mode was enabled, verify that the current local branch matches the saved branch before resuming.
+
+If it does not match, stop with a clear error. Do not switch branches automatically.
+
+Do not require Git for restore when checkpoint mode was disabled.
+
+#### Discard and start new
+
+Delete the existing state file and continue with the newly requested workflow normally.
+
+#### Cancel
+
+Leave the state file unchanged and return.
+
+### Git safety
+
+Keep all existing Git behavior strictly local.
+
+Ensure `.pi-implement-state.json` cannot be staged by the extension's checkpoint operation, independently of `.gitignore`.
+
+Do not add remote Git operations.
+
+### Interruption semantics
+
+A state left with:
+
+```text
+status = running
+```
+
+means the workflow was interrupted while that task was in progress.
+
+On restore, rerun that task.
+
+Do not attempt to infer whether a partially executed task actually completed by inspecting files, Git history, or assistant text.
+
+This deliberate behavior keeps recovery deterministic and minimal.
+
+### Tests
+
+Add focused tests for:
+
+- initial state creation;
+- state update when a task starts;
+- advancing state after successful task execution without Git;
+- advancing only after successful checkpoint when Git is enabled;
+- recording agent errors;
+- recording Git errors;
+- recording compaction errors while preserving the already completed task;
+- state deletion after full success;
+- state preservation after failure;
+- restore from `running`;
+- restore from `failed`;
+- discard and restart;
+- cancel without modifying state;
+- restore without repeating rewrite extraction or task indexing;
+- saved Git branch validation;
+- operation without Git checkpoint mode;
+- `.gitignore` prompt defaulting to Yes;
+- no duplicate `.gitignore` entry;
+- state file never being included in Git checkpoints.
+
+Update the README briefly to document save/restore behavior and the `.pi-implement-state.json` file.
+
+Run the full test suite and TypeScript typecheck after implementation.
 
 ---
 

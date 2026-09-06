@@ -1,9 +1,11 @@
 import type { ExecResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { STATE_FILE_NAME } from "./state.ts";
 
 export interface LocalGit {
 	isRepository(cwd: string): Promise<boolean>;
 	isWorkingTreeClean(cwd: string): Promise<boolean>;
 	createBranch(cwd: string, branchName: string): Promise<void>;
+	currentBranch(cwd: string): Promise<string>;
 	hasChanges(cwd: string): Promise<boolean>;
 	commitChanges(cwd: string, message: string): Promise<void>;
 }
@@ -23,8 +25,15 @@ export function createLocalGit(exec: Exec): LocalGit {
 		return result;
 	};
 
-	const status = async (cwd: string): Promise<string> =>
-		(await run(cwd, ["status", "--porcelain"], "status check")).stdout.trim();
+	const stateExclusion = `:(top,exclude)${STATE_FILE_NAME}`;
+	const status = async (cwd: string, excludeState = false): Promise<string> =>
+		(
+			await run(
+				cwd,
+				excludeState ? ["status", "--porcelain", "--", ".", stateExclusion] : ["status", "--porcelain"],
+				"status check",
+			)
+		).stdout.trim();
 
 	return {
 		async isRepository(cwd) {
@@ -44,13 +53,17 @@ export function createLocalGit(exec: Exec): LocalGit {
 			await run(cwd, ["switch", "-c", branchName], "branch creation");
 		},
 
+		async currentBranch(cwd) {
+			return (await run(cwd, ["branch", "--show-current"], "branch check")).stdout.trim();
+		},
+
 		async hasChanges(cwd) {
-			return (await status(cwd)) !== "";
+			return (await status(cwd, true)) !== "";
 		},
 
 		async commitChanges(cwd, message) {
-			await run(cwd, ["add", "-A"], "staging");
-			await run(cwd, ["commit", "-m", message], "commit");
+			await run(cwd, ["add", "-A", "--", ".", stateExclusion], "staging");
+			await run(cwd, ["commit", "-m", message, "--", ".", stateExclusion], "commit");
 		},
 	};
 }
