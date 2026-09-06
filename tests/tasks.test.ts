@@ -51,7 +51,7 @@ test("extraction uses the selected standalone model boundary without tools or se
 	assert.equal(context.messages.length, 1);
 	assert.equal(context.messages[0].content[0].text, markdown);
 	assert.equal("tools" in context, false);
-	assert.equal(options.toolChoice, "none");
+	assert.equal("toolChoice" in options, false);
 	assert.equal(options.cacheRetention, "none");
 	assert.deepEqual(activeSessionHistory, [{ role: "user", content: "existing conversation" }]);
 });
@@ -76,6 +76,12 @@ for (const [style, markdown] of [
 		assert.deepEqual(await extractImplementationPlan(markdown, ctx as never), expected);
 	});
 }
+
+test("extraction prompt propagates applicable shared requirements into each task", () => {
+	assert.match(TASK_EXTRACTION_PROMPT, /document-level constraints/);
+	assert.match(TASK_EXTRACTION_PROMPT, /acceptance criteria/);
+	assert.match(TASK_EXTRACTION_PROMPT, /Repeat each applicable shared requirement in every affected task/);
+});
 
 test("accepts a JSON fenced response", async () => {
 	const { ctx } = extractionContext(

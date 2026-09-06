@@ -90,8 +90,8 @@ test("active-session execution settles only on agent_settled", async () => {
 	assert.match(sent[0], /Complete only this task/);
 });
 
-test("active-session lifecycle rejects error and cancellation stop reasons", async () => {
-	for (const stopReason of ["error", "aborted", "length"]) {
+test("active-session lifecycle treats every non-stop reason, including toolUse, as failure", async () => {
+	for (const stopReason of ["error", "aborted", "length", "toolUse"]) {
 		const executor = new ActiveSessionTaskExecutor(() => {});
 		const execution = executor.execute(plan.tasks[0]);
 		executor.onAgentStart();

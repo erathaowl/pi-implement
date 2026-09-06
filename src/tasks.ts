@@ -16,6 +16,8 @@ For each task provide:
 - a short title
 - the complete instructions necessary to execute it
 Preserve important technical details from the source document.
+Make every task independently executable: include the document-level constraints, acceptance criteria, shared requirements, validation expectations, and scope limits that apply to it, even when they are stated elsewhere in the document.
+Repeat each applicable shared requirement in every affected task instead of assuming the executor can see the source document or other tasks.
 Do not invent tasks or requirements.
 Do not omit implementation-relevant details.
 Do not split closely related steps unnecessarily.
@@ -118,7 +120,6 @@ export async function extractImplementationPlan(
 		},
 		{
 			cacheRetention: "none",
-			toolChoice: "none",
 		},
 	)) as ModelResponse;
 

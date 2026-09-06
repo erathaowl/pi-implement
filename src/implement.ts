@@ -56,7 +56,7 @@ function turnError(message: AssistantTurn | undefined): Error | undefined {
 	}
 
 	const stopReason = typeof message.stopReason === "string" ? message.stopReason : "unknown";
-	if (stopReason === "stop" || stopReason === "toolUse") {
+	if (stopReason === "stop") {
 		return undefined;
 	}
 	if (stopReason === "aborted") {

@@ -29,9 +29,9 @@ For example:
 /implement docs/tasks.md
 ```
 
-The command reads the file, uses an isolated completion with the currently selected model to identify the ordered implementation tasks, and shows the detected titles for confirmation. Choosing **Implement** submits each task as a separate normal instruction to the active pi session. It waits for the complete agent turn—including tool execution, retries, and compaction—before starting the next task. It stops on the first failed, truncated, or cancelled turn.
+The command reads the file, uses an isolated completion with the currently selected model to identify the ordered implementation tasks, and shows the detected titles for confirmation. Choosing **Implement** submits each task as a separate normal instruction to the active pi session. It waits for the complete agent turn—including tool execution, retries, and compaction—before starting the next task. Only a normal `stop` reason marks a task complete; any other terminal reason stops the workflow.
 
-Task extraction is separate from the active session: it sends only the extraction prompt and Markdown to `ModelRegistry.complete`, supplies no tools (`toolChoice: "none"`), and does not add its prompt or response to conversation history. The provider-neutral extension API does not expose one structured-response format across every provider, so the command requests JSON text and validates it before showing the preview.
+Task extraction is separate from the active session: it sends only the extraction prompt and Markdown to `ModelRegistry.complete`, omits tools from the model context, and does not add its prompt or response to conversation history. Applicable document-wide constraints, acceptance criteria, and shared requirements are repeated in each affected task so it can be executed independently. The provider-neutral extension API does not expose one structured-response format across every provider, so the command requests JSON text and validates it before showing the preview.
 
 The source Markdown file is read-only. The extension does not edit it or persist workflow status.
 
@@ -67,4 +67,5 @@ An interactive UI (TUI or RPC UI) is required so execution can be confirmed.
 
 ```bash
 npm test
+npm run typecheck
 ```
