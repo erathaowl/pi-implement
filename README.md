@@ -40,6 +40,8 @@ If the current directory is a Git repository, the preview offers either normal i
 
 Git operations owned by this extension are strictly local: repository detection, status checks, local branch creation, staging, and commits. The extension never fetches, pulls, pushes, clones, or modifies remotes. Task prompts also tell the active agent not to perform remote Git operations or create commits itself.
 
+Before task execution, `/implement-tasks` also asks whether automatic between-task compaction should be enabled. When enabled, it checks context usage after each successful task except the last. Usage above 70% triggers pi's normal compaction, which must finish before the next task starts. Unavailable usage or usage at or below 70% is skipped; compaction failure stops the workflow. This choice is in-memory for the current run only.
+
 ### `/implement-plan <plan-file>`
 
 This converts a plan into a readable task document and then uses the same internal task-file workflow as `/implement-tasks`:
@@ -48,7 +50,7 @@ This converts a plan into a readable task document and then uses the same intern
 /implement-plan plan.md
 ```
 
-The generated document is written to `tasks.md` in the current working directory. If that file already exists, the command asks before overwriting it. The generated file is indexed after it is written; implementation does not run directly from the conversion response. Because this delegates to the task-file workflow, the same optional local Git checkpoint choice applies.
+The generated document is written to `tasks.md` in the current working directory. If that file already exists, the command asks before overwriting it. The generated file is indexed after it is written; implementation does not run directly from the conversion response. Because this delegates to the task-file workflow, the same optional local Git checkpoint and between-task compaction choices apply.
 
 ## Common behavior
 
@@ -62,7 +64,7 @@ No dedicated task-file schema is required. Headings, checklists, numbered sectio
 
 ## Scope
 
-The extension provides preview/cancel, sequential execution, in-memory progress, stop-on-failure behavior, and optional local Git checkpoints for task-file workflows. It does not provide task editing or reordering, persistence or resume, retries, parallelism, subagents, dependency graphs, model selection, or remote Git automation.
+The extension provides preview/cancel, sequential execution, in-memory progress, stop-on-failure behavior, optional local Git checkpoints, and optional 70% context-aware compaction for task-file workflows. It does not provide task editing or reordering, persistence or resume, retries, parallelism, subagents, dependency graphs, model selection, or remote Git automation.
 
 An interactive UI (TUI or RPC UI) is required so execution can be confirmed.
 

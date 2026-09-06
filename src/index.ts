@@ -1,6 +1,12 @@
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import {
+	COMPACTION_DISABLED_CHOICE,
+	COMPACTION_ENABLED_CHOICE,
+	DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+	compactIfNeeded,
+} from "./compaction.ts";
 import { ActiveSessionExecutor, runPromptSequence, type TaskStatus } from "./executor.ts";
 import { createLocalGit, type LocalGit } from "./git.ts";
 import {
@@ -144,6 +150,68 @@ async function executeTaskSet(
 	}
 }
 
+async function executeTaskFileSet(
+	tasks: TitledTaskList,
+	prompts: readonly string[],
+	ctx: ExtensionCommandContext,
+	executor: ActiveSessionExecutor,
+	git: LocalGit,
+	checkpoint: boolean,
+	automaticCompaction: boolean,
+): Promise<void> {
+	const statuses: TaskStatus[] = prompts.map(() => "pending");
+	const update = () => updateProgressUi(ctx, "Task-file implementation", tasks, statuses);
+	update();
+
+	for (let index = 0; index < prompts.length; index++) {
+		statuses[index] = "running";
+		update();
+
+		try {
+			await executor.execute(prompts[index]);
+		} catch (error) {
+			statuses[index] = "failed";
+			update();
+			report(
+				ctx,
+				"/implement-tasks",
+				`Implementation stopped: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
+			return;
+		}
+
+		statuses[index] = "completed";
+		update();
+
+		try {
+			if (checkpoint && (await git.hasChanges(ctx.cwd))) {
+				const title = tasks.tasks[index].title.replace(/\s+/g, " ").trim();
+				await git.commitChanges(ctx.cwd, `Task ${index + 1}: ${title}`);
+			}
+
+			if (index + 1 < prompts.length) {
+				await compactIfNeeded(
+					ctx,
+					automaticCompaction,
+					DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+					index + 2,
+				);
+			}
+		} catch (error) {
+			report(
+				ctx,
+				"/implement-tasks",
+				`Implementation stopped: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
+			return;
+		}
+	}
+
+	report(ctx, "/implement-tasks", "Implementation complete.", "info");
+}
+
 async function runRewriteWorkflow(
 	input: MarkdownInput,
 	ctx: ExtensionCommandContext,
@@ -191,11 +259,20 @@ export async function runTasksWorkflow(
 	}
 
 	const checkpoint = choice === "New local branch + commit after each task";
-	if (checkpoint) {
-		if (!(await git.isWorkingTreeClean(ctx.cwd))) {
-			throw new Error("A clean working tree is required for Git checkpoint mode.");
-		}
+	if (checkpoint && !(await git.isWorkingTreeClean(ctx.cwd))) {
+		throw new Error("A clean working tree is required for Git checkpoint mode.");
+	}
 
+	const compactionChoice = await ctx.ui.select("Automatic compaction between tasks?", [
+		COMPACTION_DISABLED_CHOICE,
+		COMPACTION_ENABLED_CHOICE,
+	]);
+	if (compactionChoice !== COMPACTION_DISABLED_CHOICE && compactionChoice !== COMPACTION_ENABLED_CHOICE) {
+		report(ctx, commandName, "Task-file implementation cancelled.", "info");
+		return;
+	}
+
+	if (checkpoint) {
 		const branchName = (await ctx.ui.input("New local branch name", "feature/task-checkpoints"))?.trim();
 		if (!branchName) {
 			report(ctx, commandName, "Task-file implementation cancelled.", "info");
@@ -204,21 +281,14 @@ export async function runTasksWorkflow(
 		await git.createBranch(ctx.cwd, branchName);
 	}
 
-	await executeTaskSet(
-		commandName,
-		"Task-file implementation",
+	await executeTaskFileSet(
 		taskIndex,
 		taskIndex.tasks.map((task, index) => buildTaskFilePrompt(input.sourcePath, index + 1, task)),
 		ctx,
-		async (prompt, index) => {
-			await executor.execute(prompt);
-			if (!checkpoint || !(await git.hasChanges(ctx.cwd))) {
-				return;
-			}
-
-			const title = taskIndex.tasks[index].title.replace(/\s+/g, " ").trim();
-			await git.commitChanges(ctx.cwd, `Task ${index + 1}: ${title}`);
-		},
+		executor,
+		git,
+		checkpoint,
+		compactionChoice === COMPACTION_ENABLED_CHOICE,
 	);
 }
 

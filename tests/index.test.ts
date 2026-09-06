@@ -2,10 +2,16 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
+import { COMPACTION_ENABLED_CHOICE } from "../src/compaction.ts";
 import implementExtension, { readMarkdownInput } from "../src/index.ts";
 import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
 
 type Handler = (event: any, ctx?: any) => void | Promise<void>;
+
+type CompactCallbacks = {
+	onComplete?: (result: unknown) => void;
+	onError?: (error: Error) => void;
+};
 
 type GitResult = {
 	stdout: string;
@@ -22,6 +28,14 @@ function assertNoRemoteGit(calls: Array<{ command: string; args: string[] }>): v
 		assert.equal(call.command, "git");
 		assert.equal(call.args.some((argument) => forbidden.includes(argument)), false);
 	}
+}
+
+async function waitFor(condition: () => boolean): Promise<void> {
+	for (let attempts = 0; attempts < 200; attempts++) {
+		if (condition()) return;
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	}
+	assert.fail("Timed out waiting for asynchronous workflow state.");
 }
 
 async function withTempDir(run: (directory: string) => Promise<void>): Promise<void> {
@@ -41,6 +55,8 @@ function fakeRuntime(options: {
 	gitResults?: GitResult[];
 	gitUnavailable?: boolean;
 	inputs?: string[];
+	contextUsages?: Array<{ tokens: number | null; contextWindow: number; percent: number | null } | undefined>;
+	compactionOutcomes?: Array<"complete" | "error" | "manual">;
 }) {
 	const commands = new Map<string, Handler>();
 	const handlers = new Map<string, Handler[]>();
@@ -52,11 +68,15 @@ function fakeRuntime(options: {
 	const workingMessages: Array<string | undefined> = [];
 	const execCalls: Array<{ command: string; args: string[]; cwd?: string }> = [];
 	const inputPrompts: Array<{ title: string; placeholder?: string }> = [];
+	const compactCalls: CompactCallbacks[] = [];
+	let contextUsageCalls = 0;
 	const stopReasons = [...(options.turnStopReasons ?? [])];
 	const modelOutputs = [...(options.modelOutputs ?? [])];
 	const choices = [...(options.choices ?? [])];
 	const gitResults = options.gitResults ? [...options.gitResults] : [gitResult("", 1, "not a repository")];
 	const inputs = [...(options.inputs ?? [])];
+	const contextUsages = [...(options.contextUsages ?? [])];
+	const compactionOutcomes = [...(options.compactionOutcomes ?? [])];
 	const sessionHistory = [{ role: "user", content: "existing context" }];
 
 	const emit = async (name: string, event: unknown = {}) => {
@@ -121,7 +141,8 @@ function fakeRuntime(options: {
 			},
 			async select(title: string, selectChoices: string[]) {
 				selections.push({ title, choices: selectChoices });
-				return choices.shift();
+				const choice = choices.shift();
+				return choice ?? (title === "Automatic compaction between tasks?" ? "No" : undefined);
 			},
 			async input(title: string, placeholder?: string) {
 				inputPrompts.push({ title, placeholder });
@@ -134,6 +155,16 @@ function fakeRuntime(options: {
 				workingMessages.push(message);
 			},
 		},
+		getContextUsage() {
+			contextUsageCalls++;
+			return contextUsages.shift();
+		},
+		compact(callbacks: CompactCallbacks = {}) {
+			compactCalls.push(callbacks);
+			const outcome = compactionOutcomes.shift() ?? "complete";
+			if (outcome === "complete") queueMicrotask(() => callbacks.onComplete?.({}));
+			if (outcome === "error") queueMicrotask(() => callbacks.onError?.(new Error("compaction failed")));
+		},
 		sessionManager: {
 			getEntries: () => sessionHistory,
 		},
@@ -142,7 +173,11 @@ function fakeRuntime(options: {
 	implementExtension(pi as never);
 	return {
 		commands,
+		compactCalls,
 		completeCalls,
+		get contextUsageCalls() {
+			return contextUsageCalls;
+		},
 		ctx,
 		execCalls,
 		inputPrompts,
@@ -207,6 +242,9 @@ test("/implement-rewrite preserves self-contained rewrite execution", async () =
 		assert.match(runtime.sent[0], /Instructions:\nAdd the endpoint and apply the shared validation rules\./);
 		assert.match(runtime.sent[1], /Instructions:\nTest the endpoint and all acceptance criteria\./);
 		assert.match(runtime.selections[0].title, /Rewrite and implement notes\.md/);
+		assert.equal(runtime.selections.some(({ title }) => title.includes("Automatic compaction")), false);
+		assert.equal(runtime.contextUsageCalls, 0);
+		assert.equal(runtime.compactCalls.length, 0);
 		assert.equal(runtime.execCalls.length, 0);
 		assert.ok(runtime.sent.every((prompt) => !prompt.includes("Git operations")));
 		assert.deepEqual(runtime.sessionHistory, [{ role: "user", content: "existing context" }]);
@@ -221,7 +259,7 @@ test("/implement-tasks indexes titles but makes each turn read the authoritative
 		await writeFile(join(directory, "tasks.md"), source);
 		const runtime = fakeRuntime({
 			cwd: directory,
-			choices: ["Implement"],
+			choices: ["Implement", "No"],
 			modelOutputs: [
 				{
 					tasks: [
@@ -237,6 +275,9 @@ test("/implement-tasks indexes titles but makes each turn read the authoritative
 		assert.equal(runtime.completeCalls.length, 1);
 		assert.deepEqual(runtime.execCalls[0].args, ["rev-parse", "--is-inside-work-tree"]);
 		assert.deepEqual(runtime.selections[0].choices, ["Implement", "Cancel"]);
+		assert.deepEqual(runtime.selections[1].choices, ["No", COMPACTION_ENABLED_CHOICE]);
+		assert.equal(runtime.contextUsageCalls, 0);
+		assert.equal(runtime.compactCalls.length, 0);
 		assert.equal(runtime.sent.length, 2);
 		assert.match(runtime.sent[0], /^Read "tasks\.md" and implement task #1 \("Add API"\)\./);
 		assert.match(runtime.sent[1], /^Read "tasks\.md" and implement task #2 \("Add tests"\)\./);
@@ -405,6 +446,92 @@ test("/implement-tasks stops after failure and does not start a subsequent task"
 		assert.equal(runtime.sent.length, 2);
 		assert.ok(runtime.widgets.some((lines) => lines?.some((line) => line.includes("✗") && line.includes("Two"))));
 		assert.ok(runtime.notifications.some(({ message }) => message.includes("Implementation stopped")));
+	});
+});
+
+test("automatic compaction waits above 70% before starting the next task", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
+			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
+			contextUsages: [{ tokens: 74, contextWindow: 100, percent: 74 }],
+			compactionOutcomes: ["manual"],
+		});
+
+		const execution = runtime.run("implement-tasks", "tasks.md");
+		await waitFor(() => runtime.compactCalls.length === 1);
+
+		assert.equal(runtime.sent.length, 1);
+		assert.equal(runtime.compactCalls.length, 1);
+		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("✓") && line.includes("One")));
+		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("○") && line.includes("Two")));
+		assert.equal(runtime.workingMessages.at(-1), "Compact context before task 2 (74%)");
+
+		runtime.compactCalls[0].onComplete?.({});
+		await execution;
+		assert.equal(runtime.sent.length, 2);
+		assert.equal(runtime.workingMessages.at(-1), undefined);
+	});
+});
+
+test("compaction failure stops before the next task", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
+			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
+			contextUsages: [{ tokens: 80, contextWindow: 100, percent: 80 }],
+			compactionOutcomes: ["error"],
+		});
+
+		await runtime.run("implement-tasks", "tasks.md");
+
+		assert.equal(runtime.sent.length, 1);
+		assert.equal(runtime.compactCalls.length, 1);
+		assert.ok(runtime.notifications.some(({ message }) => message.includes("compaction failed")));
+		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("✓") && line.includes("One")));
+		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("○") && line.includes("Two")));
+	});
+});
+
+test("automatic compaction does not inspect usage after the final task", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "one task");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
+			modelOutputs: [{ tasks: [{ title: "One" }] }],
+			contextUsages: [{ tokens: 90, contextWindow: 100, percent: 90 }],
+		});
+
+		await runtime.run("implement-tasks", "tasks.md");
+
+		assert.equal(runtime.contextUsageCalls, 0);
+		assert.equal(runtime.compactCalls.length, 0);
+		assert.equal(runtime.sent.length, 1);
+	});
+});
+
+test("/implement-plan receives automatic compaction through the delegated task workflow", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "plan.md"), "Build, then test.");
+		const generated = "# Tasks\n\n## Task 1 - Build\n\nBuild.\n\n## Task 2 - Test\n\nTest.\n";
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
+			modelOutputs: [generated, { tasks: [{ title: "Build" }, { title: "Test" }] }],
+			contextUsages: [{ tokens: 85, contextWindow: 100, percent: 85 }],
+		});
+
+		await runtime.run("implement-plan", "plan.md");
+
+		assert.equal(runtime.compactCalls.length, 1);
+		assert.equal(runtime.contextUsageCalls, 1);
+		assert.equal(runtime.sent.length, 2);
+		assert.ok(runtime.selections.some(({ title }) => title === "Automatic compaction between tasks?"));
 	});
 });
 
