@@ -116,7 +116,7 @@ export class ActiveSessionExecutor {
 
 export async function runPromptSequence(
 	prompts: readonly string[],
-	executePrompt: (prompt: string) => Promise<void>,
+	executePrompt: (prompt: string, index: number) => Promise<void>,
 	onProgress: ProgressHandler = () => {},
 ): Promise<ExecutionResult> {
 	const statuses: TaskStatus[] = prompts.map(() => "pending");
@@ -128,7 +128,7 @@ export async function runPromptSequence(
 		update();
 
 		try {
-			await executePrompt(prompts[index]);
+			await executePrompt(prompts[index], index);
 			statuses[index] = "completed";
 			update();
 		} catch (error) {

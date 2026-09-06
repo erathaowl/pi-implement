@@ -2,6 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { ActiveSessionExecutor, runPromptSequence, type TaskStatus } from "./executor.ts";
+import { createLocalGit, type LocalGit } from "./git.ts";
 import {
 	GENERATED_TASKS_FILE,
 	convertPlanToTaskDocument,
@@ -130,9 +131,9 @@ async function executeTaskSet(
 	tasks: TitledTaskList,
 	prompts: readonly string[],
 	ctx: ExtensionCommandContext,
-	executor: ActiveSessionExecutor,
+	executePrompt: (prompt: string, index: number) => Promise<void>,
 ): Promise<void> {
-	const result = await runPromptSequence(prompts, executor.execute, (statuses) =>
+	const result = await runPromptSequence(prompts, executePrompt, (statuses) =>
 		updateProgressUi(ctx, progressTitle, tasks, statuses),
 	);
 
@@ -166,7 +167,7 @@ async function runRewriteWorkflow(
 		plan,
 		plan.tasks.map(buildRewritePrompt),
 		ctx,
-		executor,
+		executor.execute,
 	);
 }
 
@@ -174,17 +175,33 @@ export async function runTasksWorkflow(
 	input: MarkdownInput,
 	ctx: ExtensionCommandContext,
 	executor: ActiveSessionExecutor,
+	git: LocalGit,
 ): Promise<void> {
 	const commandName = "/implement-tasks";
+	const isRepository = await git.isRepository(ctx.cwd);
 	report(ctx, commandName, `Indexing tasks in ${input.sourcePath}...`, "info");
 	const taskIndex = await indexTaskFile(input.markdown, ctx);
-	const choice = await ctx.ui.select(formatPreview(`Implement tasks from ${input.sourcePath}`, taskIndex), [
-		"Implement",
-		"Cancel",
-	]);
-	if (choice !== "Implement") {
+	const choices = isRepository
+		? ["Implement only", "New local branch + commit after each task", "Cancel"]
+		: ["Implement", "Cancel"];
+	const choice = await ctx.ui.select(formatPreview(`Implement tasks from ${input.sourcePath}`, taskIndex), choices);
+	if (choice !== "Implement" && choice !== "Implement only" && choice !== "New local branch + commit after each task") {
 		report(ctx, commandName, "Task-file implementation cancelled.", "info");
 		return;
+	}
+
+	const checkpoint = choice === "New local branch + commit after each task";
+	if (checkpoint) {
+		if (!(await git.isWorkingTreeClean(ctx.cwd))) {
+			throw new Error("A clean working tree is required for Git checkpoint mode.");
+		}
+
+		const branchName = (await ctx.ui.input("New local branch name", "feature/task-checkpoints"))?.trim();
+		if (!branchName) {
+			report(ctx, commandName, "Task-file implementation cancelled.", "info");
+			return;
+		}
+		await git.createBranch(ctx.cwd, branchName);
 	}
 
 	await executeTaskSet(
@@ -193,13 +210,22 @@ export async function runTasksWorkflow(
 		taskIndex,
 		taskIndex.tasks.map((task, index) => buildTaskFilePrompt(input.sourcePath, index + 1, task)),
 		ctx,
-		executor,
+		async (prompt, index) => {
+			await executor.execute(prompt);
+			if (!checkpoint || !(await git.hasChanges(ctx.cwd))) {
+				return;
+			}
+
+			const title = taskIndex.tasks[index].title.replace(/\s+/g, " ").trim();
+			await git.commitChanges(ctx.cwd, `Task ${index + 1}: ${title}`);
+		},
 	);
 }
 
 export default function implementExtension(pi: ExtensionAPI): void {
 	let workflowRunning = false;
 	const executor = new ActiveSessionExecutor((message) => pi.sendUserMessage(message));
+	const git = createLocalGit((command, args, options) => pi.exec(command, args, options));
 
 	pi.on("agent_start", () => executor.onAgentStart());
 	pi.on("agent_end", (event) => executor.onAgentEnd(event.messages));
@@ -250,7 +276,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 		handler: async (args, ctx) =>
 			runCommand("/implement-tasks", ctx, async () => {
 				const input = await readMarkdownInput(args, ctx.cwd, "/implement-tasks");
-				await runTasksWorkflow(input, ctx, executor);
+				await runTasksWorkflow(input, ctx, executor, git);
 			}),
 	});
 
@@ -282,6 +308,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 					{ sourcePath: GENERATED_TASKS_FILE, resolvedPath, markdown },
 					ctx,
 					executor,
+					git,
 				);
 			}),
 	});

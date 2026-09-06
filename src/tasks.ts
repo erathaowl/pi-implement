@@ -61,5 +61,9 @@ Use the task file itself as the authoritative source for the task requirements,
 shared constraints and acceptance criteria.
 
 Complete only this task.
-Do not start subsequent tasks.`;
+Do not start subsequent tasks.
+
+Do not perform remote Git operations.
+Do not push, pull, fetch, clone, or modify remotes.
+Do not create commits; the implementation workflow manages commits when enabled.`;
 }

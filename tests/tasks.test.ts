@@ -69,6 +69,9 @@ test("task-file prompt references the original file, number, and title without r
 	assert.match(prompt, /shared constraints and acceptance criteria/);
 	assert.match(prompt, /Complete only this task/);
 	assert.match(prompt, /Do not start subsequent tasks/);
+	assert.match(prompt, /Do not perform remote Git operations/);
+	assert.match(prompt, /Do not push, pull, fetch, clone, or modify remotes/);
+	assert.match(prompt, /Do not create commits/);
 });
 
 test("task index validation rejects malformed or empty indexes", () => {

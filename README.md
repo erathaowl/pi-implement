@@ -36,6 +36,10 @@ This preserves the Markdown task file as the authoritative source of instruction
 
 An isolated model call indexes only the logical task titles and order; it does not rewrite instructions. After confirmation, each active-session turn is told to read the original task file and implement one numbered task. Task-like headings or checklists inside examples and fenced code blocks should not be indexed as real tasks.
 
+If the current directory is a Git repository, the preview offers either normal implementation or an optional local checkpoint mode. Checkpoint mode requires a clean working tree, creates a new local branch supplied by the user, and commits changes after each successful task. Tasks that produce no changes do not create empty commits. Any Git failure stops the workflow before the next task. If Git is unavailable or the directory is not a repository, implementation continues without Git options.
+
+Git operations owned by this extension are strictly local: repository detection, status checks, local branch creation, staging, and commits. The extension never fetches, pulls, pushes, clones, or modifies remotes. Task prompts also tell the active agent not to perform remote Git operations or create commits itself.
+
 ### `/implement-plan <plan-file>`
 
 This converts a plan into a readable task document and then uses the same internal task-file workflow as `/implement-tasks`:
@@ -44,7 +48,7 @@ This converts a plan into a readable task document and then uses the same intern
 /implement-plan plan.md
 ```
 
-The generated document is written to `tasks.md` in the current working directory. If that file already exists, the command asks before overwriting it. The generated file is indexed after it is written; implementation does not run directly from the conversion response.
+The generated document is written to `tasks.md` in the current working directory. If that file already exists, the command asks before overwriting it. The generated file is indexed after it is written; implementation does not run directly from the conversion response. Because this delegates to the task-file workflow, the same optional local Git checkpoint choice applies.
 
 ## Common behavior
 
@@ -58,7 +62,7 @@ No dedicated task-file schema is required. Headings, checklists, numbered sectio
 
 ## Scope
 
-The extension provides preview/cancel, sequential execution, in-memory progress, and stop-on-failure behavior. It does not provide task editing or reordering, persistence or resume, retries, parallelism, subagents, dependency graphs, model selection, or Git automation.
+The extension provides preview/cancel, sequential execution, in-memory progress, stop-on-failure behavior, and optional local Git checkpoints for task-file workflows. It does not provide task editing or reordering, persistence or resume, retries, parallelism, subagents, dependency graphs, model selection, or remote Git automation.
 
 An interactive UI (TUI or RPC UI) is required so execution can be confirmed.
 

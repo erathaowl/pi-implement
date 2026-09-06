@@ -7,6 +7,23 @@ import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
 
 type Handler = (event: any, ctx?: any) => void | Promise<void>;
 
+type GitResult = {
+	stdout: string;
+	stderr: string;
+	code: number;
+	killed: boolean;
+};
+
+const gitResult = (stdout = "", code = 0, stderr = ""): GitResult => ({ stdout, stderr, code, killed: false });
+
+function assertNoRemoteGit(calls: Array<{ command: string; args: string[] }>): void {
+	const forbidden = ["fetch", "pull", "push", "clone", "ls-remote", "remote"];
+	for (const call of calls) {
+		assert.equal(call.command, "git");
+		assert.equal(call.args.some((argument) => forbidden.includes(argument)), false);
+	}
+}
+
 async function withTempDir(run: (directory: string) => Promise<void>): Promise<void> {
 	const directory = await mkdtemp(join(process.cwd(), ".implement-test-"));
 	try {
@@ -21,6 +38,9 @@ function fakeRuntime(options: {
 	choices?: string[];
 	modelOutputs?: unknown[];
 	turnStopReasons?: string[];
+	gitResults?: GitResult[];
+	gitUnavailable?: boolean;
+	inputs?: string[];
 }) {
 	const commands = new Map<string, Handler>();
 	const handlers = new Map<string, Handler[]>();
@@ -30,9 +50,13 @@ function fakeRuntime(options: {
 	const selections: Array<{ title: string; choices: string[] }> = [];
 	const widgets: Array<string[] | undefined> = [];
 	const workingMessages: Array<string | undefined> = [];
+	const execCalls: Array<{ command: string; args: string[]; cwd?: string }> = [];
+	const inputPrompts: Array<{ title: string; placeholder?: string }> = [];
 	const stopReasons = [...(options.turnStopReasons ?? [])];
 	const modelOutputs = [...(options.modelOutputs ?? [])];
 	const choices = [...(options.choices ?? [])];
+	const gitResults = options.gitResults ? [...options.gitResults] : [gitResult("", 1, "not a repository")];
+	const inputs = [...(options.inputs ?? [])];
 	const sessionHistory = [{ role: "user", content: "existing context" }];
 
 	const emit = async (name: string, event: unknown = {}) => {
@@ -47,6 +71,13 @@ function fakeRuntime(options: {
 		},
 		on(name: string, handler: Handler) {
 			handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+		},
+		async exec(command: string, args: string[], execOptions?: { cwd?: string }) {
+			execCalls.push({ command, args, cwd: execOptions?.cwd });
+			if (options.gitUnavailable) {
+				throw new Error("git not found");
+			}
+			return gitResults.shift() ?? gitResult();
 		},
 		sendUserMessage(message: string) {
 			sent.push(message);
@@ -92,6 +123,10 @@ function fakeRuntime(options: {
 				selections.push({ title, choices: selectChoices });
 				return choices.shift();
 			},
+			async input(title: string, placeholder?: string) {
+				inputPrompts.push({ title, placeholder });
+				return inputs.shift();
+			},
 			setWidget(_key: string, value: string[] | undefined) {
 				widgets.push(value);
 			},
@@ -109,6 +144,8 @@ function fakeRuntime(options: {
 		commands,
 		completeCalls,
 		ctx,
+		execCalls,
+		inputPrompts,
 		notifications,
 		selections,
 		sent,
@@ -170,6 +207,8 @@ test("/implement-rewrite preserves self-contained rewrite execution", async () =
 		assert.match(runtime.sent[0], /Instructions:\nAdd the endpoint and apply the shared validation rules\./);
 		assert.match(runtime.sent[1], /Instructions:\nTest the endpoint and all acceptance criteria\./);
 		assert.match(runtime.selections[0].title, /Rewrite and implement notes\.md/);
+		assert.equal(runtime.execCalls.length, 0);
+		assert.ok(runtime.sent.every((prompt) => !prompt.includes("Git operations")));
 		assert.deepEqual(runtime.sessionHistory, [{ role: "user", content: "existing context" }]);
 		assert.equal(await readFile(join(directory, "notes.md"), "utf8"), source);
 		assert.ok(runtime.notifications.some(({ message }) => message === "Implementation complete."));
@@ -196,6 +235,8 @@ test("/implement-tasks indexes titles but makes each turn read the authoritative
 		await runtime.run("implement-tasks", "tasks.md");
 
 		assert.equal(runtime.completeCalls.length, 1);
+		assert.deepEqual(runtime.execCalls[0].args, ["rev-parse", "--is-inside-work-tree"]);
+		assert.deepEqual(runtime.selections[0].choices, ["Implement", "Cancel"]);
 		assert.equal(runtime.sent.length, 2);
 		assert.match(runtime.sent[0], /^Read "tasks\.md" and implement task #1 \("Add API"\)\./);
 		assert.match(runtime.sent[1], /^Read "tasks\.md" and implement task #2 \("Add tests"\)\./);
@@ -204,6 +245,131 @@ test("/implement-tasks indexes titles but makes each turn read the authoritative
 		assert.deepEqual(runtime.sessionHistory, [{ role: "user", content: "existing context" }]);
 		assert.ok(runtime.widgets.some((lines) => lines?.some((line) => line.includes("●"))));
 		assert.ok(runtime.widgets.some((lines) => lines?.slice(1).every((line) => line.includes("✓"))));
+	});
+});
+
+test("task workflow continues normally when Git is unavailable", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "## Task 1 - One\nDo one.");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement"],
+			modelOutputs: [{ tasks: [{ title: "One" }] }],
+			gitUnavailable: true,
+		});
+
+		await runtime.run("implement-tasks", "tasks.md");
+
+		assert.deepEqual(runtime.selections[0].choices, ["Implement", "Cancel"]);
+		assert.equal(runtime.sent.length, 1);
+	});
+});
+
+test("repository task workflow offers implement-only mode without creating checkpoints", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "## Task 1 - One\nDo one.");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement only"],
+			modelOutputs: [{ tasks: [{ title: "One" }] }],
+			gitResults: [gitResult("true\n")],
+		});
+
+		await runtime.run("implement-tasks", "tasks.md");
+
+		assert.deepEqual(runtime.selections[0].choices, [
+			"Implement only",
+			"New local branch + commit after each task",
+			"Cancel",
+		]);
+		assert.equal(runtime.execCalls.length, 1);
+		assert.equal(runtime.sent.length, 1);
+		assert.match(runtime.sent[0], /Do not perform remote Git operations/);
+		assert.match(runtime.sent[0], /Do not create commits/);
+	});
+});
+
+test("checkpoint mode rejects a dirty working tree before asking for a branch", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "## Task 1 - One\nDo one.");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["New local branch + commit after each task"],
+			modelOutputs: [{ tasks: [{ title: "One" }] }],
+			gitResults: [gitResult("true\n"), gitResult(" M existing.ts\n")],
+		});
+
+		await runtime.run("implement-tasks", "tasks.md");
+
+		assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
+			["rev-parse", "--is-inside-work-tree"],
+			["status", "--porcelain"],
+		]);
+		assert.equal(runtime.inputPrompts.length, 0);
+		assert.deepEqual(runtime.sent, []);
+		assert.ok(runtime.notifications.some(({ message, type }) => type === "error" && message.includes("clean working tree")));
+	});
+});
+
+test("checkpoint mode creates a local branch and commits only successful tasks with changes", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["New local branch + commit after each task"],
+			inputs: ["feature/local-checkpoints"],
+			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
+			gitResults: [
+				gitResult("true\n"),
+				gitResult(),
+				gitResult(),
+				gitResult(" M one.ts\n"),
+				gitResult(),
+				gitResult(),
+				gitResult(),
+			],
+		});
+
+		await runtime.run("implement-tasks", "tasks.md");
+
+		assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
+			["rev-parse", "--is-inside-work-tree"],
+			["status", "--porcelain"],
+			["switch", "-c", "feature/local-checkpoints"],
+			["status", "--porcelain"],
+			["add", "-A"],
+			["commit", "-m", "Task 1: One"],
+			["status", "--porcelain"],
+		]);
+		assert.equal(runtime.sent.length, 2);
+		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 1);
+		assertNoRemoteGit(runtime.execCalls);
+	});
+});
+
+test("Git checkpoint failure stops before the next task", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["New local branch + commit after each task"],
+			inputs: ["feature/checkpoint-failure"],
+			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
+			gitResults: [
+				gitResult("true\n"),
+				gitResult(),
+				gitResult(),
+				gitResult(" M one.ts\n"),
+				gitResult(),
+				gitResult("", 1, "commit hook failed"),
+			],
+		});
+
+		await runtime.run("implement-tasks", "tasks.md");
+
+		assert.equal(runtime.sent.length, 1);
+		assert.ok(runtime.notifications.some(({ message }) => message.includes("Git commit failed")));
+		assertNoRemoteGit(runtime.execCalls);
 	});
 });
 
@@ -249,8 +415,9 @@ test("/implement-plan overwrites with confirmation then delegates to the task-fi
 		const generated = "# Tasks\n\n## Task 1 - Build API\n\nBuild it.\n\n## Task 2 - Test API\n\nTest it.\n";
 		const runtime = fakeRuntime({
 			cwd: directory,
-			choices: ["Overwrite", "Implement"],
+			choices: ["Overwrite", "Implement only"],
 			modelOutputs: [generated, { tasks: [{ title: "Build API" }, { title: "Test API" }] }],
+			gitResults: [gitResult("true\n")],
 		});
 
 		await runtime.run("implement-plan", "plan.md");
@@ -262,6 +429,12 @@ test("/implement-plan overwrites with confirmation then delegates to the task-fi
 		assert.equal(secondContext.messages[0].content[0].text, generated);
 		assert.match(runtime.selections[0].title, /tasks\.md already exists/);
 		assert.match(runtime.selections[1].title, /Implement tasks from tasks\.md/);
+		assert.deepEqual(runtime.selections[1].choices, [
+			"Implement only",
+			"New local branch + commit after each task",
+			"Cancel",
+		]);
+		assert.deepEqual(runtime.execCalls[0].args, ["rev-parse", "--is-inside-work-tree"]);
 		assert.equal(runtime.sent.length, 2);
 		assert.match(runtime.sent[0], /^Read "tasks\.md" and implement task #1/);
 		assert.match(runtime.sent[1], /^Read "tasks\.md" and implement task #2/);
