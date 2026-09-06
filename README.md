@@ -30,9 +30,7 @@ Update agent and installed packages with:
 pi update --all
 ```
 
-## Use
-
-Load the extension directly while developing:
+Alternatively you can clone this repository and load the extension directly while developing:
 
 ```bash
 pi -e ./index.ts
@@ -43,6 +41,9 @@ Or install this directory as a local pi package:
 ```bash
 pi install /absolute/path/to/pi-implement
 ```
+
+## Use
+
 
 ### `/implement-tasks <markdown-file>`
 
