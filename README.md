@@ -16,16 +16,6 @@ Or install this directory as a local pi package:
 pi install /absolute/path/to/pi-implement
 ```
 
-### `/implement-rewrite <markdown-file>`
-
-This is the original rewrite-based workflow. It reads arbitrary Markdown, uses the selected model to rewrite it into ordered, self-contained `{ title, instructions }` tasks, previews the task titles, and implements each rewritten task in the active session.
-
-```text
-/implement-rewrite plan.md
-```
-
-Applicable document-wide constraints, acceptance criteria, and shared requirements are repeated in each affected task so it can be executed independently. Rewrite execution offers the same optional local Git checkpoints and between-task context compaction as the task-file workflow.
-
 ### `/implement-tasks <markdown-file>`
 
 This preserves the Markdown task file as the authoritative source of instructions.
@@ -51,6 +41,16 @@ This converts a plan into a readable task document and then uses the same intern
 ```
 
 The generated document is written to `tasks.md` in the current working directory. If that file already exists, the command asks before overwriting it. The generated file is indexed after it is written; implementation does not run directly from the conversion response. Because this delegates to the task-file workflow, the same optional local Git checkpoint and between-task compaction choices apply.
+
+### `/implement-rewrite <markdown-file>`
+
+This is the original rewrite-based workflow. It reads arbitrary Markdown, uses the selected model to rewrite it into ordered, self-contained `{ title, instructions }` tasks, previews the task titles, and implements each rewritten task in the active session.
+
+```text
+/implement-rewrite plan.md
+```
+
+Applicable document-wide constraints, acceptance criteria, and shared requirements are repeated in each affected task so it can be executed independently. Rewrite execution offers the same optional local Git checkpoints and between-task context compaction as the task-file workflow.
 
 ## Common behavior
 
