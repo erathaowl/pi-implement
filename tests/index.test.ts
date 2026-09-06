@@ -854,6 +854,41 @@ test("automatic compaction waits above 70% before starting the next task", async
 	});
 });
 
+test("compaction start is recoverable during interruption and success clears the pending flag", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
+			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
+			contextUsages: [{ tokens: 80, contextWindow: 100, percent: 80 }],
+			compactionOutcomes: ["manual"],
+			manualTurns: true,
+		});
+
+		const execution = runtime.run("implement-tasks", "tasks.md");
+		await waitFor(() => runtime.sent.length === 1);
+		await runtime.settleTurn();
+		await waitFor(() => runtime.compactCalls.length === 1);
+
+		const interrupted = await loadState(directory);
+		assert.equal(interrupted?.nextTaskIndex, 1);
+		assert.equal(interrupted?.status, "running");
+		assert.equal(interrupted?.pendingCompaction, true);
+		assert.equal(runtime.sent.length, 1);
+
+		runtime.compactCalls[0].onComplete?.({});
+		await waitFor(() => runtime.sent.length === 2);
+		const completedCompaction = await loadState(directory);
+		assert.equal(completedCompaction?.nextTaskIndex, 1);
+		assert.equal(completedCompaction?.pendingCompaction, undefined);
+
+		await runtime.settleTurn();
+		await execution;
+		assert.equal(await loadState(directory), undefined);
+	});
+});
+
 test("compaction failure stops before the next task", async () => {
 	await withTempDir(async (directory) => {
 		await writeFile(join(directory, "tasks.md"), "tasks");

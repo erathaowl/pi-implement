@@ -256,9 +256,15 @@ async function executeTaskSet(
 					state.automaticCompaction,
 					DEFAULT_COMPACTION_THRESHOLD_PERCENT,
 					index + 2,
+					false,
+					async () => {
+						state.pendingCompaction = true;
+						await saveState(ctx.cwd, state);
+					},
 				);
+				delete state.pendingCompaction;
+				await saveState(ctx.cwd, state);
 			} catch (error) {
-				state.pendingCompaction = true;
 				await saveFailure(ctx, commandName, state, index + 1, error);
 				return;
 			}

@@ -30,7 +30,7 @@ For both `/implement-rewrite` and `/implement-tasks`, a Git repository adds a ch
 
 Git operations owned by this extension are strictly local: repository detection, status checks, local branch creation, staging, and commits. The extension never fetches, pulls, pushes, clones, or modifies remotes. Both rewrite and task-file prompts tell the active agent not to perform remote Git operations or create commits itself.
 
-Both workflows also ask whether automatic between-task compaction should be enabled. When enabled, they check context usage after each successful task except the last. Usage above 70% triggers pi's normal compaction, which must finish before the next task starts. Unavailable usage or usage at or below 70% is skipped; compaction failure stops the workflow. A failed compaction remains pending and is retried before the next task when the workflow is resumed.
+Both workflows also ask whether automatic between-task compaction should be enabled. When enabled, they check context usage after each successful task except the last. Usage above 70% triggers pi's normal compaction, which must finish before the next task starts. Unavailable usage or usage at or below 70% is skipped; compaction failure stops the workflow. Once compaction starts it is persisted as pending and cleared only after success, so failure or interruption retries it before the next task when the workflow is resumed.
 
 ### `/implement-plan <plan-file>`
 

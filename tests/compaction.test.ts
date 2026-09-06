@@ -44,10 +44,32 @@ for (const [name, usage] of [
 	});
 }
 
-test("usage above threshold waits for compaction and restores the working message", async () => {
+test("beforeCompact is not called when compaction is skipped", async () => {
+	const runtime = context({ percent: 69 });
+	let callbackCalls = 0;
+	await compactIfNeeded(runtime.ctx as never, true, DEFAULT_COMPACTION_THRESHOLD_PERCENT, 2, false, async () => {
+		callbackCalls++;
+	});
+
+	assert.equal(callbackCalls, 0);
+	assert.equal(runtime.compactCalls.length, 0);
+});
+
+test("usage above threshold invokes beforeCompact before compaction and waits for completion", async () => {
 	const runtime = context({ percent: 74 });
 	let settled = false;
-	const compaction = compactIfNeeded(runtime.ctx as never, true, DEFAULT_COMPACTION_THRESHOLD_PERCENT, 3).then(
+	let callbackCalls = 0;
+	const compaction = compactIfNeeded(
+		runtime.ctx as never,
+		true,
+		DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+		3,
+		false,
+		async () => {
+			callbackCalls++;
+			assert.equal(runtime.compactCalls.length, 0);
+		},
+	).then(
 		() => {
 			settled = true;
 		},
@@ -55,6 +77,8 @@ test("usage above threshold waits for compaction and restores the working messag
 
 	await Promise.resolve();
 	assert.equal(settled, false);
+	assert.equal(callbackCalls, 1);
+	assert.equal(runtime.compactCalls.length, 1);
 	assert.deepEqual(runtime.workingMessages, ["Compact context before task 3 (74%)"]);
 	runtime.compactCalls[0].onComplete?.({});
 	await compaction;

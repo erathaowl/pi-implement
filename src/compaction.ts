@@ -13,6 +13,7 @@ export async function compactIfNeeded(
 	thresholdPercent: number,
 	nextTaskNumber: number,
 	force = false,
+	beforeCompact?: () => Promise<void>,
 ): Promise<void> {
 	if (!enabled) {
 		return;
@@ -33,6 +34,7 @@ export async function compactIfNeeded(
 			: `Compact context before task ${nextTaskNumber} (${percent}%)`,
 	);
 	try {
+		await beforeCompact?.();
 		await new Promise<void>((resolve, reject) => {
 			try {
 				ctx.compact({
