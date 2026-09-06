@@ -6,8 +6,11 @@ import test from "node:test";
 test("package metadata uses the pi-implement name and wildcard pi peer dependency", async () => {
 	const packageJson = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8"));
 	const packageLock = JSON.parse(await readFile(join(process.cwd(), "package-lock.json"), "utf8"));
+	const entrypoint = await readFile(join(process.cwd(), "index.ts"), "utf8");
 
 	assert.equal(packageJson.name, "pi-implement");
+	assert.deepEqual(packageJson.pi.extensions, ["./index.ts"]);
+	assert.equal(entrypoint, 'export { default } from "./src/index.ts";\n');
 	assert.equal(packageJson.peerDependencies["@earendil-works/pi-coding-agent"], "*");
 	assert.equal(packageLock.name, "pi-implement");
 	assert.equal(packageLock.packages[""].name, "pi-implement");

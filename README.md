@@ -35,7 +35,7 @@ pi update --all
 Load the extension directly while developing:
 
 ```bash
-pi -e ./src/index.ts
+pi -e ./index.ts
 ```
 
 Or install this directory as a local pi package:
