@@ -1,6 +1,34 @@
 # pi-implement
 
-A minimal [pi](https://pi.dev) extension with three sequential implementation workflows for Markdown plans and task files.
+A minimal [pi](https://pi.dev) extension for sequentially implementing Markdown plans and task files in the current session.
+
+It provides three workflows:
+
+- `/implement-tasks` — implement an existing task file without rewriting it.
+- `/implement-plan` — convert a plan to `tasks.md`, then implement it as a task file.
+- `/implement-rewrite` — rewrite arbitrary Markdown into self-contained tasks before implementation.
+
+All workflows execute tasks sequentially in the active pi session and share the same optional Git checkpoints, context compaction, progress display, and recovery behavior.
+
+## Installation
+
+Install directly from GitHub:
+
+```bash
+pi install https://github.com/erathaowl/pi-implement
+```
+
+For a project-local installation:
+
+```bash
+pi install -l https://github.com/erathaowl/pi-implement
+```
+
+Update agent and installed packages with:
+
+```bash
+pi update --all
+```
 
 ## Use
 
@@ -18,61 +46,140 @@ pi install /absolute/path/to/pi-implement
 
 ### `/implement-tasks <markdown-file>`
 
-This preserves the Markdown task file as the authoritative source of instructions.
+Implements an existing Markdown task file while keeping the original document as the authoritative source of instructions.
 
 ```text
 /implement-tasks tasks.md
 ```
 
-An isolated model call indexes only the logical task titles and order; it does not rewrite instructions. After confirmation, each active-session turn is told to read the original task file and implement one numbered task. Task-like headings or checklists inside examples and fenced code blocks should not be indexed as real tasks.
+An isolated model call identifies the actual logical tasks, their titles, and their order. It does not rewrite their instructions.
 
-For both `/implement-rewrite` and `/implement-tasks`, a Git repository adds a choice between normal implementation and optional local checkpoint mode. Checkpoint mode requires a clean working tree, creates a new local branch supplied by the user, and commits changes after each successful task. Tasks that produce no changes do not create empty commits. Any Git failure stops the workflow before the next task. If Git is unavailable or the directory is not a repository, implementation continues without Git options.
+Each implementation turn is then told to read the original task file and implement exactly one numbered task. Shared constraints and acceptance criteria remain authoritative in the source document.
 
-Git operations owned by this extension are strictly local: repository detection, status checks, local branch creation, staging, and commits. The extension never fetches, pulls, pushes, clones, or modifies remotes. Both rewrite and task-file prompts tell the active agent not to perform remote Git operations or create commits itself.
+No fixed task-file schema is required. Headings, numbered sections, checklists, and prose can all be used. Task-like content inside examples, templates, or fenced code blocks is ignored when identifying real tasks.
 
-Both workflows also ask whether automatic between-task compaction should be enabled. When enabled, they check context usage after each successful task except the last. Usage above 70% triggers pi's normal compaction, which must finish before the next task starts. Unavailable usage or usage at or below 70% is skipped; compaction failure stops the workflow. Once compaction starts it is persisted as pending and cleared only after success, so failure or interruption retries it before the next task when the workflow is resumed.
+Use this command when the task file is already written the way you want and should not be transformed before execution.
 
 ### `/implement-plan <plan-file>`
 
-This converts a plan into a readable task document and then uses the same internal task-file workflow as `/implement-tasks`:
+Converts a Markdown implementation plan into a readable task file and then runs the same workflow used by `/implement-tasks`.
 
 ```text
 /implement-plan plan.md
 ```
 
-The generated document is written to `tasks.md` in the current working directory. If that file already exists, the command asks before overwriting it. The generated file is indexed after it is written; implementation does not run directly from the conversion response. Because this delegates to the task-file workflow, the same optional local Git checkpoint and between-task compaction choices apply.
+The generated task document is written to:
+
+```text
+tasks.md
+```
+
+in the current working directory.
+
+If `tasks.md` already exists, the command asks before overwriting it. The generated file is then indexed and implemented as a normal authoritative task file; implementation does not run directly from the plan-conversion response.
+
+This is useful when the input describes the work at plan level rather than as clearly executable tasks.
 
 ### `/implement-rewrite <markdown-file>`
 
-This is the original rewrite-based workflow. It reads arbitrary Markdown, uses the selected model to rewrite it into ordered, self-contained `{ title, instructions }` tasks, previews the task titles, and implements each rewritten task in the active session.
+Reads arbitrary Markdown and rewrites it into ordered, self-contained tasks before implementation.
 
 ```text
 /implement-rewrite plan.md
 ```
 
-Applicable document-wide constraints, acceptance criteria, and shared requirements are repeated in each affected task so it can be executed independently. Rewrite execution offers the same optional local Git checkpoints and between-task context compaction as the task-file workflow.
+The selected model produces tasks shaped conceptually as:
+
+```text
+{ title, instructions }
+```
+
+The rewritten task titles are previewed before execution. Each task is then sent to the active session as a self-contained implementation instruction.
+
+Applicable document-wide constraints, acceptance criteria, and shared requirements are repeated in the affected tasks so they can be implemented independently.
+
+Unlike `/implement-tasks`, the original Markdown is not the authoritative execution source after rewriting. Use this workflow when the input needs interpretation or restructuring before implementation.
 
 ## Common behavior
 
-All isolated model calls use the currently selected model, omit tools from the model context, and do not add their prompts or responses to active session history.
+All preparation calls use the currently selected model in isolation. Tools are omitted from those model calls, and their prompts and responses are not added to the active session history.
 
-Before implementation, each workflow shows the detected task titles and offers **Implement** or **Cancel**. Tasks run sequentially as normal user instructions in the current pi session. The extension waits for the complete agent lifecycle—including tools, retries, and compaction—to settle before submitting the next task. Only a normal `stop` reason marks a task complete; failure, truncation, cancellation, or any other terminal reason stops the workflow.
+Before execution, the detected tasks are previewed for confirmation.
 
-Input Markdown files are read-only. `/implement-plan` is the sole exception in that it intentionally creates or overwrites `tasks.md` after confirmation.
+Tasks are implemented sequentially in the current pi session. The extension waits for the complete agent lifecycle, including tool calls and retries, to settle before starting the next task.
+
+Only a normal `stop` reason marks a task as successfully completed. Failure, truncation, cancellation, or another terminal reason stops the workflow and preserves recovery state.
+
+Input Markdown files are read-only. `/implement-plan` is the only workflow that intentionally creates or overwrites a task file.
+
+An interactive UI (TUI or RPC UI) is required.
+
+### Local Git checkpoints
+
+Inside a Git repository, `/implement-tasks` and `/implement-rewrite` — and therefore `/implement-plan` through its delegated task workflow — offer two execution modes:
+
+- implement without Git checkpoints;
+- create a new local branch and commit after each successful task.
+
+Checkpoint mode requires a clean working tree before execution starts. The user chooses the new local branch name.
+
+After each successful task, changes are staged and committed locally. Tasks that produce no staged changes do not create empty commits. A Git failure stops execution before the next task.
+
+Git operations owned by the extension are strictly local. It may inspect repository state, create a local branch, stage changes, and create commits. It never fetches, pulls, pushes, clones, or modifies remotes.
+
+Task prompts also instruct the active agent not to create commits or perform remote Git operations itself.
+
+### Automatic context compaction
+
+Each workflow can optionally enable automatic compaction between tasks.
+
+When enabled, context usage is checked after every successful task except the last. Usage above 70% triggers pi's normal compaction before the next task starts.
+
+Usage at or below 70%, or unavailable usage information, does not trigger compaction.
+
+Once compaction starts, it is persisted as pending until it completes successfully. If compaction fails or execution is interrupted while it is running, recovery retries it before starting the next task.
 
 ## Recovery
 
-Inside a Git repository, new implementation workflows ask whether `.pi-implement-state.json` should be listed in the repository-root `.gitignore`, with **Yes** as the default. Outside Git, the state file is still used but `.gitignore` is not created or changed. The file stores only prepared task titles and prompts, the next task index, status, pending compaction, and the selected Git/compaction options. Writes are atomic. For each checkpoint, the extension stages changes, explicitly unstages the state file, and then creates a normal local commit, so the state file is never committed whether it is ignored or not.
+Active implementations are tracked in a single repository-local state file:
 
-If a workflow is interrupted or fails, starting any implementation command offers **Resume**, **Discard and start new**, or **Cancel** before model extraction or plan conversion. Resume uses the saved prompts without repeating extraction or indexing and requires the same resolved working directory where the workflow started. A task interrupted while running is rerun; a task completed before a compaction failure is not. Git checkpoint restores require the current branch to match the saved branch and never switch it automatically. State is deleted after complete success and preserved after failure or interruption.
+```text
+.pi-implement-state.json
+```
 
-No dedicated task-file schema is required. Headings, checklists, numbered sections, and prose instructions are interpreted semantically by the selected model.
+Inside a Git repository, new workflows ask whether this file should be added to the repository-root `.gitignore`, with **Yes** as the default. Outside Git, the state file is still used but `.gitignore` is not created or modified.
+
+The state contains only what is required to resume the workflow: prepared task titles and prompts, execution position, status, working directory, pending compaction, and the selected Git/compaction options.
+
+Writes are atomic. Git checkpoints explicitly exclude the state file whether or not it is ignored.
+
+If unfinished state exists, starting any implementation command offers:
+
+- **Resume**
+- **Discard and start new**
+- **Cancel**
+
+Resume uses the saved task sequence directly, without repeating plan conversion, task indexing, or rewrite extraction.
+
+A task interrupted while running is rerun. A task already completed before a compaction failure is not.
+
+Resume must be started from the same resolved working directory as the original workflow. When Git checkpoints are enabled, the current local branch must also match the saved branch. The extension does not change either automatically.
+
+The state file is deleted after complete success and preserved after failure or interruption.
 
 ## Scope
 
-The extension provides preview/cancel, sequential execution, in-memory progress, minimal single-file recovery, stop-on-failure behavior, optional local Git checkpoints, and optional 70% context-aware compaction for rewrite and task-file workflows. It does not provide task editing or reordering, state history or snapshots, retries, parallelism, subagents, dependency graphs, model selection, or remote Git automation.
+`pi-implement` intentionally focuses on a small sequential workflow:
 
-An interactive UI (TUI or RPC UI) is required so execution can be confirmed.
+- task preview and confirmation;
+- implementation in the current session;
+- one task at a time;
+- progress display;
+- optional local Git checkpoints;
+- optional context-aware compaction;
+- lightweight single-file recovery.
+
+It intentionally does not provide task editing or reordering, parallel execution, subagents, dependency graphs, automatic retries, state history or snapshots, model selection, or remote Git automation.
 
 ## Validation
 
