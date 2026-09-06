@@ -1,6 +1,6 @@
 # pi-implement-markdown
 
-A minimal [pi](https://pi.dev) extension that interprets implementation tasks from arbitrary Markdown and executes them one at a time in the current session.
+A minimal [pi](https://pi.dev) extension with three sequential implementation workflows for Markdown plans and task files.
 
 ## Use
 
@@ -16,54 +16,53 @@ Or install this directory as a local pi package:
 pi install /absolute/path/to/pi-implement-markdown
 ```
 
-Then run:
+### `/implement-rewrite <markdown-file>`
+
+This is the original rewrite-based workflow. It reads arbitrary Markdown, uses the selected model to rewrite it into ordered, self-contained `{ title, instructions }` tasks, previews the task titles, and implements each rewritten task in the active session.
 
 ```text
-/implement <markdown-file>
+/implement-rewrite plan.md
 ```
 
-For example:
+Applicable document-wide constraints, acceptance criteria, and shared requirements are repeated in each affected task so it can be executed independently.
+
+### `/implement-tasks <markdown-file>`
+
+This preserves the Markdown task file as the authoritative source of instructions.
 
 ```text
-/implement plan.md
-/implement docs/tasks.md
+/implement-tasks tasks.md
 ```
 
-The command reads the file, uses an isolated completion with the currently selected model to identify the ordered implementation tasks, and shows the detected titles for confirmation. Choosing **Implement** submits each task as a separate normal instruction to the active pi session. It waits for the complete agent turn—including tool execution, retries, and compaction—before starting the next task. Only a normal `stop` reason marks a task complete; any other terminal reason stops the workflow.
+An isolated model call indexes only the logical task titles and order; it does not rewrite instructions. After confirmation, each active-session turn is told to read the original task file and implement one numbered task. Task-like headings or checklists inside examples and fenced code blocks should not be indexed as real tasks.
 
-Task extraction is separate from the active session: it sends only the extraction prompt and Markdown to `ModelRegistry.complete`, omits tools from the model context, and does not add its prompt or response to conversation history. Applicable document-wide constraints, acceptance criteria, and shared requirements are repeated in each affected task so it can be executed independently. The provider-neutral extension API does not expose one structured-response format across every provider, so the command requests JSON text and validates it before showing the preview.
+### `/implement-plan <plan-file>`
 
-The source Markdown file is read-only. The extension does not edit it or persist workflow status.
+This converts a plan into a readable task document and then uses the same internal task-file workflow as `/implement-tasks`:
 
-## Markdown examples
-
-No dedicated task-file schema is required. Headings and prose can be mixed:
-
-```markdown
-## Backend
-Add the endpoint and validation.
-
-## Tests
-Add tests for the new endpoint.
+```text
+/implement-plan plan.md
 ```
 
-A list works as well:
+The generated document is written to `tasks.md` in the current working directory. If that file already exists, the command asks before overwriting it. The generated file is indexed after it is written; implementation does not run directly from the conversion response.
 
-```markdown
-- Add the configuration option
-- Implement the feature
-- Update documentation
-```
+## Common behavior
 
-Checklists, numbered sections, and prose instructions are also interpreted semantically by the selected model rather than by a heading or checkbox parser.
+All isolated model calls use the currently selected model, omit tools from the model context, and do not add their prompts or responses to active session history.
+
+Before implementation, each workflow shows the detected task titles and offers **Implement** or **Cancel**. Tasks run sequentially as normal user instructions in the current pi session. The extension waits for the complete agent lifecycle—including tools, retries, and compaction—to settle before submitting the next task. Only a normal `stop` reason marks a task complete; failure, truncation, cancellation, or any other terminal reason stops the workflow.
+
+Input Markdown files are read-only. `/implement-plan` is the sole exception in that it intentionally creates or overwrites `tasks.md` after confirmation.
+
+No dedicated task-file schema is required. Headings, checklists, numbered sections, and prose instructions are interpreted semantically by the selected model.
 
 ## Scope
 
-This first version intentionally provides only preview/cancel, sequential execution, in-memory progress, stop-on-failure behavior, and pi's normal interruption mechanism. It does not provide task editing or reordering, persistence or resume, retries, parallelism, subagents, dependency graphs, model selection, or Git automation.
+The extension provides preview/cancel, sequential execution, in-memory progress, and stop-on-failure behavior. It does not provide task editing or reordering, persistence or resume, retries, parallelism, subagents, dependency graphs, model selection, or Git automation.
 
 An interactive UI (TUI or RPC UI) is required so execution can be confirmed.
 
-## Tests
+## Validation
 
 ```bash
 npm test

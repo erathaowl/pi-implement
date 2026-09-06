@@ -1,19 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-	extractImplementationPlan,
-	TASK_EXTRACTION_PROMPT,
-	validateImplementationPlan,
+	buildTaskFilePrompt,
+	indexTaskFile,
+	TASK_INDEX_PROMPT,
+	validateTaskIndex,
 } from "../src/tasks.ts";
 
-function response(value: unknown, stopReason = "stop") {
-	return {
-		content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) }],
-		stopReason,
-	};
-}
-
-function extractionContext(result: unknown) {
+function indexingContext(result: unknown) {
 	const model = { provider: "test", id: "selected-model" };
 	const calls: unknown[][] = [];
 	const ctx = {
@@ -21,111 +15,64 @@ function extractionContext(result: unknown) {
 		modelRegistry: {
 			async complete(...args: unknown[]) {
 				calls.push(args);
-				return result;
+				return {
+					stopReason: "stop",
+					content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }],
+				};
 			},
 		},
 	};
 	return { calls, ctx, model };
 }
 
-test("extraction uses the selected standalone model boundary without tools or session messages", async () => {
-	const markdown = "## Add API\nImplement the endpoint.";
-	const activeSessionHistory = [{ role: "user", content: "existing conversation" }];
-	const { calls, ctx, model } = extractionContext(
-		response({ tasks: [{ title: "Add API", instructions: "Implement the endpoint." }] }),
-	);
-
-	const plan = await extractImplementationPlan(markdown, ctx as never);
-
-	assert.deepEqual(plan, {
-		tasks: [{ title: "Add API", instructions: "Implement the endpoint." }],
+test("task indexing uses an isolated tool-free call and returns titles only", async () => {
+	const markdown = "# Tasks\n## Task 1 - Add API\nImplement it.";
+	const { calls, ctx, model } = indexingContext({
+		tasks: [{ title: "Add API", instructions: "This must not enter the index." }],
 	});
-	assert.equal(calls.length, 1);
+
+	const index = await indexTaskFile(markdown, ctx as never);
+
+	assert.deepEqual(index, { tasks: [{ title: "Add API" }] });
 	const [calledModel, context, options] = calls[0] as [
 		unknown,
 		{ systemPrompt: string; messages: Array<{ content: Array<{ text: string }> }>; tools?: unknown },
-		{ toolChoice?: string; cacheRetention?: string },
+		Record<string, unknown>,
 	];
 	assert.equal(calledModel, model);
-	assert.equal(context.systemPrompt, TASK_EXTRACTION_PROMPT);
-	assert.equal(context.messages.length, 1);
+	assert.equal(context.systemPrompt, TASK_INDEX_PROMPT);
 	assert.equal(context.messages[0].content[0].text, markdown);
 	assert.equal("tools" in context, false);
 	assert.equal("toolChoice" in options, false);
-	assert.equal(options.cacheRetention, "none");
-	assert.deepEqual(activeSessionHistory, [{ role: "user", content: "existing conversation" }]);
 });
 
-for (const [style, markdown] of [
-	["heading-based", "## Add API\nImplement the endpoint.\n## Add tests\nCover the endpoint."],
-	["checklist", "- [ ] Add endpoint\n- [ ] Add validation\n- [ ] Update tests"],
-	[
-		"prose",
-		"First add the configuration settings. Then implement the middleware. Finally update the documentation.",
-	],
-] as const) {
-	test(`preserves model task order for ${style} Markdown`, async () => {
-		const expected = {
-			tasks: [
-				{ title: "First", instructions: "Do the first task." },
-				{ title: "Second", instructions: "Do the second task." },
-			],
-		};
-		const { ctx } = extractionContext(response(expected));
-
-		assert.deepEqual(await extractImplementationPlan(markdown, ctx as never), expected);
+test("task index preserves source order", async () => {
+	const { ctx } = indexingContext({
+		tasks: [{ title: "Configure" }, { title: "Implement" }, { title: "Document" }],
 	});
-}
-
-test("extraction prompt propagates applicable shared requirements into each task", () => {
-	assert.match(TASK_EXTRACTION_PROMPT, /document-level constraints/);
-	assert.match(TASK_EXTRACTION_PROMPT, /acceptance criteria/);
-	assert.match(TASK_EXTRACTION_PROMPT, /Repeat each applicable shared requirement in every affected task/);
-});
-
-test("accepts a JSON fenced response", async () => {
-	const { ctx } = extractionContext(
-		response('```json\n{"tasks":[{"title":"Test","instructions":"Add tests."}]}\n```'),
-	);
-
-	assert.deepEqual(await extractImplementationPlan("Add tests", ctx as never), {
-		tasks: [{ title: "Test", instructions: "Add tests." }],
+	assert.deepEqual(await indexTaskFile("task document", ctx as never), {
+		tasks: [{ title: "Configure" }, { title: "Implement" }, { title: "Document" }],
 	});
 });
 
-test("rejects empty task lists", () => {
-	assert.throws(() => validateImplementationPlan({ tasks: [] }), /No implementation tasks/);
+test("task indexing prompt excludes task-like examples and instruction rewriting", () => {
+	assert.match(TASK_INDEX_PROMPT, /examples or templates/);
+	assert.match(TASK_INDEX_PROMPT, /fenced code blocks/);
+	assert.match(TASK_INDEX_PROMPT, /Do not copy, summarize, rewrite/);
+	assert.match(TASK_INDEX_PROMPT, /authoritative source/);
 });
 
-test("rejects empty task titles", () => {
-	assert.throws(
-		() => validateImplementationPlan({ tasks: [{ title: "  ", instructions: "Do it" }] }),
-		/empty title/,
-	);
+test("task-file prompt references the original file, number, and title without rewritten instructions", () => {
+	const prompt = buildTaskFilePrompt("docs/tasks.md", 2, { title: "Add middleware" });
+	assert.match(prompt, /^Read "docs\/tasks\.md" and implement task #2 \("Add middleware"\)\./);
+	assert.match(prompt, /task file itself as the authoritative source/);
+	assert.match(prompt, /shared constraints and acceptance criteria/);
+	assert.match(prompt, /Complete only this task/);
+	assert.match(prompt, /Do not start subsequent tasks/);
 });
 
-test("rejects empty task instructions", () => {
-	assert.throws(
-		() => validateImplementationPlan({ tasks: [{ title: "Do it", instructions: "" }] }),
-		/empty instructions/,
-	);
-});
-
-test("rejects malformed structured output", async () => {
-	const { ctx } = extractionContext(response("not json"));
-	await assert.rejects(extractImplementationPlan("Do something", ctx as never), /invalid JSON/);
-});
-
-test("reports standalone model failures", async () => {
-	const { ctx } = extractionContext({
-		content: [{ type: "text", text: "" }],
-		stopReason: "error",
-		errorMessage: "provider unavailable",
-	});
-	await assert.rejects(extractImplementationPlan("Do something", ctx as never), /provider unavailable/);
-});
-
-test("requires a selected model", async () => {
-	const ctx = { model: undefined, modelRegistry: { complete: () => assert.fail("must not be called") } };
-	await assert.rejects(extractImplementationPlan("Do something", ctx as never), /No model is selected/);
+test("task index validation rejects malformed or empty indexes", () => {
+	assert.throws(() => validateTaskIndex({ wrong: [] }), /invalid tasks list/);
+	assert.throws(() => validateTaskIndex({ tasks: [] }), /No implementation tasks/);
+	assert.throws(() => validateTaskIndex({ tasks: [{ title: " " }] }), /empty title/);
 });
