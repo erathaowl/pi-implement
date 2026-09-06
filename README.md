@@ -1,4 +1,4 @@
-# pi-implement-markdown
+# pi-implement
 
 A minimal [pi](https://pi.dev) extension with three sequential implementation workflows for Markdown plans and task files.
 
@@ -13,7 +13,7 @@ pi -e ./src/index.ts
 Or install this directory as a local pi package:
 
 ```bash
-pi install /absolute/path/to/pi-implement-markdown
+pi install /absolute/path/to/pi-implement
 ```
 
 ### `/implement-rewrite <markdown-file>`
@@ -24,7 +24,7 @@ This is the original rewrite-based workflow. It reads arbitrary Markdown, uses t
 /implement-rewrite plan.md
 ```
 
-Applicable document-wide constraints, acceptance criteria, and shared requirements are repeated in each affected task so it can be executed independently.
+Applicable document-wide constraints, acceptance criteria, and shared requirements are repeated in each affected task so it can be executed independently. Rewrite execution offers the same optional local Git checkpoints and between-task context compaction as the task-file workflow.
 
 ### `/implement-tasks <markdown-file>`
 
@@ -36,11 +36,11 @@ This preserves the Markdown task file as the authoritative source of instruction
 
 An isolated model call indexes only the logical task titles and order; it does not rewrite instructions. After confirmation, each active-session turn is told to read the original task file and implement one numbered task. Task-like headings or checklists inside examples and fenced code blocks should not be indexed as real tasks.
 
-If the current directory is a Git repository, the preview offers either normal implementation or an optional local checkpoint mode. Checkpoint mode requires a clean working tree, creates a new local branch supplied by the user, and commits changes after each successful task. Tasks that produce no changes do not create empty commits. Any Git failure stops the workflow before the next task. If Git is unavailable or the directory is not a repository, implementation continues without Git options.
+For both `/implement-rewrite` and `/implement-tasks`, a Git repository adds a choice between normal implementation and optional local checkpoint mode. Checkpoint mode requires a clean working tree, creates a new local branch supplied by the user, and commits changes after each successful task. Tasks that produce no changes do not create empty commits. Any Git failure stops the workflow before the next task. If Git is unavailable or the directory is not a repository, implementation continues without Git options.
 
-Git operations owned by this extension are strictly local: repository detection, status checks, local branch creation, staging, and commits. The extension never fetches, pulls, pushes, clones, or modifies remotes. Task prompts also tell the active agent not to perform remote Git operations or create commits itself.
+Git operations owned by this extension are strictly local: repository detection, status checks, local branch creation, staging, and commits. The extension never fetches, pulls, pushes, clones, or modifies remotes. Both rewrite and task-file prompts tell the active agent not to perform remote Git operations or create commits itself.
 
-Before task execution, `/implement-tasks` also asks whether automatic between-task compaction should be enabled. When enabled, it checks context usage after each successful task except the last. Usage above 70% triggers pi's normal compaction, which must finish before the next task starts. Unavailable usage or usage at or below 70% is skipped; compaction failure stops the workflow. This choice is in-memory for the current run only.
+Both workflows also ask whether automatic between-task compaction should be enabled. When enabled, they check context usage after each successful task except the last. Usage above 70% triggers pi's normal compaction, which must finish before the next task starts. Unavailable usage or usage at or below 70% is skipped; compaction failure stops the workflow. This choice is in-memory for the current run only.
 
 ### `/implement-plan <plan-file>`
 

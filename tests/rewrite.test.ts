@@ -88,6 +88,9 @@ test("rewrite builds a self-contained active-session prompt", () => {
 	assert.match(prompt, /Title:\nTwo/);
 	assert.match(prompt, /Instructions:\nImplement two\./);
 	assert.match(prompt, /Complete only this task/);
+	assert.match(prompt, /Do not perform remote Git operations/);
+	assert.match(prompt, /Do not push, pull, fetch, clone, or modify remotes/);
+	assert.match(prompt, /Do not create commits/);
 });
 
 test("rewrite accepts a JSON fenced response", async () => {

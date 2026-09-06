@@ -364,11 +364,161 @@ Add tests for:
 
 Update the README with the optional 70% between-task compaction behavior.
 
+## Task 4 - Share Git checkpoints and context compaction with `/implement-rewrite`
+
+Extend the optional local Git checkpoint and context-aware compaction features to `/implement-rewrite`, while keeping the implementation minimal and avoiding duplicated execution logic.
+
+Also rename the package from `pi-implement-markdown` to `pi-implement`.
+
+### Shared sequential execution
+
+The current implementation has separate execution paths:
+
+- `/implement-rewrite` uses the simpler generic task execution path;
+- `/implement-tasks` uses a dedicated loop that additionally performs Git checkpoints and between-task compaction.
+
+Refactor this so both workflows use the same sequential execution mechanism.
+
+The shared execution path should:
+
+1. mark the current task as running;
+2. execute its already-built prompt through `ActiveSessionExecutor`;
+3. mark it completed on success;
+4. optionally create a local Git checkpoint;
+5. optionally compact context before the next task;
+6. continue with the next task;
+7. stop immediately on agent, Git, or compaction failure.
+
+Do not introduce a workflow framework, middleware system, hook registry, or class hierarchy.
+
+Prefer one small shared runner parameterized with:
+- command/progress title;
+- task titles;
+- prompts;
+- Git checkpoint enabled/disabled;
+- automatic compaction enabled/disabled.
+
+Remove redundant execution loops if they are no longer needed.
+
+### Shared execution options
+
+Both `/implement-tasks` and `/implement-rewrite` must offer the same optional execution features.
+
+When inside a Git repository, offer:
+
+```text
+Implement only
+New local branch + commit after each task
+Cancel
+```
+
+When Git checkpoint mode is selected:
+
+- require a clean working tree;
+- ask for a new branch name;
+- create the branch locally;
+- commit changes after every successfully completed task;
+- skip the commit when that task produced no changes;
+- stop if a required Git operation fails.
+
+Continue using the existing local-only Git helper. Do not add any remote Git operation.
+
+Both workflows must also ask:
+
+```text
+Automatic compaction between tasks?
+
+No
+Yes, when context usage exceeds 70%
+```
+
+Use the existing `DEFAULT_COMPACTION_THRESHOLD_PERCENT` and `compactIfNeeded()` implementation.
+
+Compaction must:
+- happen only between tasks;
+- never happen after the final task;
+- complete before the next task starts;
+- stop the workflow if compaction fails.
+
+`/implement-plan` must retain this behavior automatically because it delegates to the `/implement-tasks` workflow.
+
+### `/implement-rewrite` Git guardrail
+
+Add the same Git guardrail currently present in task-file execution prompts to rewrite execution prompts:
+
+```text
+Do not perform remote Git operations.
+Do not push, pull, fetch, clone, or modify remotes.
+Do not create commits; the implementation workflow manages commits when enabled.
+```
+
+The extension-owned Git operations must remain strictly local.
+
+### Preserve workflow semantics
+
+Do not change how tasks are prepared:
+
+- `/implement-rewrite` must still execute self-contained rewritten `{ title, instructions }` tasks.
+- `/implement-tasks` must still make the original task Markdown file authoritative.
+- `/implement-plan` must still generate `tasks.md` and delegate to the task-file workflow.
+
+Only the sequential execution policies should become shared.
+
+### Rename the package
+
+Rename the extension/package from:
+
+```text
+pi-implement-markdown
+```
+
+to:
+
+```text
+pi-implement
+```
+
+Update all relevant package metadata, including:
+- `package.json`;
+- `package-lock.json`;
+- documentation or other references if present.
+
+Keep the existing version unless another change is already required.
+
+Do not change the documented pi core peer dependency convention:
+
+```json
+"@earendil-works/pi-coding-agent": "*"
+```
+
+### Tests
+
+Update/add focused tests verifying:
+
+- `/implement-rewrite` offers Git checkpoint mode inside a repository;
+- rewrite checkpoint mode requires a clean working tree;
+- rewrite mode creates the selected local branch;
+- rewrite tasks create one local commit per successful task when changes exist;
+- rewrite tasks do not create empty commits;
+- rewrite prompts prohibit remote Git operations and agent-created commits;
+- `/implement-rewrite` offers automatic compaction;
+- rewrite execution compacts only when context usage exceeds 70%;
+- compaction completes before the next rewrite task starts;
+- no compaction occurs after the final rewrite task;
+- Git or compaction failure stops rewrite execution;
+- `/implement-tasks` and `/implement-plan` retain their existing behavior;
+- package metadata uses `pi-implement`.
+
+Run the full test suite and TypeScript typecheck after implementation.
+
+Keep the change focused: reuse the existing Git, compaction, executor, progress, and UI code rather than adding parallel implementations.
+
+
 ---
 
 ## Final validation
 
-After all three tasks:
+After all tasks:
 
 - run the full test suite;
 - run the TypeScript typecheck;
@@ -378,3 +528,4 @@ After all three tasks:
 - keep `/implement-tasks` faithful to the manual workflow of repeatedly asking the active agent to read the original task file and implement one task at a time;
 - keep `/implement-plan` a thin plan-to-tasks preprocessing layer;
 - preserve `/implement-rewrite` as the existing rewrite-based workflow.
+

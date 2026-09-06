@@ -1,5 +1,5 @@
 {
-  "name": "pi-implement-markdown",
+  "name": "pi-implement",
   "version": "0.1.0",
   "description": "A minimal pi extension for sequentially implementing tasks from Markdown files",
   "type": "module",

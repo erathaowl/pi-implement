@@ -242,14 +242,179 @@ test("/implement-rewrite preserves self-contained rewrite execution", async () =
 		assert.match(runtime.sent[0], /Instructions:\nAdd the endpoint and apply the shared validation rules\./);
 		assert.match(runtime.sent[1], /Instructions:\nTest the endpoint and all acceptance criteria\./);
 		assert.match(runtime.selections[0].title, /Rewrite and implement notes\.md/);
-		assert.equal(runtime.selections.some(({ title }) => title.includes("Automatic compaction")), false);
+		assert.deepEqual(runtime.selections[0].choices, ["Implement", "Cancel"]);
+		assert.deepEqual(runtime.selections[1].choices, ["No", COMPACTION_ENABLED_CHOICE]);
 		assert.equal(runtime.contextUsageCalls, 0);
 		assert.equal(runtime.compactCalls.length, 0);
-		assert.equal(runtime.execCalls.length, 0);
-		assert.ok(runtime.sent.every((prompt) => !prompt.includes("Git operations")));
+		assert.deepEqual(runtime.execCalls[0].args, ["rev-parse", "--is-inside-work-tree"]);
+		assert.ok(runtime.sent.every((prompt) => prompt.includes("Do not perform remote Git operations")));
+		assert.ok(runtime.sent.every((prompt) => prompt.includes("Do not create commits")));
 		assert.deepEqual(runtime.sessionHistory, [{ role: "user", content: "existing context" }]);
 		assert.equal(await readFile(join(directory, "notes.md"), "utf8"), source);
 		assert.ok(runtime.notifications.some(({ message }) => message === "Implementation complete."));
+	});
+});
+
+test("rewrite checkpoint mode creates a local branch and commits only tasks with changes", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "notes.md"), "rewrite tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["New local branch + commit after each task", "No"],
+			inputs: ["feature/rewrite-checkpoints"],
+			modelOutputs: [
+				{
+					tasks: [
+						{ title: "One", instructions: "Implement one." },
+						{ title: "Two", instructions: "Implement two." },
+					],
+				},
+			],
+			gitResults: [
+				gitResult("true\n"),
+				gitResult(),
+				gitResult(),
+				gitResult(" M one.ts\n"),
+				gitResult(),
+				gitResult(),
+				gitResult(),
+			],
+		});
+
+		await runtime.run("implement-rewrite", "notes.md");
+
+		assert.deepEqual(runtime.selections[0].choices, [
+			"Implement only",
+			"New local branch + commit after each task",
+			"Cancel",
+		]);
+		assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
+			["rev-parse", "--is-inside-work-tree"],
+			["status", "--porcelain"],
+			["switch", "-c", "feature/rewrite-checkpoints"],
+			["status", "--porcelain"],
+			["add", "-A"],
+			["commit", "-m", "Task 1: One"],
+			["status", "--porcelain"],
+		]);
+		assert.equal(runtime.sent.length, 2);
+		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 1);
+		assertNoRemoteGit(runtime.execCalls);
+	});
+});
+
+test("rewrite checkpoint mode requires a clean working tree", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "notes.md"), "rewrite task");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["New local branch + commit after each task"],
+			modelOutputs: [{ tasks: [{ title: "One", instructions: "Implement one." }] }],
+			gitResults: [gitResult("true\n"), gitResult(" M existing.ts\n")],
+		});
+
+		await runtime.run("implement-rewrite", "notes.md");
+
+		assert.equal(runtime.inputPrompts.length, 0);
+		assert.deepEqual(runtime.sent, []);
+		assert.ok(runtime.notifications.some(({ message }) => message.includes("clean working tree")));
+	});
+});
+
+test("Git checkpoint failure stops rewrite execution before the next task", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "notes.md"), "rewrite tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["New local branch + commit after each task", "No"],
+			inputs: ["feature/rewrite-failure"],
+			modelOutputs: [
+				{
+					tasks: [
+						{ title: "One", instructions: "Implement one." },
+						{ title: "Two", instructions: "Implement two." },
+					],
+				},
+			],
+			gitResults: [
+				gitResult("true\n"),
+				gitResult(),
+				gitResult(),
+				gitResult(" M one.ts\n"),
+				gitResult(),
+				gitResult("", 1, "commit failed"),
+			],
+		});
+
+		await runtime.run("implement-rewrite", "notes.md");
+
+		assert.equal(runtime.sent.length, 1);
+		assert.ok(runtime.notifications.some(({ message }) => message.includes("Git commit failed")));
+		assertNoRemoteGit(runtime.execCalls);
+	});
+});
+
+test("rewrite compaction completes before the next task starts", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "notes.md"), "rewrite tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
+			modelOutputs: [
+				{
+					tasks: [
+						{ title: "One", instructions: "Implement one." },
+						{ title: "Two", instructions: "Implement two." },
+					],
+				},
+			],
+			contextUsages: [{ tokens: 74, contextWindow: 100, percent: 74 }],
+			compactionOutcomes: ["manual"],
+		});
+
+		const execution = runtime.run("implement-rewrite", "notes.md");
+		await waitFor(() => runtime.compactCalls.length === 1);
+
+		assert.deepEqual(runtime.selections[1].choices, ["No", COMPACTION_ENABLED_CHOICE]);
+		assert.equal(runtime.sent.length, 1);
+		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("✓") && line.includes("One")));
+		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("○") && line.includes("Two")));
+		runtime.compactCalls[0].onComplete?.({});
+		await execution;
+		assert.equal(runtime.sent.length, 2);
+	});
+});
+
+test("rewrite compaction failure stops execution and never compacts after the final task", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "notes.md"), "rewrite tasks");
+		const failed = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
+			modelOutputs: [
+				{
+					tasks: [
+						{ title: "One", instructions: "Implement one." },
+						{ title: "Two", instructions: "Implement two." },
+					],
+				},
+			],
+			contextUsages: [{ tokens: 80, contextWindow: 100, percent: 80 }],
+			compactionOutcomes: ["error"],
+		});
+		await failed.run("implement-rewrite", "notes.md");
+		assert.equal(failed.sent.length, 1);
+		assert.ok(failed.notifications.some(({ message }) => message.includes("compaction failed")));
+
+		const finalTask = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
+			modelOutputs: [{ tasks: [{ title: "Only", instructions: "Implement it." }] }],
+			contextUsages: [{ tokens: 90, contextWindow: 100, percent: 90 }],
+		});
+		await finalTask.run("implement-rewrite", "notes.md");
+		assert.equal(finalTask.contextUsageCalls, 0);
+		assert.equal(finalTask.compactCalls.length, 0);
 	});
 });
 

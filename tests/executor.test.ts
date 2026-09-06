@@ -1,52 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ActiveSessionExecutor, runPromptSequence, type TaskStatus } from "../src/executor.ts";
+import { ActiveSessionExecutor } from "../src/executor.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-
-test("runs prompts strictly in order and waits for each prompt to complete", async () => {
-	const started: string[] = [];
-	const releases: Array<() => void> = [];
-	const snapshots: TaskStatus[][] = [];
-	const execution = runPromptSequence(
-		["one", "two", "three"],
-		(prompt) => {
-			started.push(prompt);
-			return new Promise<void>((resolve) => releases.push(resolve));
-		},
-		(statuses) => snapshots.push([...statuses]),
-	);
-
-	await tick();
-	assert.deepEqual(started, ["one"]);
-	releases.shift()?.();
-	await tick();
-	assert.deepEqual(started, ["one", "two"]);
-	releases.shift()?.();
-	await tick();
-	assert.deepEqual(started, ["one", "two", "three"]);
-	releases.shift()?.();
-
-	const result = await execution;
-	assert.equal(result.completed, true);
-	assert.deepEqual(result.statuses, ["completed", "completed", "completed"]);
-	assert.ok(snapshots.some((state) => state.includes("pending")));
-	assert.ok(snapshots.some((state) => state.includes("running")));
-	assert.deepEqual(snapshots.at(-1), ["completed", "completed", "completed"]);
-});
-
-test("marks a failed prompt and does not execute later prompts", async () => {
-	const started: string[] = [];
-	const result = await runPromptSequence(["one", "two", "three"], async (prompt) => {
-		started.push(prompt);
-		if (prompt === "two") throw new Error("turn failed");
-	});
-
-	assert.equal(result.completed, false);
-	assert.equal(result.error?.message, "turn failed");
-	assert.deepEqual(started, ["one", "two"]);
-	assert.deepEqual(result.statuses, ["completed", "failed", "pending"]);
-});
 
 test("active-session execution settles only after agent_settled", async () => {
 	const sent: string[] = [];

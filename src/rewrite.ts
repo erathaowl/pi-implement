@@ -75,5 +75,9 @@ ${task.instructions}
 Work directly on the current project.
 Complete only this task.
 Do not start subsequent tasks.
-When the task is complete, return control to the implementation workflow.`;
+When the task is complete, return control to the implementation workflow.
+
+Do not perform remote Git operations.
+Do not push, pull, fetch, clone, or modify remotes.
+Do not create commits; the implementation workflow manages commits when enabled.`;
 }

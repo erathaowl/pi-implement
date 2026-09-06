@@ -1,13 +1,5 @@
 export type TaskStatus = "pending" | "running" | "completed" | "failed";
 
-export interface ExecutionResult {
-	completed: boolean;
-	statuses: TaskStatus[];
-	error?: Error;
-}
-
-export type ProgressHandler = (statuses: readonly TaskStatus[]) => void;
-
 type AssistantTurn = {
 	role?: unknown;
 	stopReason?: unknown;
@@ -114,33 +106,3 @@ export class ActiveSessionExecutor {
 	}
 }
 
-export async function runPromptSequence(
-	prompts: readonly string[],
-	executePrompt: (prompt: string, index: number) => Promise<void>,
-	onProgress: ProgressHandler = () => {},
-): Promise<ExecutionResult> {
-	const statuses: TaskStatus[] = prompts.map(() => "pending");
-	const update = () => onProgress([...statuses]);
-	update();
-
-	for (let index = 0; index < prompts.length; index++) {
-		statuses[index] = "running";
-		update();
-
-		try {
-			await executePrompt(prompts[index], index);
-			statuses[index] = "completed";
-			update();
-		} catch (error) {
-			statuses[index] = "failed";
-			update();
-			return {
-				completed: false,
-				statuses: [...statuses],
-				error: error instanceof Error ? error : new Error(String(error)),
-			};
-		}
-	}
-
-	return { completed: true, statuses: [...statuses] };
-}

@@ -7,7 +7,7 @@ import {
 	DEFAULT_COMPACTION_THRESHOLD_PERCENT,
 	compactIfNeeded,
 } from "./compaction.ts";
-import { ActiveSessionExecutor, runPromptSequence, type TaskStatus } from "./executor.ts";
+import { ActiveSessionExecutor, type TaskStatus } from "./executor.ts";
 import { createLocalGit, type LocalGit } from "./git.ts";
 import {
 	GENERATED_TASKS_FILE,
@@ -19,6 +19,12 @@ import { buildRewritePrompt, extractRewritePlan } from "./rewrite.ts";
 import { buildTaskFilePrompt, indexTaskFile } from "./tasks.ts";
 
 const PROGRESS_WIDGET = "implement-progress";
+const GIT_CHECKPOINT_CHOICE = "New local branch + commit after each task";
+
+type ExecutionOptions = {
+	checkpoint: boolean;
+	automaticCompaction: boolean;
+};
 
 type TitledTaskList = {
 	tasks: readonly { title: string }[];
@@ -137,30 +143,12 @@ async function executeTaskSet(
 	tasks: TitledTaskList,
 	prompts: readonly string[],
 	ctx: ExtensionCommandContext,
-	executePrompt: (prompt: string, index: number) => Promise<void>,
-): Promise<void> {
-	const result = await runPromptSequence(prompts, executePrompt, (statuses) =>
-		updateProgressUi(ctx, progressTitle, tasks, statuses),
-	);
-
-	if (result.completed) {
-		report(ctx, commandName, "Implementation complete.", "info");
-	} else {
-		report(ctx, commandName, `Implementation stopped: ${result.error?.message ?? "task failed"}`, "error");
-	}
-}
-
-async function executeTaskFileSet(
-	tasks: TitledTaskList,
-	prompts: readonly string[],
-	ctx: ExtensionCommandContext,
 	executor: ActiveSessionExecutor,
 	git: LocalGit,
-	checkpoint: boolean,
-	automaticCompaction: boolean,
+	options: ExecutionOptions,
 ): Promise<void> {
 	const statuses: TaskStatus[] = prompts.map(() => "pending");
-	const update = () => updateProgressUi(ctx, "Task-file implementation", tasks, statuses);
+	const update = () => updateProgressUi(ctx, progressTitle, tasks, statuses);
 	update();
 
 	for (let index = 0; index < prompts.length; index++) {
@@ -174,7 +162,7 @@ async function executeTaskFileSet(
 			update();
 			report(
 				ctx,
-				"/implement-tasks",
+				commandName,
 				`Implementation stopped: ${error instanceof Error ? error.message : String(error)}`,
 				"error",
 			);
@@ -185,7 +173,7 @@ async function executeTaskFileSet(
 		update();
 
 		try {
-			if (checkpoint && (await git.hasChanges(ctx.cwd))) {
+			if (options.checkpoint && (await git.hasChanges(ctx.cwd))) {
 				const title = tasks.tasks[index].title.replace(/\s+/g, " ").trim();
 				await git.commitChanges(ctx.cwd, `Task ${index + 1}: ${title}`);
 			}
@@ -193,7 +181,7 @@ async function executeTaskFileSet(
 			if (index + 1 < prompts.length) {
 				await compactIfNeeded(
 					ctx,
-					automaticCompaction,
+					options.automaticCompaction,
 					DEFAULT_COMPACTION_THRESHOLD_PERCENT,
 					index + 2,
 				);
@@ -201,7 +189,7 @@ async function executeTaskFileSet(
 		} catch (error) {
 			report(
 				ctx,
-				"/implement-tasks",
+				commandName,
 				`Implementation stopped: ${error instanceof Error ? error.message : String(error)}`,
 				"error",
 			);
@@ -209,22 +197,69 @@ async function executeTaskFileSet(
 		}
 	}
 
-	report(ctx, "/implement-tasks", "Implementation complete.", "info");
+	report(ctx, commandName, "Implementation complete.", "info");
+}
+
+async function selectExecutionOptions(
+	previewTitle: string,
+	tasks: TitledTaskList,
+	isRepository: boolean,
+	ctx: ExtensionCommandContext,
+	git: LocalGit,
+): Promise<ExecutionOptions | undefined> {
+	const choices = isRepository
+		? ["Implement only", GIT_CHECKPOINT_CHOICE, "Cancel"]
+		: ["Implement", "Cancel"];
+	const choice = await ctx.ui.select(formatPreview(previewTitle, tasks), choices);
+	if (choice !== "Implement" && choice !== "Implement only" && choice !== GIT_CHECKPOINT_CHOICE) {
+		return undefined;
+	}
+
+	const checkpoint = choice === GIT_CHECKPOINT_CHOICE;
+	if (checkpoint && !(await git.isWorkingTreeClean(ctx.cwd))) {
+		throw new Error("A clean working tree is required for Git checkpoint mode.");
+	}
+
+	const compactionChoice = await ctx.ui.select("Automatic compaction between tasks?", [
+		COMPACTION_DISABLED_CHOICE,
+		COMPACTION_ENABLED_CHOICE,
+	]);
+	if (compactionChoice !== COMPACTION_DISABLED_CHOICE && compactionChoice !== COMPACTION_ENABLED_CHOICE) {
+		return undefined;
+	}
+
+	if (checkpoint) {
+		const branchName = (await ctx.ui.input("New local branch name", "feature/task-checkpoints"))?.trim();
+		if (!branchName) {
+			return undefined;
+		}
+		await git.createBranch(ctx.cwd, branchName);
+	}
+
+	return {
+		checkpoint,
+		automaticCompaction: compactionChoice === COMPACTION_ENABLED_CHOICE,
+	};
 }
 
 async function runRewriteWorkflow(
 	input: MarkdownInput,
 	ctx: ExtensionCommandContext,
 	executor: ActiveSessionExecutor,
+	git: LocalGit,
 ): Promise<void> {
 	const commandName = "/implement-rewrite";
+	const isRepository = await git.isRepository(ctx.cwd);
 	report(ctx, commandName, `Rewriting tasks in ${input.sourcePath}...`, "info");
 	const plan = await extractRewritePlan(input.markdown, ctx);
-	const choice = await ctx.ui.select(formatPreview(`Rewrite and implement ${input.sourcePath}`, plan), [
-		"Implement",
-		"Cancel",
-	]);
-	if (choice !== "Implement") {
+	const options = await selectExecutionOptions(
+		`Rewrite and implement ${input.sourcePath}`,
+		plan,
+		isRepository,
+		ctx,
+		git,
+	);
+	if (!options) {
 		report(ctx, commandName, "Rewrite implementation cancelled.", "info");
 		return;
 	}
@@ -235,7 +270,9 @@ async function runRewriteWorkflow(
 		plan,
 		plan.tasks.map(buildRewritePrompt),
 		ctx,
-		executor.execute,
+		executor,
+		git,
+		options,
 	);
 }
 
@@ -249,46 +286,27 @@ export async function runTasksWorkflow(
 	const isRepository = await git.isRepository(ctx.cwd);
 	report(ctx, commandName, `Indexing tasks in ${input.sourcePath}...`, "info");
 	const taskIndex = await indexTaskFile(input.markdown, ctx);
-	const choices = isRepository
-		? ["Implement only", "New local branch + commit after each task", "Cancel"]
-		: ["Implement", "Cancel"];
-	const choice = await ctx.ui.select(formatPreview(`Implement tasks from ${input.sourcePath}`, taskIndex), choices);
-	if (choice !== "Implement" && choice !== "Implement only" && choice !== "New local branch + commit after each task") {
+	const options = await selectExecutionOptions(
+		`Implement tasks from ${input.sourcePath}`,
+		taskIndex,
+		isRepository,
+		ctx,
+		git,
+	);
+	if (!options) {
 		report(ctx, commandName, "Task-file implementation cancelled.", "info");
 		return;
 	}
 
-	const checkpoint = choice === "New local branch + commit after each task";
-	if (checkpoint && !(await git.isWorkingTreeClean(ctx.cwd))) {
-		throw new Error("A clean working tree is required for Git checkpoint mode.");
-	}
-
-	const compactionChoice = await ctx.ui.select("Automatic compaction between tasks?", [
-		COMPACTION_DISABLED_CHOICE,
-		COMPACTION_ENABLED_CHOICE,
-	]);
-	if (compactionChoice !== COMPACTION_DISABLED_CHOICE && compactionChoice !== COMPACTION_ENABLED_CHOICE) {
-		report(ctx, commandName, "Task-file implementation cancelled.", "info");
-		return;
-	}
-
-	if (checkpoint) {
-		const branchName = (await ctx.ui.input("New local branch name", "feature/task-checkpoints"))?.trim();
-		if (!branchName) {
-			report(ctx, commandName, "Task-file implementation cancelled.", "info");
-			return;
-		}
-		await git.createBranch(ctx.cwd, branchName);
-	}
-
-	await executeTaskFileSet(
+	await executeTaskSet(
+		commandName,
+		"Task-file implementation",
 		taskIndex,
 		taskIndex.tasks.map((task, index) => buildTaskFilePrompt(input.sourcePath, index + 1, task)),
 		ctx,
 		executor,
 		git,
-		checkpoint,
-		compactionChoice === COMPACTION_ENABLED_CHOICE,
+		options,
 	);
 }
 
@@ -337,7 +355,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 		handler: async (args, ctx) =>
 			runCommand("/implement-rewrite", ctx, async () => {
 				const input = await readMarkdownInput(args, ctx.cwd, "/implement-rewrite");
-				await runRewriteWorkflow(input, ctx, executor);
+				await runRewriteWorkflow(input, ctx, executor, git);
 			}),
 	});
 
