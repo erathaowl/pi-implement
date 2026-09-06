@@ -12,17 +12,26 @@ export async function compactIfNeeded(
 	enabled: boolean,
 	thresholdPercent: number,
 	nextTaskNumber: number,
+	force = false,
 ): Promise<void> {
 	if (!enabled) {
 		return;
 	}
 
-	const usage = ctx.getContextUsage();
-	if (!usage || usage.percent === null || usage.percent <= thresholdPercent) {
-		return;
+	let percent: number | null = null;
+	if (!force) {
+		const usage = ctx.getContextUsage();
+		if (!usage || usage.percent === null || usage.percent <= thresholdPercent) {
+			return;
+		}
+		percent = usage.percent;
 	}
 
-	ctx.ui.setWorkingMessage(`Compact context before task ${nextTaskNumber} (${usage.percent}%)`);
+	ctx.ui.setWorkingMessage(
+		percent === null
+			? `Compact context before task ${nextTaskNumber}`
+			: `Compact context before task ${nextTaskNumber} (${percent}%)`,
+	);
 	try {
 		await new Promise<void>((resolve, reject) => {
 			try {

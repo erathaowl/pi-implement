@@ -62,6 +62,17 @@ test("usage above threshold waits for compaction and restores the working messag
 	assert.deepEqual(runtime.workingMessages, ["Compact context before task 3 (74%)", undefined]);
 });
 
+test("forced compaction retries without inspecting current usage", async () => {
+	const runtime = context(undefined);
+	const compaction = compactIfNeeded(runtime.ctx as never, true, DEFAULT_COMPACTION_THRESHOLD_PERCENT, 2, true);
+	await Promise.resolve();
+
+	assert.equal(runtime.usageCalls, 0);
+	assert.deepEqual(runtime.workingMessages, ["Compact context before task 2"]);
+	runtime.compactCalls[0].onComplete?.({});
+	await compaction;
+});
+
 test("compaction failure rejects and restores the working message", async () => {
 	const runtime = context({ percent: 80 });
 	const compaction = compactIfNeeded(runtime.ctx as never, true, DEFAULT_COMPACTION_THRESHOLD_PERCENT, 2);

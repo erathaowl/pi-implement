@@ -6,8 +6,7 @@ export interface LocalGit {
 	isWorkingTreeClean(cwd: string): Promise<boolean>;
 	createBranch(cwd: string, branchName: string): Promise<void>;
 	currentBranch(cwd: string): Promise<string>;
-	hasChanges(cwd: string): Promise<boolean>;
-	commitChanges(cwd: string, message: string): Promise<void>;
+	commitChanges(cwd: string, message: string): Promise<boolean>;
 }
 
 type Exec = ExtensionAPI["exec"];
@@ -25,16 +24,6 @@ export function createLocalGit(exec: Exec): LocalGit {
 		return result;
 	};
 
-	const stateExclusion = `:(top,exclude)${STATE_FILE_NAME}`;
-	const status = async (cwd: string, excludeState = false): Promise<string> =>
-		(
-			await run(
-				cwd,
-				excludeState ? ["status", "--porcelain", "--", ".", stateExclusion] : ["status", "--porcelain"],
-				"status check",
-			)
-		).stdout.trim();
-
 	return {
 		async isRepository(cwd) {
 			try {
@@ -46,7 +35,7 @@ export function createLocalGit(exec: Exec): LocalGit {
 		},
 
 		async isWorkingTreeClean(cwd) {
-			return (await status(cwd)) === "";
+			return (await run(cwd, ["status", "--porcelain"], "status check")).stdout.trim() === "";
 		},
 
 		async createBranch(cwd, branchName) {
@@ -57,13 +46,20 @@ export function createLocalGit(exec: Exec): LocalGit {
 			return (await run(cwd, ["branch", "--show-current"], "branch check")).stdout.trim();
 		},
 
-		async hasChanges(cwd) {
-			return (await status(cwd, true)) !== "";
-		},
-
 		async commitChanges(cwd, message) {
-			await run(cwd, ["add", "-A", "--", ".", stateExclusion], "staging");
-			await run(cwd, ["commit", "-m", message, "--", ".", stateExclusion], "commit");
+			await run(cwd, ["add", "-A"], "staging");
+			await run(cwd, ["reset", "-q", "HEAD", "--", STATE_FILE_NAME], "state-file unstaging");
+
+			const stagedChanges = await exec("git", ["diff", "--cached", "--quiet"], { cwd });
+			if (stagedChanges.code === 0) {
+				return false;
+			}
+			if (stagedChanges.code !== 1) {
+				throw new Error(`Git change check failed: ${failureDetail(stagedChanges)}`);
+			}
+
+			await run(cwd, ["commit", "-m", message], "commit");
+			return true;
 		},
 	};
 }

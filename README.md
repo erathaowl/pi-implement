@@ -30,7 +30,7 @@ For both `/implement-rewrite` and `/implement-tasks`, a Git repository adds a ch
 
 Git operations owned by this extension are strictly local: repository detection, status checks, local branch creation, staging, and commits. The extension never fetches, pulls, pushes, clones, or modifies remotes. Both rewrite and task-file prompts tell the active agent not to perform remote Git operations or create commits itself.
 
-Both workflows also ask whether automatic between-task compaction should be enabled. When enabled, they check context usage after each successful task except the last. Usage above 70% triggers pi's normal compaction, which must finish before the next task starts. Unavailable usage or usage at or below 70% is skipped; compaction failure stops the workflow. This choice is in-memory for the current run only.
+Both workflows also ask whether automatic between-task compaction should be enabled. When enabled, they check context usage after each successful task except the last. Usage above 70% triggers pi's normal compaction, which must finish before the next task starts. Unavailable usage or usage at or below 70% is skipped; compaction failure stops the workflow. A failed compaction remains pending and is retried before the next task when the workflow is resumed.
 
 ### `/implement-plan <plan-file>`
 
@@ -62,7 +62,7 @@ Input Markdown files are read-only. `/implement-plan` is the sole exception in t
 
 ## Recovery
 
-New implementation workflows ask whether `.pi-implement-state.json` should be listed in the repository-root `.gitignore`, with **Yes** as the default. The file stores only prepared task titles and prompts, the next task index, status, and the selected Git/compaction options. Writes are atomic, and extension-created Git checkpoints always exclude the state file independently of `.gitignore`.
+Inside a Git repository, new implementation workflows ask whether `.pi-implement-state.json` should be listed in the repository-root `.gitignore`, with **Yes** as the default. Outside Git, the state file is still used but `.gitignore` is not created or changed. The file stores only prepared task titles and prompts, the next task index, status, pending compaction, and the selected Git/compaction options. Writes are atomic. For each checkpoint, the extension stages changes, explicitly unstages the state file, and then creates a normal local commit, so the state file is never committed whether it is ignored or not.
 
 If a workflow is interrupted or fails, starting any implementation command offers **Resume**, **Discard and start new**, or **Cancel** before model extraction or plan conversion. Resume uses the saved prompts without repeating extraction or indexing. A task interrupted while running is rerun; a task completed before a compaction failure is not. Git checkpoint restores require the current branch to match the saved branch and never switch it automatically. State is deleted after complete success and preserved after failure or interruption.
 

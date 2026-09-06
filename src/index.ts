@@ -185,6 +185,25 @@ async function executeTaskSet(
 	const update = () => updateProgressUi(ctx, progressTitle, tasks, statuses);
 	update();
 
+	if (state.pendingCompaction) {
+		try {
+			await compactIfNeeded(
+				ctx,
+				state.automaticCompaction,
+				DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+				state.nextTaskIndex + 1,
+				true,
+			);
+			delete state.pendingCompaction;
+			state.status = "running";
+			delete state.error;
+			await saveState(ctx.cwd, state);
+		} catch (error) {
+			await saveFailure(ctx, commandName, state, state.nextTaskIndex, error);
+			return;
+		}
+	}
+
 	for (let index = state.nextTaskIndex; index < state.tasks.length; index++) {
 		statuses[index] = "running";
 		update();
@@ -211,7 +230,7 @@ async function executeTaskSet(
 		update();
 
 		try {
-			if (state.checkpoint && (await git.hasChanges(ctx.cwd))) {
+			if (state.checkpoint) {
 				const title = state.tasks[index].title.replace(/\s+/g, " ").trim();
 				await git.commitChanges(ctx.cwd, `Task ${index + 1}: ${title}`);
 			}
@@ -239,6 +258,7 @@ async function executeTaskSet(
 					index + 2,
 				);
 			} catch (error) {
+				state.pendingCompaction = true;
 				await saveFailure(ctx, commandName, state, index + 1, error);
 				return;
 			}
@@ -323,9 +343,9 @@ async function runRewriteWorkflow(
 	executor: ActiveSessionExecutor,
 	git: LocalGit,
 	ignoreStateFile: boolean,
+	isRepository: boolean,
 ): Promise<void> {
 	const commandName = "/implement-rewrite";
-	const isRepository = await git.isRepository(ctx.cwd);
 	report(ctx, commandName, `Rewriting tasks in ${input.sourcePath}...`, "info");
 	const plan = await extractRewritePlan(input.markdown, ctx);
 	const options = await selectExecutionOptions(
@@ -360,9 +380,9 @@ export async function runTasksWorkflow(
 	executor: ActiveSessionExecutor,
 	git: LocalGit,
 	ignoreStateFile: boolean,
+	isRepository: boolean,
 ): Promise<void> {
 	const commandName = "/implement-tasks";
-	const isRepository = await git.isRepository(ctx.cwd);
 	report(ctx, commandName, `Indexing tasks in ${input.sourcePath}...`, "info");
 	const taskIndex = await indexTaskFile(input.markdown, ctx);
 	const options = await selectExecutionOptions(
@@ -399,6 +419,9 @@ function formatRestorePrompt(state: ImplementationState): string {
 		`Task: ${taskNumber}/${state.tasks.length}`,
 		`Status: ${state.status}`,
 	];
+	if (state.pendingCompaction) {
+		lines.push("Pending compaction: yes");
+	}
 	if (state.error) {
 		lines.push(`Error: ${state.error}`);
 	}
@@ -454,7 +477,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 	const runCommand = async (
 		commandName: string,
 		ctx: ExtensionCommandContext,
-		workflow: (ignoreStateFile: boolean) => Promise<void>,
+		workflow: (ignoreStateFile: boolean, isRepository: boolean) => Promise<void>,
 	): Promise<void> => {
 		if (!ctx.hasUI) {
 			report(ctx, commandName, `${commandName} requires an interactive UI for confirmation.`, "error");
@@ -475,8 +498,11 @@ export default function implementExtension(pi: ExtensionAPI): void {
 			if (await handleExistingState(commandName, ctx, executor, git)) {
 				return;
 			}
-			const ignoreStateFile = await ctx.ui.select(`Add ${STATE_FILE_NAME} to .gitignore?`, ["Yes", "No"]);
-			await workflow(ignoreStateFile === "Yes");
+			const isRepository = await git.isRepository(ctx.cwd);
+			const ignoreStateFile = isRepository
+				? await ctx.ui.select(`Add ${STATE_FILE_NAME} to .gitignore?`, ["Yes", "No"])
+				: "No";
+			await workflow(ignoreStateFile === "Yes", isRepository);
 		} catch (error) {
 			report(ctx, commandName, error instanceof Error ? error.message : String(error), "error");
 		} finally {
@@ -488,25 +514,25 @@ export default function implementExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("implement-rewrite", {
 		description: "Rewrite Markdown into self-contained tasks and implement them sequentially",
 		handler: async (args, ctx) =>
-			runCommand("/implement-rewrite", ctx, async (ignoreStateFile) => {
+			runCommand("/implement-rewrite", ctx, async (ignoreStateFile, isRepository) => {
 				const input = await readMarkdownInput(args, ctx.cwd, "/implement-rewrite");
-				await runRewriteWorkflow(input, ctx, executor, git, ignoreStateFile);
+				await runRewriteWorkflow(input, ctx, executor, git, ignoreStateFile, isRepository);
 			}),
 	});
 
 	pi.registerCommand("implement-tasks", {
 		description: "Implement tasks sequentially from an authoritative Markdown task file",
 		handler: async (args, ctx) =>
-			runCommand("/implement-tasks", ctx, async (ignoreStateFile) => {
+			runCommand("/implement-tasks", ctx, async (ignoreStateFile, isRepository) => {
 				const input = await readMarkdownInput(args, ctx.cwd, "/implement-tasks");
-				await runTasksWorkflow(input, ctx, executor, git, ignoreStateFile);
+				await runTasksWorkflow(input, ctx, executor, git, ignoreStateFile, isRepository);
 			}),
 	});
 
 	pi.registerCommand("implement-plan", {
 		description: "Convert a plan to tasks.md and implement it through the task-file workflow",
 		handler: async (args, ctx) =>
-			runCommand("/implement-plan", ctx, async (ignoreStateFile) => {
+			runCommand("/implement-plan", ctx, async (ignoreStateFile, isRepository) => {
 				const input = await readMarkdownInput(args, ctx.cwd, "/implement-plan");
 				if (!ctx.model) {
 					throw new Error("No model is selected.");
@@ -533,6 +559,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 					executor,
 					git,
 					ignoreStateFile,
+					isRepository,
 				);
 			}),
 	});
