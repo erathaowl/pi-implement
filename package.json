@@ -3,9 +3,24 @@
   "version": "0.1.0",
   "description": "A minimal pi extension for sequentially implementing tasks from Markdown files",
   "type": "module",
-  "private": true,
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/erathaowl/pi-implement.git"
+  },
+  "homepage": "https://github.com/erathaowl/pi-implement#readme",
+  "bugs": {
+    "url": "https://github.com/erathaowl/pi-implement/issues"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "node --test tests/*.test.ts",
@@ -26,6 +41,9 @@
   },
   "engines": {
     "node": ">=22.19.0"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "license": "MIT"
 }
