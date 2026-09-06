@@ -12,6 +12,12 @@ All workflows execute tasks sequentially in the active pi session and share the 
 
 ## Installation
 
+Install from npm:
+
+```bash
+pi install npm:pi-implement
+```
+
 Install directly from GitHub:
 
 ```bash
