@@ -325,6 +325,7 @@ async function selectExecutionOptions(
 
 function createImplementationState(
 	workflow: ImplementationState["workflow"],
+	cwd: string,
 	sourcePath: string,
 	tasks: TitledTaskList,
 	prompts: readonly string[],
@@ -333,6 +334,7 @@ function createImplementationState(
 	return {
 		version: 1,
 		workflow,
+		cwd: resolve(cwd),
 		sourcePath,
 		tasks: tasks.tasks.map((task, index) => ({ title: task.title, prompt: prompts[index] })),
 		nextTaskIndex: 0,
@@ -376,7 +378,7 @@ async function runRewriteWorkflow(
 		ctx,
 		executor,
 		git,
-		createImplementationState("rewrite", input.sourcePath, plan, prompts, options),
+		createImplementationState("rewrite", ctx.cwd, input.sourcePath, plan, prompts, options),
 	);
 }
 
@@ -413,7 +415,7 @@ export async function runTasksWorkflow(
 		ctx,
 		executor,
 		git,
-		createImplementationState("tasks", input.sourcePath, taskIndex, prompts, options),
+		createImplementationState("tasks", ctx.cwd, input.sourcePath, taskIndex, prompts, options),
 	);
 }
 
@@ -453,6 +455,13 @@ async function handleExistingState(
 	if (choice !== "Resume") {
 		report(ctx, requestedCommand, "Implementation resume cancelled.", "info");
 		return true;
+	}
+
+	const currentCwd = resolve(ctx.cwd);
+	if (currentCwd !== state.cwd) {
+		throw new Error(
+			`Cannot resume this implementation from a different working directory.\nExpected: ${state.cwd}\nCurrent: ${currentCwd}`,
+		);
 	}
 
 	if (state.checkpoint) {

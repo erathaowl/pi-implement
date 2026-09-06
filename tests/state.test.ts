@@ -15,6 +15,7 @@ import {
 const state: ImplementationState = {
 	version: 1,
 	workflow: "tasks",
+	cwd: "/project",
 	sourcePath: "tasks.md",
 	tasks: [{ title: "One", prompt: "Implement one" }],
 	nextTaskIndex: 0,
@@ -72,6 +73,17 @@ test("state and gitignore are stored at the repository root", async () => {
 		assert.deepEqual(await loadState(nested), state);
 		assert.equal(JSON.parse(await readFile(join(directory, STATE_FILE_NAME), "utf8")).workflow, "tasks");
 		assert.equal(await readFile(join(directory, ".gitignore"), "utf8"), `${STATE_FILE_NAME}\n`);
+	});
+});
+
+test("state validation requires a non-empty working directory", async () => {
+	await withTempDir(async (directory) => {
+		for (const cwd of [undefined, "   "]) {
+			const candidate: Record<string, unknown> = { ...state, cwd };
+			if (cwd === undefined) delete candidate.cwd;
+			await writeFile(join(directory, STATE_FILE_NAME), JSON.stringify(candidate), "utf8");
+			await assert.rejects(loadState(directory), /Invalid implementation state/);
+		}
 	});
 });
 

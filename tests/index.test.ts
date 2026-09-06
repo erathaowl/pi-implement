@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { COMPACTION_ENABLED_CHOICE } from "../src/compaction.ts";
 import implementExtension, { readMarkdownInput } from "../src/index.ts";
@@ -213,10 +213,11 @@ function fakeRuntime(options: {
 	};
 }
 
-function savedState(overrides: Partial<ImplementationState> = {}): ImplementationState {
+function savedState(cwd: string, overrides: Partial<ImplementationState> = {}): ImplementationState {
 	return {
 		version: 1,
 		workflow: "tasks",
+		cwd: resolve(cwd),
 		sourcePath: "tasks.md",
 		tasks: [
 			{ title: "One", prompt: "saved prompt one" },
@@ -257,7 +258,7 @@ test("file handling rejects nonexistent, directory, and empty paths", async () =
 for (const status of ["running", "failed"] as const) {
 	test(`restore resumes ${status} state from the saved task without model preparation`, async () => {
 		await withTempDir(async (directory) => {
-			const state = savedState({ status, error: status === "failed" ? "previous failure" : undefined });
+			const state = savedState(directory, { status, error: status === "failed" ? "previous failure" : undefined });
 			await saveState(directory, state);
 			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], gitUnavailable: true });
 
@@ -276,7 +277,7 @@ for (const status of ["running", "failed"] as const) {
 
 test("discard deletes saved state and starts the newly requested workflow", async () => {
 	await withTempDir(async (directory) => {
-		await saveState(directory, savedState());
+		await saveState(directory, savedState(join(directory, "original")));
 		await writeFile(join(directory, "tasks.md"), "## Task 1 - New\nImplement it.");
 		const runtime = fakeRuntime({
 			cwd: directory,
@@ -297,7 +298,7 @@ test("discard deletes saved state and starts the newly requested workflow", asyn
 
 test("restore cancellation leaves state unchanged", async () => {
 	await withTempDir(async (directory) => {
-		const state = savedState({ status: "failed", error: "keep this" });
+		const state = savedState(directory, { status: "failed", error: "keep this" });
 		await saveState(directory, state);
 		const before = await readFile(join(directory, STATE_FILE_NAME), "utf8");
 		const runtime = fakeRuntime({ cwd: directory, choices: ["Cancel"] });
@@ -311,11 +312,38 @@ test("restore cancellation leaves state unchanged", async () => {
 	});
 });
 
+test("restore rejects a different working directory before saved work can run", async () => {
+	await withTempDir(async (directory) => {
+		const originalCwd = join(directory, "packages", "original");
+		const currentCwd = join(directory, "packages", "current");
+		await mkdir(join(directory, ".git"));
+		await mkdir(originalCwd, { recursive: true });
+		await mkdir(currentCwd, { recursive: true });
+		await saveState(originalCwd, savedState(originalCwd, { pendingCompaction: true, automaticCompaction: true }));
+		const runtime = fakeRuntime({ cwd: currentCwd, choices: ["Resume"] });
+
+		await runtime.run("implement-tasks", "missing.md");
+
+		assert.deepEqual(runtime.sent, []);
+		assert.equal(runtime.execCalls.length, 0);
+		assert.equal(runtime.compactCalls.length, 0);
+		assert.equal(runtime.completeCalls.length, 0);
+		assert.ok(
+			runtime.notifications.some(
+				({ message }) =>
+					message ===
+					`Cannot resume this implementation from a different working directory.\nExpected: ${resolve(originalCwd)}\nCurrent: ${resolve(currentCwd)}`,
+			),
+		);
+		assert.equal((await loadState(currentCwd))?.pendingCompaction, true);
+	});
+});
+
 test("checkpoint restore validates the saved branch without switching", async () => {
 	await withTempDir(async (directory) => {
 		await saveState(
 			directory,
-			savedState({ checkpoint: true, branchName: "feature/saved", status: "failed", error: "commit failed" }),
+			savedState(directory, { checkpoint: true, branchName: "feature/saved", status: "failed", error: "commit failed" }),
 		);
 		const runtime = fakeRuntime({
 			cwd: directory,
@@ -404,6 +432,7 @@ test("workflow state is saved before each task, advances without Git, and is del
 		await waitFor(() => runtime.sent.length === 1);
 		const started = await loadState(directory);
 		assert.equal(started?.workflow, "tasks");
+		assert.equal(started?.cwd, resolve(directory));
 		assert.equal(started?.status, "running");
 		assert.equal(started?.nextTaskIndex, 0);
 		assert.deepEqual(started?.tasks.map(({ title }) => title), ["One", "Two"]);
