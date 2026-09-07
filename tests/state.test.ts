@@ -21,6 +21,9 @@ const state: ImplementationState = {
 	status: "running",
 	checkpoint: false,
 	automaticCompaction: false,
+	compactionThresholdPercent: 70,
+	implementationModel: { provider: "test", id: "selected" },
+	implementationThinkingLevel: "medium",
 };
 
 async function withTempDir(run: (directory: string) => Promise<void>): Promise<void> {
@@ -119,6 +122,22 @@ test("pending checkpoint validation requires a boolean, checkpoint mode, and a c
 				pendingCheckpoint: true,
 				...overrides,
 			}));
+			await assert.rejects(loadState(directory), /Invalid implementation state/);
+		}
+	});
+});
+
+test("state validation rejects invalid implementation settings and compaction thresholds", async () => {
+	await withTempDir(async (directory) => {
+		for (const overrides of [
+			{ implementationModel: { provider: "", id: "selected" } },
+			{ implementationModel: { provider: "test", id: "" } },
+			{ implementationThinkingLevel: "extreme" },
+			{ compactionThresholdPercent: 0 },
+			{ compactionThresholdPercent: 101 },
+			{ compactionThresholdPercent: 70.5 },
+		]) {
+			await writeFile(join(directory, STATE_FILE_NAME), JSON.stringify({ ...state, ...overrides }), "utf8");
 			await assert.rejects(loadState(directory), /Invalid implementation state/);
 		}
 	});

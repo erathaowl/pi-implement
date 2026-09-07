@@ -6,9 +6,17 @@ import {
 	COMPACTION_ENABLED_CHOICE,
 	DEFAULT_COMPACTION_THRESHOLD_PERCENT,
 	compactIfNeeded,
+	parseCompactionThresholdPercent,
 } from "./compaction.ts";
 import { ActiveSessionExecutor, type TaskStatus } from "./executor.ts";
 import { createLocalGit, type LocalGit } from "./git.ts";
+import {
+	applyImplementationSettings,
+	assertImplementationSettings,
+	selectImplementationSettings,
+	type ImplementationModelController,
+	type ImplementationSettings,
+} from "./model.ts";
 import {
 	GENERATED_TASKS_FILE,
 	convertPlanToTaskDocument,
@@ -29,9 +37,10 @@ const PROGRESS_WIDGET = "implement-progress";
 const PROGRESS_TASK_LIMIT = 5;
 const GIT_CHECKPOINT_CHOICE = "Git checkpoints: new or current local branch";
 
-type ExecutionOptions = {
+type ExecutionOptions = ImplementationSettings & {
 	checkpoint: boolean;
 	automaticCompaction: boolean;
+	compactionThresholdPercent: number;
 	branchName?: string;
 };
 
@@ -215,6 +224,7 @@ async function executeTaskSet(
 	executor: ActiveSessionExecutor,
 	git: LocalGit,
 	state: ImplementationState,
+	modelController: ImplementationModelController,
 ): Promise<void> {
 	const tasks = { tasks: state.tasks };
 	const statuses: TaskStatus[] = state.tasks.map((_, index) =>
@@ -238,7 +248,7 @@ async function executeTaskSet(
 			await compactIfNeeded(
 				ctx,
 				state.automaticCompaction,
-				DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+				state.compactionThresholdPercent,
 				state.nextTaskIndex + 1,
 				state.pendingCompaction === true,
 				async () => {
@@ -270,6 +280,7 @@ async function executeTaskSet(
 		}
 
 		try {
+			assertImplementationSettings(state, ctx, modelController);
 			await executor.execute(state.tasks[index].prompt);
 		} catch (error) {
 			statuses[index] = "failed";
@@ -302,7 +313,7 @@ async function executeTaskSet(
 				await compactIfNeeded(
 					ctx,
 					state.automaticCompaction,
-					DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+					state.compactionThresholdPercent,
 					index + 2,
 					false,
 					async () => {
@@ -333,6 +344,7 @@ async function selectExecutionOptions(
 	isRepository: boolean,
 	ctx: ExtensionCommandContext,
 	git: LocalGit,
+	modelController: ImplementationModelController,
 ): Promise<ExecutionOptions | undefined> {
 	const choices = isRepository
 		? ["Implement only", GIT_CHECKPOINT_CHOICE, "Cancel"]
@@ -352,6 +364,25 @@ async function selectExecutionOptions(
 		COMPACTION_ENABLED_CHOICE,
 	]);
 	if (compactionChoice !== COMPACTION_DISABLED_CHOICE && compactionChoice !== COMPACTION_ENABLED_CHOICE) {
+		return undefined;
+	}
+
+	let compactionThresholdPercent = DEFAULT_COMPACTION_THRESHOLD_PERCENT;
+	if (compactionChoice === COMPACTION_ENABLED_CHOICE) {
+		const thresholdInput = await ctx.ui.input(
+			`Compaction threshold percentage (default: ${DEFAULT_COMPACTION_THRESHOLD_PERCENT}%)`,
+			String(DEFAULT_COMPACTION_THRESHOLD_PERCENT),
+		);
+		if (thresholdInput === undefined) {
+			return undefined;
+		}
+		if (thresholdInput.trim()) {
+			compactionThresholdPercent = parseCompactionThresholdPercent(thresholdInput);
+		}
+	}
+
+	const implementationSettings = await selectImplementationSettings(ctx, modelController);
+	if (!implementationSettings) {
 		return undefined;
 	}
 
@@ -379,8 +410,10 @@ async function selectExecutionOptions(
 	}
 
 	return {
+		...implementationSettings,
 		checkpoint,
 		automaticCompaction: compactionChoice === COMPACTION_ENABLED_CHOICE,
+		compactionThresholdPercent,
 		branchName,
 	};
 }
@@ -401,6 +434,9 @@ function createImplementationState(
 		status: "running",
 		checkpoint: options.checkpoint,
 		automaticCompaction: options.automaticCompaction,
+		compactionThresholdPercent: options.compactionThresholdPercent,
+		implementationModel: options.implementationModel,
+		implementationThinkingLevel: options.implementationThinkingLevel,
 		branchName: options.branchName,
 	};
 }
@@ -410,6 +446,7 @@ export async function runTasksWorkflow(
 	ctx: ExtensionCommandContext,
 	executor: ActiveSessionExecutor,
 	git: LocalGit,
+	modelController: ImplementationModelController,
 	ignoreStateFile: boolean,
 	isRepository: boolean,
 ): Promise<void> {
@@ -422,6 +459,7 @@ export async function runTasksWorkflow(
 		isRepository,
 		ctx,
 		git,
+		modelController,
 	);
 	if (!options) {
 		report(ctx, commandName, "Task-file implementation cancelled.", "info");
@@ -432,13 +470,22 @@ export async function runTasksWorkflow(
 		await addStateFileToGitignore(ctx.cwd);
 	}
 	const prompts = taskIndex.tasks.map((task, index) => buildTaskFilePrompt(input.sourcePath, index + 1, task));
+	const state = createImplementationState(ctx.cwd, input.sourcePath, taskIndex, prompts, options);
+	await saveState(ctx.cwd, state);
+	try {
+		await applyImplementationSettings(state, ctx, modelController);
+	} catch (error) {
+		await saveFailure(ctx, commandName, state, 0, error);
+		return;
+	}
 	await executeTaskSet(
 		commandName,
 		"Task-file implementation",
 		ctx,
 		executor,
 		git,
-		createImplementationState(ctx.cwd, input.sourcePath, taskIndex, prompts, options),
+		state,
+		modelController,
 	);
 }
 
@@ -449,7 +496,12 @@ function formatRestorePrompt(state: ImplementationState): string {
 		"Workflow: /implement-tasks",
 		`Task: ${taskNumber}/${state.tasks.length}`,
 		`Status: ${state.status}`,
+		`Model: ${state.implementationModel.provider}/${state.implementationModel.id}`,
+		`Thinking: ${state.implementationThinkingLevel}`,
 	];
+	if (state.automaticCompaction) {
+		lines.push(`Compaction threshold: ${state.compactionThresholdPercent}%`);
+	}
 	if (state.pendingCheckpoint) {
 		lines.push("Pending Git checkpoint: yes");
 	}
@@ -467,6 +519,7 @@ async function handleExistingState(
 	ctx: ExtensionCommandContext,
 	executor: ActiveSessionExecutor,
 	git: LocalGit,
+	modelController: ImplementationModelController,
 ): Promise<boolean> {
 	const state = await loadState(ctx.cwd);
 	if (!state) {
@@ -499,7 +552,14 @@ async function handleExistingState(
 		}
 	}
 
-	await executeTaskSet("/implement-tasks", "Task-file implementation", ctx, executor, git, state);
+	try {
+		await applyImplementationSettings(state, ctx, modelController);
+	} catch (error) {
+		await saveFailure(ctx, requestedCommand, state, state.nextTaskIndex, error);
+		return true;
+	}
+
+	await executeTaskSet("/implement-tasks", "Task-file implementation", ctx, executor, git, state, modelController);
 	return true;
 }
 
@@ -534,7 +594,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 		workflowRunning = true;
 		ctx.ui.setWidget(PROGRESS_WIDGET, undefined);
 		try {
-			if (await handleExistingState(commandName, ctx, executor, git)) {
+			if (await handleExistingState(commandName, ctx, executor, git, pi)) {
 				return;
 			}
 			const isRepository = await git.isRepository(ctx.cwd);
@@ -559,7 +619,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 					report(ctx, "/implement-tasks", "Task-file implementation cancelled.", "info");
 					return;
 				}
-				await runTasksWorkflow(input, ctx, executor, git, ignoreStateFile, isRepository);
+				await runTasksWorkflow(input, ctx, executor, git, pi, ignoreStateFile, isRepository);
 			}),
 	});
 
@@ -596,6 +656,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 					ctx,
 					executor,
 					git,
+					pi,
 					ignoreStateFile,
 					isRepository,
 				);

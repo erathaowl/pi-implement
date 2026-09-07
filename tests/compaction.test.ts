@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { compactIfNeeded, DEFAULT_COMPACTION_THRESHOLD_PERCENT } from "../src/compaction.ts";
+import {
+	compactIfNeeded,
+	DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+	parseCompactionThresholdPercent,
+} from "../src/compaction.ts";
 
 function context(usage: { percent: number | null } | undefined) {
 	let usageCalls = 0;
@@ -22,6 +26,18 @@ function context(usage: { percent: number | null } | undefined) {
 	};
 	return { compactCalls, ctx, get usageCalls() { return usageCalls; }, workingMessages };
 }
+
+test("compaction threshold accepts integer percentages from 1 through 100", () => {
+	assert.equal(parseCompactionThresholdPercent(" 1 "), 1);
+	assert.equal(parseCompactionThresholdPercent("85"), 85);
+	assert.equal(parseCompactionThresholdPercent("100"), 100);
+});
+
+test("compaction threshold rejects non-integers and out-of-range percentages", () => {
+	for (const input of ["", "0", "101", "70.5", "70%", "text"]) {
+		assert.throws(() => parseCompactionThresholdPercent(input), /integer from 1 to 100 percent/);
+	}
+});
 
 test("disabled compaction does not inspect context usage", async () => {
 	const runtime = context({ percent: 90 });

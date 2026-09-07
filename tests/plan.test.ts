@@ -23,6 +23,7 @@ test("plan conversion uses an isolated tool-free model call and returns Markdown
 	const model = { provider: "test", id: "selected" };
 	const ctx = {
 		model,
+		thinkingLevel: "high",
 		modelRegistry: {
 			async complete(...args: unknown[]) {
 				calls.push(args);
@@ -46,6 +47,7 @@ test("plan conversion uses an isolated tool-free model call and returns Markdown
 	assert.equal(context.messages[0].content[0].text, "Build the feature");
 	assert.equal("tools" in context, false);
 	assert.equal("toolChoice" in options, false);
+	assert.equal(options.reasoning, "high");
 	assert.match(PLAN_CONVERSION_PROMPT, /requirements, constraints, acceptance criteria/);
 	assert.match(PLAN_CONVERSION_PROMPT, /intended execution order/);
 });

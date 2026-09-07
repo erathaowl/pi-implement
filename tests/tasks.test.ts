@@ -12,6 +12,7 @@ function indexingContext(result: unknown) {
 	const calls: unknown[][] = [];
 	const ctx = {
 		model,
+		thinkingLevel: "high",
 		modelRegistry: {
 			async complete(...args: unknown[]) {
 				calls.push(args);
@@ -44,6 +45,7 @@ test("task indexing uses an isolated tool-free call and returns titles only", as
 	assert.equal(context.messages[0].content[0].text, markdown);
 	assert.equal("tools" in context, false);
 	assert.equal("toolChoice" in options, false);
+	assert.equal(options.reasoning, "high");
 });
 
 test("task index preserves source order", async () => {

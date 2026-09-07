@@ -88,9 +88,9 @@ This is useful when the input describes the work at plan level rather than as cl
 
 ## Common behavior
 
-All preparation calls use the currently selected model in isolation. Tools are omitted from those model calls, and their prompts and responses are not added to the active session history.
+All preparation calls use the currently active model and thinking settings in isolation. Tools are omitted from those model calls, and their prompts and responses are not added to the active session history. For `/implement-plan`, both plan conversion and generated-task indexing finish before implementation settings are selected.
 
-Before execution, the detected tasks are previewed for confirmation.
+Before execution, the detected tasks are previewed for confirmation. The workflow then asks for one implementation model and thinking level, defaulting to the currently active pair. That fixed pair is used for every task; there is no per-task selection or automatic model switching.
 
 Tasks are implemented sequentially in the current pi session. The extension waits for the complete agent lifecycle, including tool calls and retries, to settle before starting the next task.
 
@@ -121,9 +121,9 @@ Task prompts also instruct the active agent not to create commits or perform rem
 
 Each workflow can optionally enable automatic compaction between tasks.
 
-When enabled, context usage is checked after every successful task except the last. Usage above 70% triggers pi's normal compaction before the next task starts.
+When enabled, the workflow asks for an integer threshold percentage from 1 through 100. Leaving the input empty uses the default of 70%. Context usage is checked after every successful task except the last, and usage above the selected threshold triggers pi's normal compaction before the next task starts. Disabled compaction does not ask for a threshold.
 
-Usage at or below 70%, or unavailable usage information, does not trigger compaction.
+Usage at or below the selected threshold, or unavailable usage information, does not trigger compaction.
 
 Once compaction starts, it is persisted as pending until it completes successfully. If compaction fails or execution is interrupted while it is running, recovery retries it before starting the next task.
 
@@ -137,7 +137,7 @@ Active implementations are tracked in a single repository-local state file:
 
 Inside a Git repository, new workflows ask whether this file should be added to the repository-root `.gitignore`, with **Yes** as the default. Outside Git, the state file is still used but `.gitignore` is not created or modified.
 
-The state contains only what is required to resume the workflow: prepared task titles and prompts, execution position, status, working directory, pending checkpoint/compaction, and the selected Git/compaction options.
+The state contains only what is required to resume the workflow: prepared task titles and prompts, execution position, status, working directory, pending checkpoint/compaction, the selected implementation model and thinking level, and the selected Git/compaction options (including the compaction threshold).
 
 Writes are atomic. Git checkpoints explicitly exclude the state file whether or not it is ignored.
 
@@ -147,7 +147,7 @@ If unfinished state exists, starting any implementation command offers:
 - **Discard and start new**
 - **Cancel**
 
-Resume uses the saved task sequence directly, without repeating plan conversion or task indexing.
+Resume uses the saved task sequence directly, without repeating plan conversion, task indexing, or implementation-setting prompts. It restores the saved model, thinking level, and compaction threshold. If the model or exact thinking level can no longer be used, recovery stops with an error instead of continuing under different settings.
 
 A task interrupted while running is rerun. A task already completed before a Git checkpoint or compaction failure is not. Resume retries any pending Git checkpoint before compaction or the next task, using the saved task metadata for the commit message. If no staged changes remain (for example, the commit completed before an interruption), checkpoint recovery succeeds without creating another commit.
 
@@ -165,9 +165,10 @@ The state file is deleted after complete success and preserved after failure or 
 - progress display;
 - optional local Git checkpoints;
 - optional context-aware compaction;
+- one model/thinking selection per workflow;
 - lightweight single-file recovery.
 
-It intentionally does not provide task editing or reordering, parallel execution, subagents, dependency graphs, automatic retries, state history or snapshots, model selection, or remote Git automation.
+It intentionally does not provide task editing or reordering, parallel execution, subagents, dependency graphs, automatic retries, state history or snapshots, per-task model selection, global model preferences, automatic model switching, or remote Git automation.
 
 ## Release on npm
 

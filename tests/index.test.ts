@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { COMPACTION_ENABLED_CHOICE } from "../src/compaction.ts";
+import { COMPACTION_ENABLED_CHOICE, DEFAULT_COMPACTION_THRESHOLD_PERCENT } from "../src/compaction.ts";
 import implementExtension, { formatProgress, readMarkdownInput } from "../src/index.ts";
 import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from "../src/state.ts";
 import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
@@ -22,7 +22,23 @@ type GitResult = {
 	killed: boolean;
 };
 
+type FakeModel = {
+	provider: string;
+	id: string;
+	reasoning: boolean;
+	thinkingLevelMap?: Record<string, string | null>;
+};
+
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
 const gitResult = (stdout = "", code = 0, stderr = ""): GitResult => ({ stdout, stderr, code, killed: false });
+
+const fakeModel = (provider: string, id: string): FakeModel => ({
+	provider,
+	id,
+	reasoning: true,
+	thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+});
 
 function assertNoRemoteGit(calls: Array<{ command: string; args: string[] }>): void {
 	const forbidden = ["fetch", "pull", "push", "clone", "ls-remote", "remote"];
@@ -62,11 +78,18 @@ function fakeRuntime(options: {
 	compactionOutcomes?: Array<"complete" | "error" | "manual">;
 	ignoreStateChoice?: "Yes" | "No";
 	manualTurns?: boolean;
+	models?: FakeModel[];
+	currentModel?: FakeModel;
+	thinkingLevel?: ThinkingLevel;
+	scopedModels?: FakeModel[];
+	setModelOutcomes?: Array<boolean | Error>;
+	thresholdInputs?: Array<string | undefined>;
 }) {
 	const commands = new Map<string, Handler>();
 	const handlers = new Map<string, Handler[]>();
 	const sent: string[] = [];
 	const completeCalls: unknown[][] = [];
+	const completeSettings: Array<{ model: string; thinkingLevel: ThinkingLevel }> = [];
 	const notifications: Array<{ message: string; type?: string }> = [];
 	const selections: Array<{ title: string; choices: string[] }> = [];
 	const widgets: Array<string[] | undefined> = [];
@@ -76,6 +99,9 @@ function fakeRuntime(options: {
 	const confirmationPrompts: Array<{ title: string; message: string }> = [];
 	const ignoreStatePrompts: Array<{ title: string; choices: string[] }> = [];
 	const compactCalls: CompactCallbacks[] = [];
+	const setModelCalls: FakeModel[] = [];
+	const setThinkingLevelCalls: ThinkingLevel[] = [];
+	const sentSettings: Array<{ model: string; thinkingLevel: ThinkingLevel }> = [];
 	let contextUsageCalls = 0;
 	const stopReasons = [...(options.turnStopReasons ?? [])];
 	const modelOutputs = [...(options.modelOutputs ?? [])];
@@ -87,6 +113,17 @@ function fakeRuntime(options: {
 	const confirmations = [...(options.confirmations ?? [])];
 	const contextUsages = [...(options.contextUsages ?? [])];
 	const compactionOutcomes = [...(options.compactionOutcomes ?? [])];
+	const defaultModel: FakeModel = {
+		provider: "test",
+		id: "selected",
+		reasoning: true,
+		thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+	};
+	let currentModel = options.currentModel ?? defaultModel;
+	let currentThinkingLevel = options.thinkingLevel ?? "medium";
+	const models = options.models ?? [currentModel];
+	const setModelOutcomes = [...(options.setModelOutcomes ?? [])];
+	const thresholdInputs = [...(options.thresholdInputs ?? [])];
 	const sessionHistory = [{ role: "user", content: "existing context" }];
 	const pendingTurnReasons: string[] = [];
 
@@ -129,10 +166,25 @@ function fakeRuntime(options: {
 		},
 		sendUserMessage(message: string) {
 			sent.push(message);
+			sentSettings.push({ model: `${currentModel.provider}/${currentModel.id}`, thinkingLevel: currentThinkingLevel });
 			pendingTurnReasons.push(stopReasons.shift() ?? "stop");
 			if (!options.manualTurns) {
 				queueMicrotask(() => void settleTurn());
 			}
+		},
+		async setModel(model: FakeModel) {
+			setModelCalls.push(model);
+			const outcome = setModelOutcomes.shift() ?? true;
+			if (outcome instanceof Error) throw outcome;
+			if (outcome) currentModel = model;
+			return outcome;
+		},
+		getThinkingLevel() {
+			return currentThinkingLevel;
+		},
+		setThinkingLevel(level: ThinkingLevel) {
+			setThinkingLevelCalls.push(level);
+			currentThinkingLevel = level;
 		},
 	};
 
@@ -140,11 +192,24 @@ function fakeRuntime(options: {
 		cwd: options.cwd,
 		hasUI: true,
 		mode: "tui",
-		model: { provider: "test", id: "selected" },
+		get model() {
+			return currentModel;
+		},
+		get thinkingLevel() {
+			return currentThinkingLevel;
+		},
+		scopedModels: (options.scopedModels ?? []).map((model) => ({ model })),
 		isIdle: () => true,
 		modelRegistry: {
+			getAvailable() {
+				return models;
+			},
+			find(provider: string, id: string) {
+				return models.find((model) => model.provider === provider && model.id === id);
+			},
 			async complete(...args: unknown[]) {
 				completeCalls.push(args);
+				completeSettings.push({ model: `${currentModel.provider}/${currentModel.id}`, thinkingLevel: currentThinkingLevel });
 				const output = modelOutputs.shift() ?? { tasks: [{ title: "One" }] };
 				return {
 					stopReason: "stop",
@@ -163,10 +228,19 @@ function fakeRuntime(options: {
 				}
 				selections.push({ title, choices: selectChoices });
 				const choice = choices.shift();
-				return choice ?? (title === "Automatic compaction between tasks?" ? "No" : undefined);
+				if (choice !== undefined) return choice;
+				if (title === "Automatic compaction between tasks?") return "No";
+				if (title.startsWith("Implementation model for all tasks")) {
+					return `${currentModel.provider}/${currentModel.id}`;
+				}
+				if (title.startsWith("Thinking level for all implementation tasks")) return currentThinkingLevel;
+				return undefined;
 			},
 			async input(title: string, placeholder?: string) {
 				inputPrompts.push({ title, placeholder });
+				if (title.startsWith("Compaction threshold percentage")) {
+					return thresholdInputs.length > 0 ? thresholdInputs.shift() : "";
+				}
 				return inputs.shift();
 			},
 			async confirm(title: string, message: string) {
@@ -200,6 +274,7 @@ function fakeRuntime(options: {
 		commands,
 		compactCalls,
 		completeCalls,
+		completeSettings,
 		confirmationPrompts,
 		get contextUsageCalls() {
 			return contextUsageCalls;
@@ -211,6 +286,9 @@ function fakeRuntime(options: {
 		notifications,
 		selections,
 		sent,
+		sentSettings,
+		setModelCalls,
+		setThinkingLevelCalls,
 		sessionHistory,
 		widgets,
 		workingMessages,
@@ -237,6 +315,9 @@ function savedState(cwd: string, overrides: Partial<ImplementationState> = {}): 
 		status: "running",
 		checkpoint: false,
 		automaticCompaction: false,
+		compactionThresholdPercent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+		implementationModel: { provider: "test", id: "selected" },
+		implementationThinkingLevel: "medium",
 		...overrides,
 	};
 }
@@ -528,6 +609,130 @@ test("workflow state is saved before each task, advances without Git, and is del
 		await runtime.settleTurn();
 		await execution;
 		assert.equal(await loadState(directory), undefined);
+	});
+});
+
+test("implementation model and thinking selections default to the current pair", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "one task");
+		const currentModel = fakeModel("current", "planning-model");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", "No"],
+			currentModel,
+			models: [currentModel, fakeModel("other", "implementation-model")],
+			thinkingLevel: "high",
+			manualTurns: true,
+		});
+
+		const execution = runtime.run("implement-tasks", "tasks.md");
+		await waitFor(() => runtime.sent.length === 1);
+
+		const modelSelection = runtime.selections.find(({ title }) => title.startsWith("Implementation model"));
+		const thinkingSelection = runtime.selections.find(({ title }) => title.startsWith("Thinking level"));
+		assert.equal(modelSelection?.choices[0], "current/planning-model");
+		assert.equal(thinkingSelection?.choices[0], "high");
+		assert.deepEqual((await loadState(directory))?.implementationModel, {
+			provider: "current",
+			id: "planning-model",
+		});
+		assert.equal((await loadState(directory))?.implementationThinkingLevel, "high");
+		assert.deepEqual(runtime.sentSettings, [{ model: "current/planning-model", thinkingLevel: "high" }]);
+
+		await runtime.settleTurn();
+		await execution;
+	});
+});
+
+test("a custom implementation model and thinking level are fixed for every task", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "two tasks");
+		const currentModel = fakeModel("current", "planning-model");
+		const implementationModel = fakeModel("selected", "implementation-model");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", "No", "selected/implementation-model", "high"],
+			currentModel,
+			models: [currentModel, implementationModel],
+			thinkingLevel: "low",
+			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
+			manualTurns: true,
+		});
+
+		const execution = runtime.run("implement-tasks", "tasks.md");
+		await waitFor(() => runtime.sent.length === 1);
+		const state = await loadState(directory);
+		assert.deepEqual(state?.implementationModel, { provider: "selected", id: "implementation-model" });
+		assert.equal(state?.implementationThinkingLevel, "high");
+
+		await runtime.settleTurn();
+		await waitFor(() => runtime.sent.length === 2);
+		assert.deepEqual(runtime.sentSettings, [
+			{ model: "selected/implementation-model", thinkingLevel: "high" },
+			{ model: "selected/implementation-model", thinkingLevel: "high" },
+		]);
+		await runtime.settleTurn();
+		await execution;
+	});
+});
+
+test("Resume restores the persisted implementation model and thinking level", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "one task");
+		const originalModel = fakeModel("current", "planning-model");
+		const implementationModel = fakeModel("selected", "implementation-model");
+		const failed = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", "No", "selected/implementation-model", "xhigh"],
+			currentModel: originalModel,
+			models: [originalModel, implementationModel],
+			thinkingLevel: "low",
+			turnStopReasons: ["error"],
+		});
+		await failed.run("implement-tasks", "tasks.md");
+		assert.equal((await loadState(directory))?.implementationThinkingLevel, "xhigh");
+
+		const laterCurrentModel = fakeModel("later", "active-model");
+		const resumed = fakeRuntime({
+			cwd: directory,
+			choices: ["Resume"],
+			currentModel: laterCurrentModel,
+			models: [laterCurrentModel, implementationModel],
+			thinkingLevel: "medium",
+		});
+		await resumed.run("implement-plan", "missing.md");
+
+		assert.equal(resumed.completeCalls.length, 0);
+		assert.equal(resumed.setModelCalls[0], implementationModel);
+		assert.deepEqual(resumed.sentSettings, [
+			{ model: "selected/implementation-model", thinkingLevel: "xhigh" },
+		]);
+		assert.equal(await loadState(directory), undefined);
+	});
+});
+
+test("Resume fails clearly when the saved implementation model cannot be selected", async () => {
+	await withTempDir(async (directory) => {
+		const state = savedState(directory, {
+			implementationModel: { provider: "selected", id: "implementation-model" },
+			implementationThinkingLevel: "high",
+		});
+		await saveState(directory, state);
+		const implementationModel = fakeModel("selected", "implementation-model");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Resume"],
+			models: [implementationModel],
+			setModelOutcomes: [false],
+		});
+
+		await runtime.run("implement-tasks", "missing.md");
+
+		assert.deepEqual(runtime.sent, []);
+		assert.ok(runtime.notifications.some(({ message, type }) =>
+			type === "error" && message.includes("Cannot use implementation model") && message.includes("model selection failed"),
+		));
+		assert.equal((await loadState(directory))?.status, "failed");
 	});
 });
 
@@ -1051,6 +1256,10 @@ test("automatic compaction waits above 70% before starting the next task", async
 
 		assert.equal(runtime.sent.length, 1);
 		assert.equal(runtime.compactCalls.length, 1);
+		assert.equal((await loadState(directory))?.compactionThresholdPercent, 70);
+		assert.ok(runtime.inputPrompts.some(({ title, placeholder }) =>
+			title === "Compaction threshold percentage (default: 70%)" && placeholder === "70",
+		));
 		assert.deepEqual(runtime.widgets.at(-1), ["Task-file implementation", "○ 2/2 Two"]);
 		assert.equal(runtime.workingMessages.at(-1), "Compact context before task 2 (74%)");
 
@@ -1058,6 +1267,61 @@ test("automatic compaction waits above 70% before starting the next task", async
 		await execution;
 		assert.equal(runtime.sent.length, 2);
 		assert.equal(runtime.workingMessages.at(-1), undefined);
+	});
+});
+
+test("a custom compaction threshold is persisted and used", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
+			thresholdInputs: ["85"],
+			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
+			contextUsages: [{ tokens: 80, contextWindow: 100, percent: 80 }],
+			manualTurns: true,
+		});
+
+		const execution = runtime.run("implement-tasks", "tasks.md");
+		await waitFor(() => runtime.sent.length === 1);
+		assert.equal((await loadState(directory))?.compactionThresholdPercent, 85);
+		await runtime.settleTurn();
+		await waitFor(() => runtime.sent.length === 2);
+		assert.equal(runtime.contextUsageCalls, 1);
+		assert.equal(runtime.compactCalls.length, 0);
+		await runtime.settleTurn();
+		await execution;
+	});
+});
+
+test("invalid compaction threshold input stops before model selection or task execution", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
+			thresholdInputs: ["70.5"],
+		});
+
+		await runtime.run("implement-tasks", "tasks.md");
+
+		assert.deepEqual(runtime.sent, []);
+		assert.equal(runtime.selections.some(({ title }) => title.startsWith("Implementation model")), false);
+		assert.ok(runtime.notifications.some(({ message, type }) =>
+			type === "error" && message === "Compaction threshold must be an integer from 1 to 100 percent.",
+		));
+		assert.equal(await loadState(directory), undefined);
+	});
+});
+
+test("compaction-disabled workflows do not ask for a threshold", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "one task");
+		const runtime = fakeRuntime({ cwd: directory, choices: ["Implement", "No"] });
+
+		await runtime.run("implement-tasks", "tasks.md");
+
+		assert.equal(runtime.inputPrompts.some(({ title }) => title.startsWith("Compaction threshold")), false);
 	});
 });
 
@@ -1143,6 +1407,36 @@ test("compaction failure stops before the next task", async () => {
 	});
 });
 
+test("Resume uses the persisted compaction threshold for later checks", async () => {
+	await withTempDir(async (directory) => {
+		await saveState(directory, savedState(directory, {
+			automaticCompaction: true,
+			compactionThresholdPercent: 40,
+			nextTaskIndex: 1,
+		}));
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Resume"],
+			contextUsages: [{ tokens: 50, contextWindow: 100, percent: 50 }],
+			compactionOutcomes: ["manual"],
+			manualTurns: true,
+		});
+
+		const execution = runtime.run("implement-tasks", "missing.md");
+		await waitFor(() => runtime.sent.length === 1);
+		await runtime.settleTurn();
+		await waitFor(() => runtime.compactCalls.length === 1);
+
+		assert.equal(runtime.contextUsageCalls, 1);
+		assert.equal((await loadState(directory))?.compactionThresholdPercent, 40);
+		runtime.compactCalls[0].onComplete?.({});
+		await waitFor(() => runtime.sent.length === 2);
+		await runtime.settleTurn();
+		await execution;
+		assert.equal(await loadState(directory), undefined);
+	});
+});
+
 test("automatic compaction does not inspect usage after the final task", async () => {
 	await withTempDir(async (directory) => {
 		await writeFile(join(directory, "tasks.md"), "one task");
@@ -1158,6 +1452,32 @@ test("automatic compaction does not inspect usage after the final task", async (
 		assert.equal(runtime.contextUsageCalls, 0);
 		assert.equal(runtime.compactCalls.length, 0);
 		assert.equal(runtime.sent.length, 1);
+	});
+});
+
+test("/implement-plan prepares tasks with current settings and uses the selected pair for implementation", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "plan.md"), "Build it.");
+		const currentModel = fakeModel("current", "planning-model");
+		const implementationModel = fakeModel("selected", "implementation-model");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", "No", "selected/implementation-model", "high"],
+			currentModel,
+			models: [currentModel, implementationModel],
+			thinkingLevel: "low",
+			modelOutputs: ["## Task 1 - Build\n\nBuild it.\n", { tasks: [{ title: "Build" }] }],
+		});
+
+		await runtime.run("implement-plan", "plan.md");
+
+		assert.deepEqual(runtime.completeSettings, [
+			{ model: "current/planning-model", thinkingLevel: "low" },
+			{ model: "current/planning-model", thinkingLevel: "low" },
+		]);
+		assert.deepEqual(runtime.sentSettings, [
+			{ model: "selected/implementation-model", thinkingLevel: "high" },
+		]);
 	});
 });
 

@@ -1,9 +1,10 @@
 import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { isImplementationThinkingLevel, type ImplementationSettings } from "./model.ts";
 
 export const STATE_FILE_NAME = ".pi-implement-state.json";
 
-export interface ImplementationState {
+export interface ImplementationState extends ImplementationSettings {
 	version: 1;
 	cwd: string;
 	sourcePath: string;
@@ -13,6 +14,7 @@ export interface ImplementationState {
 	error?: string;
 	checkpoint: boolean;
 	automaticCompaction: boolean;
+	compactionThresholdPercent: number;
 	pendingCheckpoint?: boolean;
 	pendingCompaction?: boolean;
 	branchName?: string;
@@ -77,6 +79,17 @@ function validateState(value: unknown): ImplementationState {
 		(state.status !== "running" && state.status !== "failed") ||
 		typeof state.checkpoint !== "boolean" ||
 		typeof state.automaticCompaction !== "boolean" ||
+		typeof state.compactionThresholdPercent !== "number" ||
+		!Number.isInteger(state.compactionThresholdPercent) ||
+		state.compactionThresholdPercent < 1 ||
+		state.compactionThresholdPercent > 100 ||
+		typeof state.implementationModel !== "object" ||
+		state.implementationModel === null ||
+		typeof state.implementationModel.provider !== "string" ||
+		state.implementationModel.provider.trim().length === 0 ||
+		typeof state.implementationModel.id !== "string" ||
+		state.implementationModel.id.trim().length === 0 ||
+		!isImplementationThinkingLevel(state.implementationThinkingLevel) ||
 		(state.pendingCheckpoint !== undefined && typeof state.pendingCheckpoint !== "boolean") ||
 		(state.pendingCheckpoint === true && (!state.checkpoint || state.nextTaskIndex === 0)) ||
 		(state.pendingCompaction !== undefined && typeof state.pendingCompaction !== "boolean") ||
