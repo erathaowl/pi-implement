@@ -167,6 +167,23 @@ The state file is deleted after complete success and preserved after failure or 
 
 It intentionally does not provide task editing or reordering, parallel execution, subagents, dependency graphs, automatic retries, state history or snapshots, model selection, or remote Git automation.
 
+## Release on npm
+
+From the repository root, use the following workflow with a clean working tree:
+
+```bash
+git status --short
+npm ci
+npm version patch
+# Or: npm version X.Y.Z
+npm test
+npm run typecheck
+npm publish
+git push origin HEAD --follow-tags
+```
+
+`npm version` updates the package files and automatically creates the release commit and the `vX.X.X` Git tag. The final command pushes both to the remote.
+
 ## Validation
 
 ```bash
