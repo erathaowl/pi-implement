@@ -2,13 +2,12 @@
 
 A minimal [pi](https://pi.dev) extension for sequentially implementing Markdown plans and task files in the current session.
 
-It provides three workflows:
+It provides two workflows:
 
 - `/implement-tasks` — implement an existing task file without rewriting it.
 - `/implement-plan` — convert a plan to `tasks.md`, then implement it as a task file.
-- `/implement-rewrite` — rewrite arbitrary Markdown into self-contained tasks before implementation.
 
-All workflows execute tasks sequentially in the active pi session and share the same optional Git checkpoints, context compaction, progress display, and recovery behavior.
+Both workflows execute tasks sequentially in the active pi session and share the same optional Git checkpoints, context compaction, progress display, and recovery behavior.
 
 ## Installation
 
@@ -87,26 +86,6 @@ If `tasks.md` already exists, the command asks before overwriting it. The genera
 
 This is useful when the input describes the work at plan level rather than as clearly executable tasks.
 
-### `/implement-rewrite <markdown-file>`
-
-Reads arbitrary Markdown and rewrites it into ordered, self-contained tasks before implementation.
-
-```text
-/implement-rewrite plan.md
-```
-
-The selected model produces tasks shaped conceptually as:
-
-```text
-{ title, instructions }
-```
-
-The rewritten task titles are previewed before execution. Each task is then sent to the active session as a self-contained implementation instruction.
-
-Applicable document-wide constraints, acceptance criteria, and shared requirements are repeated in the affected tasks so they can be implemented independently.
-
-Unlike `/implement-tasks`, the original Markdown is not the authoritative execution source after rewriting. Use this workflow when the input needs interpretation or restructuring before implementation.
-
 ## Common behavior
 
 All preparation calls use the currently selected model in isolation. Tools are omitted from those model calls, and their prompts and responses are not added to the active session history.
@@ -123,7 +102,7 @@ An interactive UI (TUI or RPC UI) is required.
 
 ### Local Git checkpoints
 
-Inside a Git repository, `/implement-tasks` and `/implement-rewrite` — and therefore `/implement-plan` through its delegated task workflow — offer two execution modes:
+Inside a Git repository, `/implement-tasks` — and therefore `/implement-plan` through its delegated task workflow — offers two execution modes:
 
 - implement without Git checkpoints;
 - create a new local branch and commit after each successful task.
@@ -166,7 +145,7 @@ If unfinished state exists, starting any implementation command offers:
 - **Discard and start new**
 - **Cancel**
 
-Resume uses the saved task sequence directly, without repeating plan conversion, task indexing, or rewrite extraction.
+Resume uses the saved task sequence directly, without repeating plan conversion or task indexing.
 
 A task interrupted while running is rerun. A task already completed before a compaction failure is not.
 

@@ -14,7 +14,6 @@ import {
 
 const state: ImplementationState = {
 	version: 1,
-	workflow: "tasks",
 	cwd: "/project",
 	sourcePath: "tasks.md",
 	tasks: [{ title: "One", prompt: "Implement one" }],
@@ -71,7 +70,7 @@ test("state and gitignore are stored at the repository root", async () => {
 		await addStateFileToGitignore(nested);
 
 		assert.deepEqual(await loadState(nested), state);
-		assert.equal(JSON.parse(await readFile(join(directory, STATE_FILE_NAME), "utf8")).workflow, "tasks");
+		assert.equal(JSON.parse(await readFile(join(directory, STATE_FILE_NAME), "utf8")).sourcePath, "tasks.md");
 		assert.equal(await readFile(join(directory, ".gitignore"), "utf8"), `${STATE_FILE_NAME}\n`);
 	});
 });

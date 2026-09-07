@@ -5,7 +5,6 @@ export const STATE_FILE_NAME = ".pi-implement-state.json";
 
 export interface ImplementationState {
 	version: 1;
-	workflow: "rewrite" | "tasks";
 	cwd: string;
 	sourcePath: string;
 	tasks: Array<{ title: string; prompt: string }>;
@@ -56,7 +55,6 @@ function validateState(value: unknown): ImplementationState {
 	const state = value as Partial<ImplementationState>;
 	if (
 		state.version !== 1 ||
-		(state.workflow !== "rewrite" && state.workflow !== "tasks") ||
 		typeof state.cwd !== "string" ||
 		state.cwd.trim().length === 0 ||
 		typeof state.sourcePath !== "string" ||

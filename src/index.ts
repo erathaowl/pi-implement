@@ -15,7 +15,6 @@ import {
 	generatedTasksFileExists,
 	writeGeneratedTaskDocument,
 } from "./plan.ts";
-import { buildRewritePrompt, extractRewritePlan } from "./rewrite.ts";
 import {
 	STATE_FILE_NAME,
 	addStateFileToGitignore,
@@ -324,7 +323,6 @@ async function selectExecutionOptions(
 }
 
 function createImplementationState(
-	workflow: ImplementationState["workflow"],
 	cwd: string,
 	sourcePath: string,
 	tasks: TitledTaskList,
@@ -333,7 +331,6 @@ function createImplementationState(
 ): ImplementationState {
 	return {
 		version: 1,
-		workflow,
 		cwd: resolve(cwd),
 		sourcePath,
 		tasks: tasks.tasks.map((task, index) => ({ title: task.title, prompt: prompts[index] })),
@@ -343,43 +340,6 @@ function createImplementationState(
 		automaticCompaction: options.automaticCompaction,
 		branchName: options.branchName,
 	};
-}
-
-async function runRewriteWorkflow(
-	input: MarkdownInput,
-	ctx: ExtensionCommandContext,
-	executor: ActiveSessionExecutor,
-	git: LocalGit,
-	ignoreStateFile: boolean,
-	isRepository: boolean,
-): Promise<void> {
-	const commandName = "/implement-rewrite";
-	report(ctx, commandName, `Rewriting tasks in ${input.sourcePath}...`, "info");
-	const plan = await extractRewritePlan(input.markdown, ctx);
-	const options = await selectExecutionOptions(
-		`Rewrite and implement ${input.sourcePath}`,
-		plan,
-		isRepository,
-		ctx,
-		git,
-	);
-	if (!options) {
-		report(ctx, commandName, "Rewrite implementation cancelled.", "info");
-		return;
-	}
-
-	if (ignoreStateFile) {
-		await addStateFileToGitignore(ctx.cwd);
-	}
-	const prompts = plan.tasks.map(buildRewritePrompt);
-	await executeTaskSet(
-		commandName,
-		"Rewrite implementation",
-		ctx,
-		executor,
-		git,
-		createImplementationState("rewrite", ctx.cwd, input.sourcePath, plan, prompts, options),
-	);
 }
 
 export async function runTasksWorkflow(
@@ -415,7 +375,7 @@ export async function runTasksWorkflow(
 		ctx,
 		executor,
 		git,
-		createImplementationState("tasks", ctx.cwd, input.sourcePath, taskIndex, prompts, options),
+		createImplementationState(ctx.cwd, input.sourcePath, taskIndex, prompts, options),
 	);
 }
 
@@ -423,7 +383,7 @@ function formatRestorePrompt(state: ImplementationState): string {
 	const taskNumber = Math.min(state.nextTaskIndex + 1, state.tasks.length);
 	const lines = [
 		"Unfinished implementation found",
-		`Workflow: /implement-${state.workflow}`,
+		"Workflow: /implement-tasks",
 		`Task: ${taskNumber}/${state.tasks.length}`,
 		`Status: ${state.status}`,
 	];
@@ -473,9 +433,7 @@ async function handleExistingState(
 		}
 	}
 
-	const commandName = state.workflow === "rewrite" ? "/implement-rewrite" : "/implement-tasks";
-	const progressTitle = state.workflow === "rewrite" ? "Rewrite implementation" : "Task-file implementation";
-	await executeTaskSet(commandName, progressTitle, ctx, executor, git, state);
+	await executeTaskSet("/implement-tasks", "Task-file implementation", ctx, executor, git, state);
 	return true;
 }
 
@@ -525,15 +483,6 @@ export default function implementExtension(pi: ExtensionAPI): void {
 			workflowRunning = false;
 		}
 	};
-
-	pi.registerCommand("implement-rewrite", {
-		description: "Rewrite Markdown into self-contained tasks and implement them sequentially",
-		handler: async (args, ctx) =>
-			runCommand("/implement-rewrite", ctx, async (ignoreStateFile, isRepository) => {
-				const input = await readMarkdownInput(args, ctx.cwd, "/implement-rewrite");
-				await runRewriteWorkflow(input, ctx, executor, git, ignoreStateFile, isRepository);
-			}),
-	});
 
 	pi.registerCommand("implement-tasks", {
 		description: "Implement tasks sequentially from an authoritative Markdown task file",

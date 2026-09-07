@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import { COMPACTION_ENABLED_CHOICE } from "../src/compaction.ts";
 import implementExtension, { readMarkdownInput } from "../src/index.ts";
-import { STATE_FILE_NAME, deleteState, loadState, saveState, type ImplementationState } from "../src/state.ts";
+import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from "../src/state.ts";
 import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
 
 type Handler = (event: any, ctx?: any) => void | Promise<void>;
@@ -216,7 +216,6 @@ function fakeRuntime(options: {
 function savedState(cwd: string, overrides: Partial<ImplementationState> = {}): ImplementationState {
 	return {
 		version: 1,
-		workflow: "tasks",
 		cwd: resolve(cwd),
 		sourcePath: "tasks.md",
 		tasks: [
@@ -232,16 +231,16 @@ function savedState(cwd: string, overrides: Partial<ImplementationState> = {}): 
 	};
 }
 
-test("registers the three split commands and removes the old /implement command", () => {
+test("registers the two implementation commands and removes the old /implement command", () => {
 	const runtime = fakeRuntime({ cwd: process.cwd() });
-	assert.deepEqual([...runtime.commands.keys()].sort(), ["implement-plan", "implement-rewrite", "implement-tasks"]);
+	assert.deepEqual([...runtime.commands.keys()].sort(), ["implement-plan", "implement-tasks"]);
 	assert.equal(runtime.commands.has("implement"), false);
 });
 
 test("file handling reports command-specific usage for a missing argument", async () => {
 	await assert.rejects(
-		readMarkdownInput("   ", process.cwd(), "/implement-rewrite"),
-		/Usage: \/implement-rewrite/,
+		readMarkdownInput("   ", process.cwd(), "/implement-tasks"),
+		/Usage: \/implement-tasks/,
 	);
 });
 
@@ -303,7 +302,7 @@ test("restore cancellation leaves state unchanged", async () => {
 		const before = await readFile(join(directory, STATE_FILE_NAME), "utf8");
 		const runtime = fakeRuntime({ cwd: directory, choices: ["Cancel"] });
 
-		await runtime.run("implement-rewrite", "missing.md");
+		await runtime.run("implement-tasks", "missing.md");
 
 		assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), before);
 		assert.equal(runtime.completeCalls.length, 0);
@@ -362,45 +361,6 @@ test("checkpoint restore validates the saved branch without switching", async ()
 	});
 });
 
-test("/implement-rewrite preserves self-contained rewrite execution", async () => {
-	await withTempDir(async (directory) => {
-		const source = "## API\nAdd an endpoint.";
-		await writeFile(join(directory, "notes.md"), source);
-		const runtime = fakeRuntime({
-			cwd: directory,
-			choices: ["Implement"],
-			modelOutputs: [
-				{
-					tasks: [
-						{ title: "Add API", instructions: "Add the endpoint and apply the shared validation rules." },
-						{ title: "Test API", instructions: "Test the endpoint and all acceptance criteria." },
-					],
-				},
-			],
-		});
-
-		await runtime.run("implement-rewrite", "notes.md");
-
-		assert.equal(runtime.completeCalls.length, 1);
-		assert.equal(runtime.sent.length, 2);
-		assert.match(runtime.sent[0], /Instructions:\nAdd the endpoint and apply the shared validation rules\./);
-		assert.match(runtime.sent[1], /Instructions:\nTest the endpoint and all acceptance criteria\./);
-		assert.match(runtime.selections[0].title, /Rewrite and implement notes\.md/);
-		assert.deepEqual(runtime.selections[0].choices, ["Implement", "Cancel"]);
-		assert.deepEqual(runtime.selections[1].choices, ["No", COMPACTION_ENABLED_CHOICE]);
-		assert.equal(runtime.contextUsageCalls, 0);
-		assert.equal(runtime.compactCalls.length, 0);
-		assert.deepEqual(runtime.execCalls[0].args, ["rev-parse", "--is-inside-work-tree"]);
-		assert.ok(runtime.sent.every((prompt) => prompt.includes("Do not perform remote Git operations")));
-		assert.ok(runtime.sent.every((prompt) => prompt.includes("Do not create commits")));
-		assert.deepEqual(runtime.sessionHistory, [{ role: "user", content: "existing context" }]);
-		assert.equal(await readFile(join(directory, "notes.md"), "utf8"), source);
-		assert.equal(runtime.ignoreStatePrompts.length, 0);
-		assert.equal(await loadState(directory), undefined);
-		assert.ok(runtime.notifications.some(({ message }) => message === "Implementation complete."));
-	});
-});
-
 test("repository workflows offer the state-file gitignore update with Yes as the default", async () => {
 	await withTempDir(async (directory) => {
 		await writeFile(join(directory, "tasks.md"), "tasks");
@@ -431,7 +391,6 @@ test("workflow state is saved before each task, advances without Git, and is del
 		const execution = runtime.run("implement-tasks", "tasks.md");
 		await waitFor(() => runtime.sent.length === 1);
 		const started = await loadState(directory);
-		assert.equal(started?.workflow, "tasks");
 		assert.equal(started?.cwd, resolve(directory));
 		assert.equal(started?.status, "running");
 		assert.equal(started?.nextTaskIndex, 0);
@@ -447,199 +406,6 @@ test("workflow state is saved before each task, advances without Git, and is del
 		await runtime.settleTurn();
 		await execution;
 		assert.equal(await loadState(directory), undefined);
-	});
-});
-
-test("rewrite checkpoint mode creates a local branch and commits only tasks with changes", async () => {
-	await withTempDir(async (directory) => {
-		await writeFile(join(directory, "notes.md"), "rewrite tasks");
-		const runtime = fakeRuntime({
-			cwd: directory,
-			choices: ["New local branch + commit after each task", "No"],
-			inputs: ["feature/rewrite-checkpoints"],
-			ignoreStateChoice: "No",
-			manualTurns: true,
-			modelOutputs: [
-				{
-					tasks: [
-						{ title: "One", instructions: "Implement one." },
-						{ title: "Two", instructions: "Implement two." },
-					],
-				},
-			],
-			gitResults: [
-				gitResult("true\n"),
-				gitResult(),
-				gitResult(),
-				gitResult(),
-				gitResult(),
-				gitResult("", 1),
-				gitResult(),
-				gitResult(),
-				gitResult(),
-				gitResult(),
-			],
-		});
-
-		const execution = runtime.run("implement-rewrite", "notes.md");
-		await waitFor(() => runtime.sent.length === 1);
-		await runtime.settleTurn();
-		await waitFor(() => runtime.sent.length === 2);
-		const advanced = await loadState(directory);
-		assert.equal(advanced?.nextTaskIndex, 1);
-		assert.equal(advanced?.status, "running");
-		await runtime.settleTurn();
-		await execution;
-
-		assert.deepEqual(runtime.selections[0].choices, [
-			"Implement only",
-			"New local branch + commit after each task",
-			"Cancel",
-		]);
-		assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
-			["rev-parse", "--is-inside-work-tree"],
-			["status", "--porcelain"],
-			["switch", "-c", "feature/rewrite-checkpoints"],
-			["add", "-A"],
-			["reset", "-q", "HEAD", "--", STATE_FILE_NAME],
-			["diff", "--cached", "--quiet"],
-			["commit", "-m", "Task 1: One"],
-			["add", "-A"],
-			["reset", "-q", "HEAD", "--", STATE_FILE_NAME],
-			["diff", "--cached", "--quiet"],
-		]);
-		assert.equal(runtime.sent.length, 2);
-		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 1);
-		assertNoRemoteGit(runtime.execCalls);
-	});
-});
-
-test("rewrite checkpoint mode requires a clean working tree", async () => {
-	await withTempDir(async (directory) => {
-		await writeFile(join(directory, "notes.md"), "rewrite task");
-		const runtime = fakeRuntime({
-			cwd: directory,
-			choices: ["New local branch + commit after each task"],
-			modelOutputs: [{ tasks: [{ title: "One", instructions: "Implement one." }] }],
-			gitResults: [gitResult("true\n"), gitResult(" M existing.ts\n")],
-		});
-
-		await runtime.run("implement-rewrite", "notes.md");
-
-		assert.equal(runtime.inputPrompts.length, 0);
-		assert.deepEqual(runtime.sent, []);
-		assert.ok(runtime.notifications.some(({ message }) => message.includes("clean working tree")));
-	});
-});
-
-test("Git checkpoint failure stops rewrite execution before the next task", async () => {
-	await withTempDir(async (directory) => {
-		await writeFile(join(directory, "notes.md"), "rewrite tasks");
-		const runtime = fakeRuntime({
-			cwd: directory,
-			choices: ["New local branch + commit after each task", "No"],
-			inputs: ["feature/rewrite-failure"],
-			modelOutputs: [
-				{
-					tasks: [
-						{ title: "One", instructions: "Implement one." },
-						{ title: "Two", instructions: "Implement two." },
-					],
-				},
-			],
-			gitResults: [
-				gitResult("true\n"),
-				gitResult(),
-				gitResult(),
-				gitResult(),
-				gitResult(),
-				gitResult("", 1),
-				gitResult("", 1, "commit failed"),
-			],
-		});
-
-		await runtime.run("implement-rewrite", "notes.md");
-
-		assert.equal(runtime.sent.length, 1);
-		assert.ok(runtime.notifications.some(({ message }) => message.includes("Git commit failed")));
-		const saved = await loadState(directory);
-		assert.equal(saved?.workflow, "rewrite");
-		assert.equal(saved?.nextTaskIndex, 0);
-		assert.equal(saved?.status, "failed");
-		assert.equal(saved?.error, "Git commit failed: commit failed");
-		assert.equal(saved?.branchName, "feature/rewrite-failure");
-		assert.match(saved?.tasks[1].prompt ?? "", /Instructions:\nImplement two\./);
-		assertNoRemoteGit(runtime.execCalls);
-	});
-});
-
-test("rewrite compaction completes before the next task starts", async () => {
-	await withTempDir(async (directory) => {
-		await writeFile(join(directory, "notes.md"), "rewrite tasks");
-		const runtime = fakeRuntime({
-			cwd: directory,
-			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
-			modelOutputs: [
-				{
-					tasks: [
-						{ title: "One", instructions: "Implement one." },
-						{ title: "Two", instructions: "Implement two." },
-					],
-				},
-			],
-			contextUsages: [{ tokens: 74, contextWindow: 100, percent: 74 }],
-			compactionOutcomes: ["manual"],
-		});
-
-		const execution = runtime.run("implement-rewrite", "notes.md");
-		await waitFor(() => runtime.compactCalls.length === 1);
-
-		assert.deepEqual(runtime.selections[1].choices, ["No", COMPACTION_ENABLED_CHOICE]);
-		assert.equal(runtime.sent.length, 1);
-		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("✓") && line.includes("One")));
-		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("○") && line.includes("Two")));
-		runtime.compactCalls[0].onComplete?.({});
-		await execution;
-		assert.equal(runtime.sent.length, 2);
-	});
-});
-
-test("rewrite compaction failure stops execution and never compacts after the final task", async () => {
-	await withTempDir(async (directory) => {
-		await writeFile(join(directory, "notes.md"), "rewrite tasks");
-		const failed = fakeRuntime({
-			cwd: directory,
-			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
-			modelOutputs: [
-				{
-					tasks: [
-						{ title: "One", instructions: "Implement one." },
-						{ title: "Two", instructions: "Implement two." },
-					],
-				},
-			],
-			contextUsages: [{ tokens: 80, contextWindow: 100, percent: 80 }],
-			compactionOutcomes: ["error"],
-		});
-		await failed.run("implement-rewrite", "notes.md");
-		assert.equal(failed.sent.length, 1);
-		assert.ok(failed.notifications.some(({ message }) => message.includes("compaction failed")));
-		const saved = await loadState(directory);
-		assert.equal(saved?.status, "failed");
-		assert.equal(saved?.nextTaskIndex, 1);
-		assert.equal(saved?.pendingCompaction, true);
-		assert.equal(saved?.error, "compaction failed");
-
-		await deleteState(directory);
-		const finalTask = fakeRuntime({
-			cwd: directory,
-			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
-			modelOutputs: [{ tasks: [{ title: "Only", instructions: "Implement it." }] }],
-			contextUsages: [{ tokens: 90, contextWindow: 100, percent: 90 }],
-		});
-		await finalTask.run("implement-rewrite", "notes.md");
-		assert.equal(finalTask.contextUsageCalls, 0);
-		assert.equal(finalTask.compactCalls.length, 0);
 	});
 });
 
