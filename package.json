@@ -1,6 +1,6 @@
 {
   "name": "pi-implement",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "A minimal pi extension for sequentially implementing tasks from Markdown files",
   "type": "module",
   "keywords": [
