@@ -50,9 +50,9 @@ pi install /absolute/path/to/pi-implement
 ## Use
 
 
-### `/implement-tasks <markdown-file>`
+### `/implement-tasks [markdown-file]`
 
-Implements an existing Markdown task file while keeping the original document as the authoritative source of instructions.
+Implements an existing Markdown task file while keeping the original document as the authoritative source of instructions. If the path is omitted, the command prompts for it.
 
 ```text
 /implement-tasks tasks.md
@@ -66,9 +66,9 @@ No fixed task-file schema is required. Headings, numbered sections, checklists, 
 
 Use this command when the task file is already written the way you want and should not be transformed before execution.
 
-### `/implement-plan <plan-file>`
+### `/implement-plan [plan-file]`
 
-Converts a Markdown implementation plan into a readable task file and then runs the same workflow used by `/implement-tasks`.
+Converts a Markdown implementation plan into a readable task file and then runs the same workflow used by `/implement-tasks`. If the path is omitted, the command prompts for it.
 
 ```text
 /implement-plan plan.md

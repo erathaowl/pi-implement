@@ -26,6 +26,7 @@ import {
 import { buildTaskFilePrompt, indexTaskFile } from "./tasks.ts";
 
 const PROGRESS_WIDGET = "implement-progress";
+const PROGRESS_TASK_LIMIT = 5;
 const GIT_CHECKPOINT_CHOICE = "Git checkpoints: new or current local branch";
 
 type ExecutionOptions = {
@@ -89,6 +90,20 @@ export async function readMarkdownInput(
 	return { sourcePath, resolvedPath, markdown };
 }
 
+async function requestMarkdownInput(
+	argument: string,
+	ctx: ExtensionCommandContext,
+	commandName: string,
+): Promise<MarkdownInput | undefined> {
+	const sourcePath = argument.trim()
+		? argument
+		: await ctx.ui.input(`Markdown file for ${commandName}`, "path/to/file.md");
+	if (!sourcePath?.trim()) {
+		return undefined;
+	}
+	return readMarkdownInput(sourcePath, ctx.cwd, commandName);
+}
+
 function report(
 	ctx: ExtensionCommandContext,
 	commandName: string,
@@ -121,12 +136,23 @@ export function formatProgress(
 		failed: "✗",
 	};
 
+	let currentIndex = tasks.tasks.findIndex((_, index) => statuses[index] === "running");
+	if (currentIndex < 0) {
+		currentIndex = tasks.tasks.findIndex((_, index) => statuses[index] === "failed");
+	}
+	if (currentIndex < 0) {
+		currentIndex = tasks.tasks.findIndex((_, index) => (statuses[index] ?? "pending") === "pending");
+	}
+	if (currentIndex < 0) {
+		currentIndex = Math.max(0, tasks.tasks.length - 1);
+	}
+
 	return [
 		title,
-		...tasks.tasks.map(
-			(task, index) =>
-				`${symbols[statuses[index] ?? "pending"]} ${index + 1}/${tasks.tasks.length} ${task.title}`,
-		),
+		...tasks.tasks.slice(currentIndex, currentIndex + PROGRESS_TASK_LIMIT).map((task, visibleIndex) => {
+			const index = currentIndex + visibleIndex;
+			return `${symbols[statuses[index] ?? "pending"]} ${index + 1}/${tasks.tasks.length} ${task.title}`;
+		}),
 	];
 }
 
@@ -528,7 +554,11 @@ export default function implementExtension(pi: ExtensionAPI): void {
 		description: "Implement tasks sequentially from an authoritative Markdown task file",
 		handler: async (args, ctx) =>
 			runCommand("/implement-tasks", ctx, async (ignoreStateFile, isRepository) => {
-				const input = await readMarkdownInput(args, ctx.cwd, "/implement-tasks");
+				const input = await requestMarkdownInput(args, ctx, "/implement-tasks");
+				if (!input) {
+					report(ctx, "/implement-tasks", "Task-file implementation cancelled.", "info");
+					return;
+				}
 				await runTasksWorkflow(input, ctx, executor, git, ignoreStateFile, isRepository);
 			}),
 	});
@@ -537,7 +567,11 @@ export default function implementExtension(pi: ExtensionAPI): void {
 		description: "Convert a plan to tasks.md and implement it through the task-file workflow",
 		handler: async (args, ctx) =>
 			runCommand("/implement-plan", ctx, async (ignoreStateFile, isRepository) => {
-				const input = await readMarkdownInput(args, ctx.cwd, "/implement-plan");
+				const input = await requestMarkdownInput(args, ctx, "/implement-plan");
+				if (!input) {
+					report(ctx, "/implement-plan", "Plan conversion cancelled.", "info");
+					return;
+				}
 				if (!ctx.model) {
 					throw new Error("No model is selected.");
 				}

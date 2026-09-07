@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { COMPACTION_ENABLED_CHOICE } from "../src/compaction.ts";
-import implementExtension, { readMarkdownInput } from "../src/index.ts";
+import implementExtension, { formatProgress, readMarkdownInput } from "../src/index.ts";
 import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from "../src/state.ts";
 import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
 
@@ -247,6 +247,44 @@ test("registers the two implementation commands and removes the old /implement c
 	assert.equal(runtime.commands.has("implement"), false);
 });
 
+test("progress renders the first five tasks at the beginning", () => {
+	const tasks = { tasks: Array.from({ length: 8 }, (_, index) => ({ title: `Task ${index + 1}` })) };
+	const statuses = tasks.tasks.map((_, index) => index === 0 ? "running" as const : "pending" as const);
+
+	assert.deepEqual(formatProgress("Task-file implementation", tasks, statuses), [
+		"Task-file implementation",
+		"● 1/8 Task 1",
+		"○ 2/8 Task 2",
+		"○ 3/8 Task 3",
+		"○ 4/8 Task 4",
+		"○ 5/8 Task 5",
+	]);
+});
+
+test("progress advances its five-task window to a middle running task", () => {
+	const tasks = { tasks: Array.from({ length: 20 }, (_, index) => ({ title: `Task ${index + 1}` })) };
+	const statuses = tasks.tasks.map((_, index) => index === 7 ? "running" as const : "pending" as const);
+
+	assert.deepEqual(formatProgress("Task-file implementation", tasks, statuses), [
+		"Task-file implementation",
+		"● 8/20 Task 8",
+		"○ 9/20 Task 9",
+		"○ 10/20 Task 10",
+		"○ 11/20 Task 11",
+		"○ 12/20 Task 12",
+	]);
+});
+
+test("progress renders only the final task when it is running", () => {
+	const tasks = { tasks: Array.from({ length: 20 }, (_, index) => ({ title: `Task ${index + 1}` })) };
+	const statuses = tasks.tasks.map((_, index) => index === 19 ? "running" as const : "completed" as const);
+
+	assert.deepEqual(formatProgress("Task-file implementation", tasks, statuses), [
+		"Task-file implementation",
+		"● 20/20 Task 20",
+	]);
+});
+
 test("file handling reports command-specific usage for a missing argument", async () => {
 	await assert.rejects(
 		readMarkdownInput("   ", process.cwd(), "/implement-tasks"),
@@ -263,6 +301,70 @@ test("file handling rejects nonexistent, directory, and empty paths", async () =
 		await assert.rejects(readMarkdownInput("empty.md", directory, "/implement-tasks"), /is empty/);
 	});
 });
+
+for (const workflow of [
+	{
+		command: "implement-tasks",
+		sourcePath: "tasks.md",
+		source: "## Task 1 - One\nDo one.",
+		modelOutputs: [{ tasks: [{ title: "One" }] }],
+		preparationCalls: 1,
+	},
+	{
+		command: "implement-plan",
+		sourcePath: "plan.md",
+		source: "Do one thing.",
+		modelOutputs: ["## Task 1 - One\n\nDo one.", { tasks: [{ title: "One" }] }],
+		preparationCalls: 2,
+	},
+]) {
+	for (const prompted of [false, true]) {
+		test(`/${workflow.command} accepts a ${prompted ? "prompted" : "provided"} Markdown path`, async () => {
+			await withTempDir(async (directory) => {
+				await writeFile(join(directory, workflow.sourcePath), workflow.source);
+				const runtime = fakeRuntime({
+					cwd: directory,
+					choices: ["Cancel"],
+					inputs: prompted ? [`  ${workflow.sourcePath}  `] : [],
+					modelOutputs: workflow.modelOutputs,
+				});
+
+				await runtime.run(workflow.command, prompted ? "   " : workflow.sourcePath);
+
+				assert.equal(runtime.inputPrompts.length, prompted ? 1 : 0);
+				if (prompted) {
+					assert.deepEqual(runtime.inputPrompts[0], {
+						title: `Markdown file for /${workflow.command}`,
+						placeholder: "path/to/file.md",
+					});
+				}
+				assert.equal(runtime.completeCalls.length, workflow.preparationCalls);
+				assert.equal(runtime.notifications.some(({ type }) => type === "error"), false);
+			});
+		});
+	}
+}
+
+for (const command of ["implement-tasks", "implement-plan"]) {
+	for (const input of [undefined, "   "]) {
+		test(`/${command} cancels cleanly for ${input === undefined ? "dismissed" : "empty"} file input`, async () => {
+			await withTempDir(async (directory) => {
+				const runtime = fakeRuntime({
+					cwd: directory,
+					inputs: input === undefined ? [] : [input],
+				});
+
+				await runtime.run(command, "");
+
+				assert.equal(runtime.inputPrompts.length, 1);
+				assert.equal(runtime.completeCalls.length, 0);
+				assert.deepEqual(runtime.sent, []);
+				assert.equal(runtime.notifications.some(({ type }) => type === "error"), false);
+				assert.ok(runtime.notifications.some(({ message, type }) => type === "info" && message.includes("cancelled")));
+			});
+		});
+	}
+}
 
 for (const status of ["running", "failed"] as const) {
 	test(`restore resumes ${status} state from the saved task without model preparation`, async () => {
@@ -949,8 +1051,7 @@ test("automatic compaction waits above 70% before starting the next task", async
 
 		assert.equal(runtime.sent.length, 1);
 		assert.equal(runtime.compactCalls.length, 1);
-		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("✓") && line.includes("One")));
-		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("○") && line.includes("Two")));
+		assert.deepEqual(runtime.widgets.at(-1), ["Task-file implementation", "○ 2/2 Two"]);
 		assert.equal(runtime.workingMessages.at(-1), "Compact context before task 2 (74%)");
 
 		runtime.compactCalls[0].onComplete?.({});
@@ -1011,8 +1112,7 @@ test("compaction failure stops before the next task", async () => {
 		assert.equal(runtime.sent.length, 1);
 		assert.equal(runtime.compactCalls.length, 1);
 		assert.ok(runtime.notifications.some(({ message }) => message.includes("compaction failed")));
-		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("✓") && line.includes("One")));
-		assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes("○") && line.includes("Two")));
+		assert.deepEqual(runtime.widgets.at(-1), ["Task-file implementation", "○ 2/2 Two"]);
 		const saved = await loadState(directory);
 		assert.equal(saved?.status, "failed");
 		assert.equal(saved?.nextTaskIndex, 1);
