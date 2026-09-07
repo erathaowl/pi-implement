@@ -107,6 +107,8 @@ Inside a Git repository, `/implement-tasks` — and therefore `/implement-plan` 
 - implement without Git checkpoints;
 - create a new local branch and commit after each successful task.
 
+The Git mode is selected in the task-preview dialog, before the compaction question. Outside a Git working tree, only **Implement** and **Cancel** are offered. If Git detection fails (for example, due to dubious ownership, permissions, or unavailable Git), the workflow reports the error and stops instead of silently hiding the Git choices. Resolve the reported Git issue manually, then rerun the command; the extension never changes Git trust settings.
+
 Checkpoint mode requires a clean working tree before execution starts. The user chooses the new local branch name.
 
 After each successful task, changes are staged and committed locally. Tasks that produce no staged changes do not create empty commits. A Git failure stops execution before the next task.

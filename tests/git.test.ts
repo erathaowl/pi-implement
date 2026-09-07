@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { ExecResult } from "@earendil-works/pi-coding-agent";
 import { createLocalGit } from "../src/git.ts";
 import { STATE_FILE_NAME } from "../src/state.ts";
 
@@ -22,6 +23,49 @@ function runGit(cwd: string, args: string[]): string {
 	assert.equal(result.code, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
 	return result.stdout;
 }
+
+for (const [name, result, expected] of [
+	["working tree", { stdout: "true\n" }, true],
+	["outside a working tree", { stdout: "false\n" }, false],
+	["non-repository directory", { code: 128, stderr: "fatal: not a git repository (or any of the parent directories): .git\n" }, false],
+] as const) {
+	test(`repository detection recognizes ${name}`, async () => {
+		const cwd = join(process.cwd(), "nested project");
+		const git = createLocalGit(async (command, args, options) => {
+			assert.equal(command, "git");
+			assert.deepEqual(args, ["rev-parse", "--is-inside-work-tree"]);
+			assert.equal(options?.cwd, cwd);
+			return { stdout: "", stderr: "", code: 0, killed: false, ...result };
+		});
+
+		assert.equal(await git.isRepository(cwd), expected);
+	});
+}
+
+for (const [name, result, detail] of [
+	["dubious ownership", { code: 128, stderr: "fatal: detected dubious ownership in repository" }, "dubious ownership"],
+	["permission denial", { code: 128, stderr: "fatal: cannot access .git: Permission denied" }, "Permission denied"],
+	["missing diagnostics", { code: 1 }, "exit code 1"],
+	["unexpected output", { stdout: "unexpected output\n" }, "unexpected output"],
+	["interrupted check", { stdout: "true\n", killed: true }, "interrupted"],
+] satisfies Array<[string, Partial<ExecResult>, string]>) {
+	test(`repository detection reports ${name} instead of disabling Git`, async () => {
+		const cwd = process.cwd();
+		const git = createLocalGit(async () => ({ stdout: "", stderr: "", code: 0, killed: false, ...result }));
+
+		await assert.rejects(git.isRepository(cwd), (error: Error) => {
+			assert.match(error.message, /Git repository check failed/);
+			assert.ok(error.message.includes(cwd));
+			assert.ok(error.message.includes(detail));
+			return true;
+		});
+	});
+}
+
+test("repository detection reports execution exceptions", async () => {
+	const git = createLocalGit(async () => { throw new Error("spawn git ENOENT"); });
+	await assert.rejects(git.isRepository(process.cwd()), /Git repository check failed.*spawn git ENOENT/);
+});
 
 test("checkpoint staging excludes the state file whether it is ignored or unignored", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "pi-implement-git-"));

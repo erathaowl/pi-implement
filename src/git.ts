@@ -26,12 +26,25 @@ export function createLocalGit(exec: Exec): LocalGit {
 
 	return {
 		async isRepository(cwd) {
+			let result: ExecResult;
 			try {
-				const result = await exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd });
-				return result.code === 0 && result.stdout.trim() === "true";
-			} catch {
-				return false;
+				result = await exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd });
+			} catch (error) {
+				throw new Error(`Git repository check failed in ${cwd}: ${error instanceof Error ? error.message : String(error)}`);
 			}
+
+			if (!result.killed) {
+				const output = result.stdout.trim();
+				if (result.code === 0 && (output === "true" || output === "false")) {
+					return output === "true";
+				}
+				// Only Git's explicit non-repository result should hide checkpoint options.
+				if (result.code !== 0 && /^fatal: not a git repository(?:\s|\()/i.test(result.stderr.trim())) {
+					return false;
+				}
+			}
+
+			throw new Error(`Git repository check failed in ${cwd}: ${result.killed ? "check interrupted" : failureDetail(result)}`);
 		},
 
 		async isWorkingTreeClean(cwd) {

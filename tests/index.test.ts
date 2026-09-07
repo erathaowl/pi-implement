@@ -78,7 +78,9 @@ function fakeRuntime(options: {
 	const stopReasons = [...(options.turnStopReasons ?? [])];
 	const modelOutputs = [...(options.modelOutputs ?? [])];
 	const choices = [...(options.choices ?? [])];
-	const gitResults = options.gitResults ? [...options.gitResults] : [gitResult("", 1, "not a repository")];
+	const gitResults = options.gitResults
+		? [...options.gitResults]
+		: [gitResult("", 128, "fatal: not a git repository (or any of the parent directories): .git")];
 	const inputs = [...(options.inputs ?? [])];
 	const contextUsages = [...(options.contextUsages ?? [])];
 	const compactionOutcomes = [...(options.compactionOutcomes ?? [])];
@@ -445,24 +447,33 @@ test("/implement-tasks indexes titles but makes each turn read the authoritative
 	});
 });
 
-test("task workflow continues normally when Git is unavailable", async () => {
-	await withTempDir(async (directory) => {
-		await writeFile(join(directory, "tasks.md"), "## Task 1 - One\nDo one.");
-		const runtime = fakeRuntime({
-			cwd: directory,
-			choices: ["Implement"],
-			modelOutputs: [{ tasks: [{ title: "One" }] }],
-			gitUnavailable: true,
+for (const command of ["implement-tasks", "implement-plan"]) {
+	for (const unavailable of [false, true]) {
+		test(`${command} reports Git detection ${unavailable ? "exceptions" : "failures"} before preparation`, async () => {
+			await withTempDir(async (directory) => {
+				const detail = unavailable ? "git not found" : `fatal: detected dubious ownership in repository at '${directory}'`;
+				const runtime = fakeRuntime({
+					cwd: directory,
+					gitUnavailable: unavailable,
+					gitResults: [gitResult("", 128, detail)],
+				});
+
+				await runtime.run(command, "tasks.md");
+
+				assert.deepEqual(runtime.selections, []);
+				assert.equal(runtime.ignoreStatePrompts.length, 0);
+				assert.equal(runtime.completeCalls.length, 0);
+				assert.deepEqual(runtime.sent, []);
+				assert.equal(runtime.execCalls.length, 1);
+				assert.ok(runtime.notifications.some(({ message, type }) =>
+					type === "error" && message.includes("Git repository check failed") && message.includes(detail),
+				));
+				await assert.rejects(readFile(join(directory, ".gitignore"), "utf8"), /ENOENT/);
+				assert.equal(await loadState(directory), undefined);
+			});
 		});
-
-		await runtime.run("implement-tasks", "tasks.md");
-
-		assert.deepEqual(runtime.selections[0].choices, ["Implement", "Cancel"]);
-		assert.equal(runtime.ignoreStatePrompts.length, 0);
-		await assert.rejects(readFile(join(directory, ".gitignore"), "utf8"), /ENOENT/);
-		assert.equal(runtime.sent.length, 1);
-	});
-});
+	}
+}
 
 test("repository task workflow offers implement-only mode without creating checkpoints", async () => {
 	await withTempDir(async (directory) => {
