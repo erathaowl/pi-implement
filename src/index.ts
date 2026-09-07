@@ -26,7 +26,7 @@ import {
 import { buildTaskFilePrompt, indexTaskFile } from "./tasks.ts";
 
 const PROGRESS_WIDGET = "implement-progress";
-const GIT_CHECKPOINT_CHOICE = "New local branch + commit after each task";
+const GIT_CHECKPOINT_CHOICE = "Git checkpoints: new or current local branch";
 
 type ExecutionOptions = {
 	checkpoint: boolean;
@@ -169,6 +169,19 @@ async function saveFailure(
 	}
 }
 
+async function completeCheckpoint(
+	ctx: ExtensionCommandContext,
+	git: LocalGit,
+	state: ImplementationState,
+): Promise<void> {
+	const title = state.tasks[state.nextTaskIndex - 1].title.replace(/\s+/g, " ").trim();
+	await git.commitChanges(ctx.cwd, `Task ${state.nextTaskIndex}: ${title}`);
+	delete state.pendingCheckpoint;
+	state.status = "running";
+	delete state.error;
+	await saveState(ctx.cwd, state);
+}
+
 async function executeTaskSet(
 	commandName: string,
 	progressTitle: string,
@@ -184,14 +197,28 @@ async function executeTaskSet(
 	const update = () => updateProgressUi(ctx, progressTitle, tasks, statuses);
 	update();
 
-	if (state.pendingCompaction) {
+	const recoveringCheckpoint = state.pendingCheckpoint;
+	if (recoveringCheckpoint) {
+		try {
+			await completeCheckpoint(ctx, git, state);
+		} catch (error) {
+			await saveFailure(ctx, commandName, state, state.nextTaskIndex, error);
+			return;
+		}
+	}
+
+	if (state.pendingCompaction || (recoveringCheckpoint && state.nextTaskIndex < state.tasks.length)) {
 		try {
 			await compactIfNeeded(
 				ctx,
 				state.automaticCompaction,
 				DEFAULT_COMPACTION_THRESHOLD_PERCENT,
 				state.nextTaskIndex + 1,
-				true,
+				state.pendingCompaction === true,
+				async () => {
+					state.pendingCompaction = true;
+					await saveState(ctx.cwd, state);
+				},
 			);
 			delete state.pendingCompaction;
 			state.status = "running";
@@ -228,23 +255,19 @@ async function executeTaskSet(
 		statuses[index] = "completed";
 		update();
 
-		try {
-			if (state.checkpoint) {
-				const title = state.tasks[index].title.replace(/\s+/g, " ").trim();
-				await git.commitChanges(ctx.cwd, `Task ${index + 1}: ${title}`);
-			}
-		} catch (error) {
-			await saveFailure(ctx, commandName, state, index, error);
-			return;
-		}
-
 		state.nextTaskIndex = index + 1;
+		if (state.checkpoint) {
+			state.pendingCheckpoint = true;
+		}
 		state.status = "running";
 		delete state.error;
 		try {
 			await saveState(ctx.cwd, state);
+			if (state.pendingCheckpoint) {
+				await completeCheckpoint(ctx, git, state);
+			}
 		} catch (error) {
-			report(ctx, commandName, error instanceof Error ? error.message : String(error), "error");
+			await saveFailure(ctx, commandName, state, state.nextTaskIndex, error);
 			return;
 		}
 
@@ -308,11 +331,25 @@ async function selectExecutionOptions(
 
 	let branchName: string | undefined;
 	if (checkpoint) {
-		branchName = (await ctx.ui.input("New local branch name", "feature/task-checkpoints"))?.trim();
-		if (!branchName) {
+		branchName = (await ctx.ui.input("New local branch name (empty to use current branch)", "feature/task-checkpoints"))?.trim();
+		if (branchName === undefined) {
 			return undefined;
 		}
-		await git.createBranch(ctx.cwd, branchName);
+		if (branchName) {
+			await git.createBranch(ctx.cwd, branchName);
+		} else {
+			const confirmed = await ctx.ui.confirm(
+				"Continue on the current branch?",
+				"Git checkpoints will commit changes directly to the current local branch.",
+			);
+			if (!confirmed) {
+				return undefined;
+			}
+			branchName = await git.currentBranch(ctx.cwd);
+			if (!branchName) {
+				throw new Error("Cannot start Git checkpoint mode on a detached HEAD. Switch to a local branch and try again.");
+			}
+		}
 	}
 
 	return {
@@ -387,6 +424,9 @@ function formatRestorePrompt(state: ImplementationState): string {
 		`Task: ${taskNumber}/${state.tasks.length}`,
 		`Status: ${state.status}`,
 	];
+	if (state.pendingCheckpoint) {
+		lines.push("Pending Git checkpoint: yes");
+	}
 	if (state.pendingCompaction) {
 		lines.push("Pending compaction: yes");
 	}

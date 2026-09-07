@@ -54,9 +54,10 @@ function fakeRuntime(options: {
 	choices?: string[];
 	modelOutputs?: unknown[];
 	turnStopReasons?: string[];
-	gitResults?: GitResult[];
+	gitResults?: Array<GitResult | Promise<GitResult>>;
 	gitUnavailable?: boolean;
 	inputs?: string[];
+	confirmations?: boolean[];
 	contextUsages?: Array<{ tokens: number | null; contextWindow: number; percent: number | null } | undefined>;
 	compactionOutcomes?: Array<"complete" | "error" | "manual">;
 	ignoreStateChoice?: "Yes" | "No";
@@ -72,6 +73,7 @@ function fakeRuntime(options: {
 	const workingMessages: Array<string | undefined> = [];
 	const execCalls: Array<{ command: string; args: string[]; cwd?: string }> = [];
 	const inputPrompts: Array<{ title: string; placeholder?: string }> = [];
+	const confirmationPrompts: Array<{ title: string; message: string }> = [];
 	const ignoreStatePrompts: Array<{ title: string; choices: string[] }> = [];
 	const compactCalls: CompactCallbacks[] = [];
 	let contextUsageCalls = 0;
@@ -82,6 +84,7 @@ function fakeRuntime(options: {
 		? [...options.gitResults]
 		: [gitResult("", 128, "fatal: not a git repository (or any of the parent directories): .git")];
 	const inputs = [...(options.inputs ?? [])];
+	const confirmations = [...(options.confirmations ?? [])];
 	const contextUsages = [...(options.contextUsages ?? [])];
 	const compactionOutcomes = [...(options.compactionOutcomes ?? [])];
 	const sessionHistory = [{ role: "user", content: "existing context" }];
@@ -166,6 +169,10 @@ function fakeRuntime(options: {
 				inputPrompts.push({ title, placeholder });
 				return inputs.shift();
 			},
+			async confirm(title: string, message: string) {
+				confirmationPrompts.push({ title, message });
+				return confirmations.shift() ?? false;
+			},
 			setWidget(_key: string, value: string[] | undefined) {
 				widgets.push(value);
 			},
@@ -193,6 +200,7 @@ function fakeRuntime(options: {
 		commands,
 		compactCalls,
 		completeCalls,
+		confirmationPrompts,
 		get contextUsageCalls() {
 			return contextUsageCalls;
 		},
@@ -344,7 +352,15 @@ test("checkpoint restore validates the saved branch without switching", async ()
 	await withTempDir(async (directory) => {
 		await saveState(
 			directory,
-			savedState(directory, { checkpoint: true, branchName: "feature/saved", status: "failed", error: "commit failed" }),
+			savedState(directory, {
+				checkpoint: true,
+				branchName: "feature/saved",
+				status: "failed",
+				error: "commit failed",
+				pendingCheckpoint: true,
+				pendingCompaction: true,
+				automaticCompaction: true,
+			}),
 		);
 		const runtime = fakeRuntime({
 			cwd: directory,
@@ -359,6 +375,8 @@ test("checkpoint restore validates the saved branch without switching", async ()
 		assert.deepEqual(runtime.sent, []);
 		assert.equal(runtime.completeCalls.length, 0);
 		assert.ok(runtime.notifications.some(({ message }) => message.includes("expected local branch")));
+		assert.equal(runtime.compactCalls.length, 0);
+		assert.equal((await loadState(directory))?.pendingCheckpoint, true);
 		assert.equal((await loadState(directory))?.status, "failed");
 	});
 });
@@ -489,7 +507,7 @@ test("repository task workflow offers implement-only mode without creating check
 
 		assert.deepEqual(runtime.selections[0].choices, [
 			"Implement only",
-			"New local branch + commit after each task",
+			"Git checkpoints: new or current local branch",
 			"Cancel",
 		]);
 		assert.equal(runtime.execCalls.length, 1);
@@ -504,7 +522,7 @@ test("checkpoint mode rejects a dirty working tree before asking for a branch", 
 		await writeFile(join(directory, "tasks.md"), "## Task 1 - One\nDo one.");
 		const runtime = fakeRuntime({
 			cwd: directory,
-			choices: ["New local branch + commit after each task"],
+			choices: ["Git checkpoints: new or current local branch"],
 			modelOutputs: [{ tasks: [{ title: "One" }] }],
 			gitResults: [gitResult("true\n"), gitResult(" M existing.ts\n")],
 		});
@@ -526,8 +544,8 @@ test("checkpoint mode creates a local branch and commits only successful tasks w
 		await writeFile(join(directory, "tasks.md"), "tasks");
 		const runtime = fakeRuntime({
 			cwd: directory,
-			choices: ["New local branch + commit after each task"],
-			inputs: ["feature/local-checkpoints"],
+			choices: ["Git checkpoints: new or current local branch"],
+			inputs: ["  feature/local-checkpoints  "],
 			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
 			gitResults: [
 				gitResult("true\n"),
@@ -559,16 +577,152 @@ test("checkpoint mode creates a local branch and commits only successful tasks w
 		]);
 		assert.equal(runtime.sent.length, 2);
 		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 1);
+		assert.equal(runtime.inputPrompts[0].placeholder, "feature/task-checkpoints");
+		assert.equal(runtime.confirmationPrompts.length, 0);
 		assertNoRemoteGit(runtime.execCalls);
 	});
 });
+
+for (const input of ["", "   "]) {
+	test(`checkpoint mode confirms and saves the current branch for ${JSON.stringify(input)} input`, async () => {
+		await withTempDir(async (directory) => {
+			await writeFile(join(directory, "tasks.md"), "tasks");
+			const runtime = fakeRuntime({
+				cwd: directory,
+				choices: ["Git checkpoints: new or current local branch"],
+				inputs: [input],
+				confirmations: [true],
+				gitResults: [gitResult("true\n"), gitResult(), gitResult("main\n")],
+				manualTurns: true,
+			});
+
+			const execution = runtime.run("implement-tasks", "tasks.md");
+			await waitFor(() => runtime.sent.length === 1);
+			assert.equal(runtime.confirmationPrompts.length, 1);
+			assert.match(runtime.confirmationPrompts[0].message, /commit changes directly to the current local branch/);
+			assert.equal(runtime.inputPrompts[0].placeholder, "feature/task-checkpoints");
+			assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
+				["rev-parse", "--is-inside-work-tree"],
+				["status", "--porcelain"],
+				["branch", "--show-current"],
+			]);
+			assert.equal((await loadState(directory))?.branchName, "main");
+			assert.equal((await loadState(directory))?.checkpoint, true);
+			await runtime.settleTurn("error");
+			await execution;
+
+			const resumed = fakeRuntime({ cwd: directory, choices: ["Resume"], gitResults: [gitResult("main\n")] });
+			await resumed.run("implement-tasks", "missing.md");
+			assert.deepEqual(resumed.execCalls[0].args, ["branch", "--show-current"]);
+			assert.equal(resumed.sent.length, 1);
+			assert.equal(await loadState(directory), undefined);
+			assertNoRemoteGit(resumed.execCalls);
+		});
+	});
+}
+
+for (const scenario of [
+	{ name: "dismissed branch input", input: undefined, confirmed: true, result: gitResult(), action: undefined, error: undefined },
+	{ name: "declined current branch", input: "", confirmed: false, result: gitResult(), action: undefined, error: undefined },
+	{ name: "detached HEAD", input: "", confirmed: true, result: gitResult(), action: "branch", error: /detached HEAD/ },
+	{ name: "branch lookup failure", input: "", confirmed: true, result: gitResult("", 128, "lookup failed"), action: "branch", error: /Git branch check failed/ },
+	{ name: "branch creation failure", input: "feature/existing", confirmed: false, result: gitResult("", 128, "branch already exists"), action: "switch", error: /Git branch creation failed/ },
+]) {
+	test(`checkpoint setup aborts without workflow state on ${scenario.name}`, async () => {
+		await withTempDir(async (directory) => {
+			await writeFile(join(directory, "tasks.md"), "tasks");
+			const runtime = fakeRuntime({
+				cwd: directory,
+				choices: ["Git checkpoints: new or current local branch"],
+				inputs: scenario.input === undefined ? [] : [scenario.input],
+				confirmations: [scenario.confirmed],
+				gitResults: [gitResult("true\n"), gitResult(), scenario.result],
+			});
+
+			await runtime.run("implement-tasks", "tasks.md");
+
+			assert.deepEqual(runtime.sent, []);
+			assert.equal(await loadState(directory), undefined);
+			await assert.rejects(readFile(join(directory, ".gitignore")), /ENOENT/);
+			assert.equal(runtime.confirmationPrompts.length, scenario.input === "" ? 1 : 0);
+			assert.equal(runtime.execCalls[2]?.args[0], scenario.action);
+			assert.equal(runtime.execCalls.length, scenario.action ? 3 : 2);
+			assert.ok(runtime.notifications.some(({ message, type }) => scenario.error
+				? type === "error" && scenario.error.test(message)
+				: type === "info" && message.includes("cancelled")));
+		});
+	});
+}
+
+test("task completion and pending checkpoint are persisted before staging", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "tasks");
+		let finishStaging!: (result: GitResult) => void;
+		const staging = new Promise<GitResult>((resolve) => { finishStaging = resolve; });
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Git checkpoints: new or current local branch"],
+			inputs: ["feature/checkpoints"],
+			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
+			gitResults: [gitResult("true\n"), gitResult(), gitResult(), staging],
+			manualTurns: true,
+		});
+
+		const execution = runtime.run("implement-tasks", "tasks.md");
+		await waitFor(() => runtime.sent.length === 1);
+		await runtime.settleTurn();
+		await waitFor(() => runtime.execCalls.some(({ args }) => args[0] === "add"));
+		const pending = await loadState(directory);
+		assert.equal(pending?.nextTaskIndex, 1);
+		assert.equal(pending?.pendingCheckpoint, true);
+		assert.equal(pending?.status, "running");
+		assert.equal(runtime.sent.length, 1);
+
+		finishStaging(gitResult());
+		await waitFor(() => runtime.sent.length === 2);
+		assert.equal((await loadState(directory))?.pendingCheckpoint, undefined);
+		await runtime.settleTurn();
+		await execution;
+		assert.equal(await loadState(directory), undefined);
+	});
+});
+
+for (const [action, results] of [
+	["staging", [gitResult("", 1, "staging failed")]],
+	["state-file unstaging", [gitResult(), gitResult("", 1, "unstaging failed")]],
+	["change check", [gitResult(), gitResult(), gitResult("", 128, "diff failed")]],
+] as const) {
+	test(`Git ${action} failure preserves completed progress and a pending checkpoint`, async () => {
+		await withTempDir(async (directory) => {
+			await writeFile(join(directory, "tasks.md"), "tasks");
+			const runtime = fakeRuntime({
+				cwd: directory,
+				choices: ["Git checkpoints: new or current local branch", COMPACTION_ENABLED_CHOICE],
+				inputs: ["feature/checkpoints"],
+				modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
+				gitResults: [gitResult("true\n"), gitResult(), gitResult(), ...results],
+			});
+
+			await runtime.run("implement-tasks", "tasks.md");
+
+			const saved = await loadState(directory);
+			assert.equal(saved?.nextTaskIndex, 1);
+			assert.equal(saved?.pendingCheckpoint, true);
+			assert.equal(saved?.status, "failed");
+			assert.ok(saved?.error?.includes(`Git ${action} failed`));
+			assert.equal(runtime.sent.length, 1);
+			assert.equal(runtime.compactCalls.length, 0);
+			assert.equal(runtime.contextUsageCalls, 0);
+		});
+	});
+}
 
 test("Git checkpoint failure stops before the next task", async () => {
 	await withTempDir(async (directory) => {
 		await writeFile(join(directory, "tasks.md"), "tasks");
 		const runtime = fakeRuntime({
 			cwd: directory,
-			choices: ["New local branch + commit after each task"],
+			choices: ["Git checkpoints: new or current local branch"],
 			inputs: ["feature/checkpoint-failure"],
 			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
 			gitResults: [
@@ -588,11 +742,157 @@ test("Git checkpoint failure stops before the next task", async () => {
 		assert.ok(runtime.notifications.some(({ message }) => message.includes("Git commit failed")));
 		const saved = await loadState(directory);
 		assert.equal(saved?.status, "failed");
-		assert.equal(saved?.nextTaskIndex, 0);
+		assert.equal(saved?.nextTaskIndex, 1);
+		assert.equal(saved?.pendingCheckpoint, true);
 		assert.match(saved?.error ?? "", /Git commit failed/);
 		assertNoRemoteGit(runtime.execCalls);
+
+		const failedRecovery = fakeRuntime({
+			cwd: directory,
+			choices: ["Resume"],
+			gitResults: [gitResult("feature/checkpoint-failure\n"), gitResult(), gitResult(), gitResult("", 1), gitResult("", 1, "hook still failing")],
+		});
+		await failedRecovery.run("implement-tasks", "missing.md");
+		assert.deepEqual(failedRecovery.sent, []);
+		assert.equal(failedRecovery.completeCalls.length, 0);
+		assert.equal((await loadState(directory))?.pendingCheckpoint, true);
+		assert.equal((await loadState(directory))?.nextTaskIndex, 1);
+		assert.equal((await loadState(directory))?.status, "failed");
+
+		let finishCommit!: (result: GitResult) => void;
+		const commit = new Promise<GitResult>((resolve) => { finishCommit = resolve; });
+		const resumed = fakeRuntime({
+			cwd: directory,
+			choices: ["Resume"],
+			gitResults: [gitResult("feature/checkpoint-failure\n"), gitResult(), gitResult(), gitResult("", 1), commit],
+			manualTurns: true,
+		});
+		const recovery = resumed.run("implement-plan", "missing.md");
+		await waitFor(() => resumed.execCalls.some(({ args }) => args[0] === "commit"));
+		assert.deepEqual(resumed.sent, []);
+		assert.equal(resumed.completeCalls.length, 0);
+		assert.match(resumed.selections[0].title, /Pending Git checkpoint: yes/);
+		assert.equal((await loadState(directory))?.pendingCheckpoint, true);
+		assert.deepEqual(resumed.execCalls.map(({ args }) => args), [
+			["branch", "--show-current"],
+			["add", "-A"],
+			["reset", "-q", "HEAD", "--", STATE_FILE_NAME],
+			["diff", "--cached", "--quiet"],
+			["commit", "-m", "Task 1: One"],
+		]);
+
+		finishCommit(gitResult());
+		await waitFor(() => resumed.sent.length === 1);
+		assert.deepEqual(resumed.sent, [saved?.tasks[1].prompt]);
+		const recovered = await loadState(directory);
+		assert.equal(recovered?.pendingCheckpoint, undefined);
+		assert.equal(recovered?.nextTaskIndex, 1);
+		assert.equal(recovered?.status, "running");
+		assert.equal(recovered?.error, undefined);
+		await resumed.settleTurn();
+		await recovery;
+		assert.equal(await loadState(directory), undefined);
+		assertNoRemoteGit(resumed.execCalls);
 	});
 });
+
+for (const nextTaskIndex of [2, 3]) {
+	test(`Resume recovers an already committed checkpoint at task index ${nextTaskIndex}`, async () => {
+		await withTempDir(async (directory) => {
+			const state = savedState(directory, {
+				checkpoint: true,
+				branchName: "feature/saved",
+				pendingCheckpoint: true,
+				nextTaskIndex,
+			});
+			await saveState(directory, state);
+			const runtime = fakeRuntime({
+				cwd: directory,
+				choices: ["Resume"],
+				gitResults: [gitResult("feature/saved\n"), gitResult(), gitResult(), gitResult()],
+			});
+
+			await runtime.run("implement-tasks", "missing.md");
+
+			assert.deepEqual(runtime.sent, state.tasks.slice(nextTaskIndex).map(({ prompt }) => prompt));
+			assert.equal(runtime.completeCalls.length, 0);
+			assert.deepEqual(runtime.execCalls.slice(0, 4).map(({ args }) => args), [
+				["branch", "--show-current"],
+				["add", "-A"],
+				["reset", "-q", "HEAD", "--", STATE_FILE_NAME],
+				["diff", "--cached", "--quiet"],
+			]);
+			assert.equal(runtime.execCalls.some(({ args }) => args[0] === "commit"), false);
+			assert.equal(await loadState(directory), undefined);
+		});
+	});
+}
+
+for (const pendingCompaction of [undefined, true]) {
+	test(`checkpoint recovery precedes ${pendingCompaction ? "pending" : "threshold-triggered"} compaction`, async () => {
+		await withTempDir(async (directory) => {
+			const state = savedState(directory, {
+				checkpoint: true,
+				branchName: "feature/saved",
+				pendingCheckpoint: true,
+				automaticCompaction: true,
+				pendingCompaction,
+				nextTaskIndex: 2,
+			});
+			state.tasks[1].title = "Two\n  with spacing";
+			await saveState(directory, state);
+			const failed = fakeRuntime({
+				cwd: directory,
+				choices: ["Resume"],
+				gitResults: [gitResult("feature/saved\n"), gitResult("", 1, "staging failed")],
+			});
+			await failed.run("implement-tasks", "missing.md");
+			assert.deepEqual(failed.sent, []);
+			assert.equal(failed.compactCalls.length, 0);
+			assert.equal(failed.contextUsageCalls, 0);
+			assert.equal((await loadState(directory))?.pendingCheckpoint, true);
+			assert.equal((await loadState(directory))?.pendingCompaction, pendingCompaction);
+
+			const runtime = fakeRuntime({
+				cwd: directory,
+				choices: ["Resume"],
+				gitResults: [gitResult("feature/saved\n"), gitResult(), gitResult(), gitResult("", 1), gitResult()],
+				contextUsages: [{ tokens: 80, contextWindow: 100, percent: 80 }],
+				compactionOutcomes: ["manual"],
+			});
+			const execution = runtime.run("implement-tasks", "missing.md");
+			await waitFor(() => runtime.compactCalls.length === 1);
+			assert.deepEqual(runtime.sent, []);
+			assert.deepEqual(runtime.execCalls.at(-1)?.args, ["commit", "-m", "Task 2: Two with spacing"]);
+			assert.equal(runtime.contextUsageCalls, pendingCompaction ? 0 : 1);
+			assert.equal((await loadState(directory))?.pendingCheckpoint, undefined);
+			assert.equal((await loadState(directory))?.pendingCompaction, true);
+
+			runtime.compactCalls[0].onError?.(new Error("compaction failed"));
+			await execution;
+			assert.equal((await loadState(directory))?.pendingCheckpoint, undefined);
+			assert.equal((await loadState(directory))?.pendingCompaction, true);
+			assert.equal((await loadState(directory))?.nextTaskIndex, 2);
+			assert.equal((await loadState(directory))?.status, "failed");
+
+			const resumed = fakeRuntime({
+				cwd: directory,
+				choices: ["Resume"],
+				gitResults: [gitResult("feature/saved\n")],
+				compactionOutcomes: ["manual"],
+			});
+			const recovery = resumed.run("implement-tasks", "missing.md");
+			await waitFor(() => resumed.compactCalls.length === 1);
+			assert.deepEqual(resumed.execCalls.map(({ args }) => args), [["branch", "--show-current"]]);
+			assert.deepEqual(resumed.sent, []);
+			assert.equal(resumed.contextUsageCalls, 0);
+			resumed.compactCalls[0].onComplete?.({});
+			await recovery;
+			assert.deepEqual(resumed.sent, [state.tasks[2].prompt]);
+			assert.equal(await loadState(directory), undefined);
+		});
+	});
+}
 
 test("/implement-tasks preview cancellation sends no active-session prompt", async () => {
 	await withTempDir(async (directory) => {
@@ -804,7 +1104,7 @@ test("/implement-plan overwrites with confirmation then delegates to the task-fi
 		assert.match(runtime.selections[1].title, /Implement tasks from tasks\.md/);
 		assert.deepEqual(runtime.selections[1].choices, [
 			"Implement only",
-			"New local branch + commit after each task",
+			"Git checkpoints: new or current local branch",
 			"Cancel",
 		]);
 		assert.deepEqual(runtime.execCalls[0].args, ["rev-parse", "--is-inside-work-tree"]);

@@ -93,6 +93,10 @@ test("checkpoint staging excludes the state file whether it is ignored or unigno
 			assert.equal(runGit(repository, ["show", "--format=", "--name-only", "HEAD"]).trim(), "tracked.txt");
 			assert.notEqual(executeGit(repository, ["ls-files", "--error-unmatch", STATE_FILE_NAME]).code, 0);
 			assert.equal(await readFile(join(repository, STATE_FILE_NAME), "utf8"), "state\n");
+
+			const committedHead = runGit(repository, ["rev-parse", "HEAD"]);
+			assert.equal(await git.commitChanges(repository, "Task 1: Update tracked file"), false);
+			assert.equal(runGit(repository, ["rev-parse", "HEAD"]), committedHead);
 		}
 	} finally {
 		await rm(directory, { recursive: true, force: true });

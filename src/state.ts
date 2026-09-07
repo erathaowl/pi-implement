@@ -13,6 +13,7 @@ export interface ImplementationState {
 	error?: string;
 	checkpoint: boolean;
 	automaticCompaction: boolean;
+	pendingCheckpoint?: boolean;
 	pendingCompaction?: boolean;
 	branchName?: string;
 }
@@ -76,6 +77,8 @@ function validateState(value: unknown): ImplementationState {
 		(state.status !== "running" && state.status !== "failed") ||
 		typeof state.checkpoint !== "boolean" ||
 		typeof state.automaticCompaction !== "boolean" ||
+		(state.pendingCheckpoint !== undefined && typeof state.pendingCheckpoint !== "boolean") ||
+		(state.pendingCheckpoint === true && (!state.checkpoint || state.nextTaskIndex === 0)) ||
 		(state.pendingCompaction !== undefined && typeof state.pendingCompaction !== "boolean") ||
 		(state.pendingCompaction === true &&
 			(!state.automaticCompaction || state.nextTaskIndex >= state.tasks.length)) ||

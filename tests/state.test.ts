@@ -86,6 +86,44 @@ test("state validation requires a non-empty working directory", async () => {
 	});
 });
 
+test("pending checkpoint state round-trips, including the final task", async () => {
+	await withTempDir(async (directory) => {
+		const pending: ImplementationState = {
+			...state,
+			checkpoint: true,
+			branchName: "main",
+			nextTaskIndex: state.tasks.length,
+			pendingCheckpoint: true,
+			status: "failed",
+			error: "commit failed",
+		};
+		await saveState(directory, pending);
+		assert.deepEqual(await loadState(directory), pending);
+	});
+});
+
+test("pending checkpoint validation requires a boolean, checkpoint mode, and a completed task", async () => {
+	await withTempDir(async (directory) => {
+		for (const overrides of [
+			{ pendingCheckpoint: "true" },
+			{ pendingCheckpoint: null },
+			{ checkpoint: false },
+			{ nextTaskIndex: 0 },
+			{ nextTaskIndex: 2 },
+		]) {
+			await writeFile(join(directory, STATE_FILE_NAME), JSON.stringify({
+				...state,
+				checkpoint: true,
+				branchName: "main",
+				nextTaskIndex: 1,
+				pendingCheckpoint: true,
+				...overrides,
+			}));
+			await assert.rejects(loadState(directory), /Invalid implementation state/);
+		}
+	});
+});
+
 test("invalid state is rejected", async () => {
 	await withTempDir(async (directory) => {
 		await writeFile(join(directory, STATE_FILE_NAME), "{}", "utf8");

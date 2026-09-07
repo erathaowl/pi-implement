@@ -105,13 +105,13 @@ An interactive UI (TUI or RPC UI) is required.
 Inside a Git repository, `/implement-tasks` — and therefore `/implement-plan` through its delegated task workflow — offers two execution modes:
 
 - implement without Git checkpoints;
-- create a new local branch and commit after each successful task.
+- commit after each successful task on a new or current local branch.
 
 The Git mode is selected in the task-preview dialog, before the compaction question. Outside a Git working tree, only **Implement** and **Cancel** are offered. If Git detection fails (for example, due to dubious ownership, permissions, or unavailable Git), the workflow reports the error and stops instead of silently hiding the Git choices. Resolve the reported Git issue manually, then rerun the command; the extension never changes Git trust settings.
 
-Checkpoint mode requires a clean working tree before execution starts. The user chooses the new local branch name.
+Checkpoint mode requires a clean working tree before execution starts. Enter a name to create a new local branch, or leave the branch-name input empty and confirm to continue on the current branch. Continuing on the current branch requires a named branch; detached HEAD is rejected.
 
-After each successful task, changes are staged and committed locally. Tasks that produce no staged changes do not create empty commits. A Git failure stops execution before the next task.
+After each successful task, changes are staged and committed locally. Tasks that produce no staged changes do not create empty commits. A Git failure stops execution before the next task, without losing the completed task's progress.
 
 Git operations owned by the extension are strictly local. It may inspect repository state, create a local branch, stage changes, and create commits. It never fetches, pulls, pushes, clones, or modifies remotes.
 
@@ -137,7 +137,7 @@ Active implementations are tracked in a single repository-local state file:
 
 Inside a Git repository, new workflows ask whether this file should be added to the repository-root `.gitignore`, with **Yes** as the default. Outside Git, the state file is still used but `.gitignore` is not created or modified.
 
-The state contains only what is required to resume the workflow: prepared task titles and prompts, execution position, status, working directory, pending compaction, and the selected Git/compaction options.
+The state contains only what is required to resume the workflow: prepared task titles and prompts, execution position, status, working directory, pending checkpoint/compaction, and the selected Git/compaction options.
 
 Writes are atomic. Git checkpoints explicitly exclude the state file whether or not it is ignored.
 
@@ -149,7 +149,7 @@ If unfinished state exists, starting any implementation command offers:
 
 Resume uses the saved task sequence directly, without repeating plan conversion or task indexing.
 
-A task interrupted while running is rerun. A task already completed before a compaction failure is not.
+A task interrupted while running is rerun. A task already completed before a Git checkpoint or compaction failure is not. Resume retries any pending Git checkpoint before compaction or the next task, using the saved task metadata for the commit message. If no staged changes remain (for example, the commit completed before an interruption), checkpoint recovery succeeds without creating another commit.
 
 Resume must be started from the same resolved working directory as the original workflow. When Git checkpoints are enabled, the current local branch must also match the saved branch. The extension does not change either automatically.
 
