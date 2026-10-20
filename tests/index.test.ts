@@ -3,10 +3,14 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { stripVTControlCharacters } from "node:util";
+import { initTheme, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { COMPACTION_ENABLED_CHOICE, DEFAULT_COMPACTION_THRESHOLD_PERCENT } from "../src/compaction.ts";
 import implementExtension, { formatProgress, readMarkdownInput } from "../src/index.ts";
 import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from "../src/state.ts";
 import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
+
+initTheme("dark");
 
 type Handler = (event: any, ctx?: any) => void | Promise<void>;
 
@@ -220,6 +224,27 @@ function fakeRuntime(options: {
 		ui: {
 			notify(message: string, type?: string) {
 				notifications.push({ message, type });
+			},
+			async custom(factory: Parameters<ExtensionUIContext["custom"]>[0]) {
+				return new Promise((done) => {
+					const selector = factory({} as never, {} as never, {} as never, done);
+					assert.ok(!(selector instanceof Promise));
+					const lines = selector.render(200).map(stripVTControlCharacters);
+					const menuChoices = lines.map((line) => line.trim().replace(/^→ /, ""))
+						.filter((line) => ["Implement only", "Git checkpoints: new or current local branch", "Cancel"].includes(line));
+					selections.push({ title: lines.join("\n"), choices: menuChoices });
+					const choice = choices.shift();
+					if (choice !== undefined) {
+						const selectedIndex = lines.filter((line) => line.trim().startsWith("→ "))
+							.map((line) => menuChoices.indexOf(line.trim().slice(2)))[0];
+						const targetIndex = menuChoices.indexOf(choice);
+						assert.notEqual(targetIndex, -1);
+						for (let i = 0; i < Math.abs(targetIndex - selectedIndex); i++) {
+							selector.handleInput?.(targetIndex < selectedIndex ? "\u001b[A" : "\u001b[B");
+						}
+					}
+					selector.handleInput?.("\r");
+				});
 			},
 			async select(title: string, selectChoices: string[]) {
 				if (title.includes(".pi-implement-state.json")) {
@@ -824,6 +849,23 @@ test("repository task workflow offers implement-only mode without creating check
 	});
 });
 
+test("repository confirmation still allows navigating down to Cancel", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "one task");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Cancel"],
+			gitResults: [gitResult("true\n")],
+		});
+
+		await runtime.run("implement-tasks", "tasks.md");
+
+		assert.equal(runtime.sent.length, 0);
+		assert.equal(runtime.execCalls.length, 1);
+		assert.equal(await loadState(directory), undefined);
+	});
+});
+
 test("checkpoint mode rejects a dirty working tree before asking for a branch", async () => {
 	await withTempDir(async (directory) => {
 		await writeFile(join(directory, "tasks.md"), "## Task 1 - One\nDo one.");
@@ -846,12 +888,11 @@ test("checkpoint mode rejects a dirty working tree before asking for a branch", 
 	});
 });
 
-test("checkpoint mode creates a local branch and commits only successful tasks with changes", async () => {
+test("Enter defaults to checkpoint mode, creating a local branch and committing only successful tasks with changes", async () => {
 	await withTempDir(async (directory) => {
 		await writeFile(join(directory, "tasks.md"), "tasks");
 		const runtime = fakeRuntime({
 			cwd: directory,
-			choices: ["Git checkpoints: new or current local branch"],
 			inputs: ["  feature/local-checkpoints  "],
 			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
 			gitResults: [
@@ -884,6 +925,9 @@ test("checkpoint mode creates a local branch and commits only successful tasks w
 		]);
 		assert.equal(runtime.sent.length, 2);
 		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 1);
+		assert.deepEqual(runtime.selections[0].choices, [
+			"Implement only", "Git checkpoints: new or current local branch", "Cancel",
+		]);
 		assert.equal(runtime.inputPrompts.find(({ title }) => title.startsWith("New local branch name"))?.placeholder, "feature/task-checkpoints");
 		assert.equal(runtime.confirmationPrompts.length, 0);
 		assertNoRemoteGit(runtime.execCalls);

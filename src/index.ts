@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { ExtensionSelectorComponent, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
 	COMPACTION_DISABLED_CHOICE,
 	COMPACTION_ENABLED_CHOICE,
@@ -349,7 +349,17 @@ async function selectExecutionOptions(
 	const choices = isRepository
 		? ["Implement only", GIT_CHECKPOINT_CHOICE, "Cancel"]
 		: ["Implement", "Cancel"];
-	const choice = await ctx.ui.select(formatPreview(previewTitle, tasks), choices);
+	const title = formatPreview(previewTitle, tasks);
+	const choice = isRepository && ctx.mode === "tui"
+		? await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+			const selector = new ExtensionSelectorComponent(title, choices, done, () => done(undefined), {
+				onToggleToolsExpanded: () => ctx.ui.setToolsExpanded(!ctx.ui.getToolsExpanded()),
+			});
+			// The built-in selector has no initial-index option; move to Git checkpoints before showing it.
+			selector.handleInput("j");
+			return selector;
+		})
+		: await ctx.ui.select(title, choices);
 	if (choice !== "Implement" && choice !== "Implement only" && choice !== GIT_CHECKPOINT_CHOICE) {
 		return undefined;
 	}
