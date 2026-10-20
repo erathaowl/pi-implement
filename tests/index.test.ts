@@ -866,27 +866,45 @@ test("repository confirmation still allows navigating down to Cancel", async () 
 	});
 });
 
-test("checkpoint mode rejects a dirty working tree before asking for a branch", async () => {
-	await withTempDir(async (directory) => {
-		await writeFile(join(directory, "tasks.md"), "## Task 1 - One\nDo one.");
-		const runtime = fakeRuntime({
-			cwd: directory,
-			choices: ["Git checkpoints: new or current local branch"],
-			modelOutputs: [{ tasks: [{ title: "One" }] }],
-			gitResults: [gitResult("true\n"), gitResult(" M existing.ts\n")],
+for (const branchInput of ["feature/checkpoints", ""]) {
+	for (const status of ["M  staged.ts\n", " M unstaged.ts\n", "?? untracked.ts\n"]) {
+		test(`dirty ${JSON.stringify(status.trim())} state is captured on ${branchInput || "the current branch"} before implementation`, async () => {
+			await withTempDir(async (directory) => {
+				await writeFile(join(directory, "tasks.md"), "one task");
+				const runtime = fakeRuntime({
+					cwd: directory,
+					choices: ["Git checkpoints: new or current local branch"],
+					inputs: [branchInput],
+					confirmations: [true],
+					gitResults: [
+						gitResult("true\n"), gitResult(status), gitResult("main\n"), gitResult("staged-tree\n"),
+						gitResult(), gitResult(), gitResult(), gitResult(), gitResult("", 1), gitResult(),
+					],
+					manualTurns: true,
+				});
+
+				const execution = runtime.run("implement-tasks", "tasks.md");
+				await waitFor(() => runtime.sent.length === 1);
+				assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
+					["rev-parse", "--is-inside-work-tree"],
+					["status", "--porcelain", "--untracked-files=all"],
+					branchInput ? ["switch", "-c", branchInput] : ["branch", "--show-current"],
+					["write-tree"],
+					["add", "-A"],
+					["commit", "-m", "chore: capture initial implementation state"],
+				]);
+				assert.equal((await loadState(directory))?.branchName, branchInput || "main");
+				await runtime.settleTurn();
+				await execution;
+				assert.deepEqual(runtime.execCalls.filter(({ args }) => args[0] === "commit").map(({ args }) => args), [
+					["commit", "-m", "chore: capture initial implementation state"],
+					["commit", "-m", "Task 1: One"],
+				]);
+				assertNoRemoteGit(runtime.execCalls);
+			});
 		});
-
-		await runtime.run("implement-tasks", "tasks.md");
-
-		assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
-			["rev-parse", "--is-inside-work-tree"],
-			["status", "--porcelain"],
-		]);
-		assert.equal(runtime.inputPrompts.length, 0);
-		assert.deepEqual(runtime.sent, []);
-		assert.ok(runtime.notifications.some(({ message, type }) => type === "error" && message.includes("clean working tree")));
-	});
-});
+	}
+}
 
 test("Enter defaults to checkpoint mode, creating a local branch and committing only successful tasks with changes", async () => {
 	await withTempDir(async (directory) => {
@@ -913,7 +931,7 @@ test("Enter defaults to checkpoint mode, creating a local branch and committing 
 
 		assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
 			["rev-parse", "--is-inside-work-tree"],
-			["status", "--porcelain"],
+			["status", "--porcelain", "--untracked-files=all"],
 			["switch", "-c", "feature/local-checkpoints"],
 			["add", "-A"],
 			["reset", "-q", "HEAD", "--", STATE_FILE_NAME],
@@ -954,7 +972,7 @@ for (const input of ["", "   "]) {
 			assert.equal(runtime.inputPrompts.find(({ title }) => title.startsWith("New local branch name"))?.placeholder, "feature/task-checkpoints");
 			assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
 				["rev-parse", "--is-inside-work-tree"],
-				["status", "--porcelain"],
+				["status", "--porcelain", "--untracked-files=all"],
 				["branch", "--show-current"],
 			]);
 			assert.equal((await loadState(directory))?.branchName, "main");
@@ -987,7 +1005,7 @@ for (const scenario of [
 				choices: ["Git checkpoints: new or current local branch"],
 				inputs: scenario.input === undefined ? [] : [scenario.input],
 				confirmations: [scenario.confirmed],
-				gitResults: [gitResult("true\n"), gitResult(), scenario.result],
+				gitResults: [gitResult("true\n"), gitResult(" M existing.txt\n"), scenario.result],
 			});
 
 			await runtime.run("implement-tasks", "tasks.md");
@@ -1001,6 +1019,35 @@ for (const scenario of [
 			assert.ok(runtime.notifications.some(({ message, type }) => scenario.error
 				? type === "error" && scenario.error.test(message)
 				: type === "info" && message.includes("cancelled")));
+		});
+	});
+}
+
+for (const [action, results, restoresIndex] of [
+	["initial index snapshot", [gitResult("", 1, "unmerged entries")], false],
+	["initial checkpoint staging", [gitResult("saved-tree\n"), gitResult("", 1, "index locked")], true],
+	["initial checkpoint commit", [gitResult("saved-tree\n"), gitResult(), gitResult("", 1, "commit hook rejected")], true],
+] as const) {
+	test(`${action} failure stops before implementation and preserves existing work`, async () => {
+		await withTempDir(async (directory) => {
+			await writeFile(join(directory, "tasks.md"), "one task");
+			await writeFile(join(directory, "existing.txt"), "existing work\n");
+			const runtime = fakeRuntime({
+				cwd: directory,
+				choices: ["Git checkpoints: new or current local branch"],
+				inputs: ["feature/checkpoints"],
+				gitResults: [gitResult("true\n"), gitResult(" M existing.txt\n"), gitResult(), ...results],
+			});
+
+			await runtime.run("implement-tasks", "tasks.md");
+
+			assert.deepEqual(runtime.sent, []);
+			assert.equal(await loadState(directory), undefined);
+			assert.equal(await readFile(join(directory, "existing.txt"), "utf8"), "existing work\n");
+			assert.equal(runtime.execCalls.some(({ args }) => args[0] === "read-tree"), restoresIndex);
+			if (restoresIndex) assert.deepEqual(runtime.execCalls.at(-1)?.args, ["read-tree", "saved-tree"]);
+			assert.ok(runtime.notifications.some(({ message, type }) => type === "error"
+				&& message.includes(`Git ${action} failed`) && message.includes(results.at(-1)!.stderr)));
 		});
 	});
 }

@@ -6,6 +6,7 @@ export interface LocalGit {
 	isWorkingTreeClean(cwd: string): Promise<boolean>;
 	createBranch(cwd: string, branchName: string): Promise<void>;
 	currentBranch(cwd: string): Promise<string>;
+	commitInitialChanges(cwd: string): Promise<void>;
 	commitChanges(cwd: string, message: string): Promise<boolean>;
 }
 
@@ -18,8 +19,8 @@ function failureDetail(result: ExecResult): string {
 export function createLocalGit(exec: Exec): LocalGit {
 	const run = async (cwd: string, args: string[], action: string): Promise<ExecResult> => {
 		const result = await exec("git", args, { cwd });
-		if (result.code !== 0) {
-			throw new Error(`Git ${action} failed: ${failureDetail(result)}`);
+		if (result.killed || result.code !== 0) {
+			throw new Error(`Git ${action} failed: ${result.killed ? "command interrupted" : failureDetail(result)}`);
 		}
 		return result;
 	};
@@ -48,7 +49,7 @@ export function createLocalGit(exec: Exec): LocalGit {
 		},
 
 		async isWorkingTreeClean(cwd) {
-			return (await run(cwd, ["status", "--porcelain"], "status check")).stdout.trim() === "";
+			return (await run(cwd, ["status", "--porcelain", "--untracked-files=all"], "status check")).stdout.trim() === "";
 		},
 
 		async createBranch(cwd, branchName) {
@@ -57,6 +58,23 @@ export function createLocalGit(exec: Exec): LocalGit {
 
 		async currentBranch(cwd) {
 			return (await run(cwd, ["branch", "--show-current"], "branch check")).stdout.trim();
+		},
+
+		async commitInitialChanges(cwd) {
+			// Save the staged tree before adding working-tree changes. This also rejects unresolved conflicts.
+			const stagedTree = (await run(cwd, ["write-tree"], "initial index snapshot")).stdout.trim();
+			try {
+				await run(cwd, ["add", "-A"], "initial checkpoint staging");
+				await run(cwd, ["commit", "-m", "chore: capture initial implementation state"], "initial checkpoint commit");
+			} catch (error) {
+				// Restore only the index; never reset or overwrite the user's working files.
+				try {
+					await run(cwd, ["read-tree", stagedTree], "initial index restoration");
+				} catch (restoreError) {
+					throw new Error(`${error instanceof Error ? error.message : String(error)}; ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
+				}
+				throw error;
+			}
 		},
 
 		async commitChanges(cwd, message) {

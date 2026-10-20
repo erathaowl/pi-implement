@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExecResult } from "@earendil-works/pi-coding-agent";
@@ -68,7 +67,7 @@ test("repository detection reports execution exceptions", async () => {
 });
 
 test("checkpoint staging excludes the state file whether it is ignored or unignored", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "pi-implement-git-"));
+	const directory = await mkdtemp(join(process.cwd(), ".pi-implement-git-test-"));
 	try {
 		for (const ignored of [true, false]) {
 			const repository = join(directory, ignored ? "ignored" : "unignored");

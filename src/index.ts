@@ -365,9 +365,7 @@ async function selectExecutionOptions(
 	}
 
 	const checkpoint = choice === GIT_CHECKPOINT_CHOICE;
-	if (checkpoint && !(await git.isWorkingTreeClean(ctx.cwd))) {
-		throw new Error("A clean working tree is required for Git checkpoint mode.");
-	}
+	const initiallyDirty = checkpoint && !(await git.isWorkingTreeClean(ctx.cwd));
 
 	const compactionChoice = await ctx.ui.select("Automatic compaction between tasks?", [
 		COMPACTION_ENABLED_CHOICE,
@@ -416,6 +414,9 @@ async function selectExecutionOptions(
 			if (!branchName) {
 				throw new Error("Cannot start Git checkpoint mode on a detached HEAD. Switch to a local branch and try again.");
 			}
+		}
+		if (initiallyDirty) {
+			await git.commitInitialChanges(ctx.cwd);
 		}
 	}
 
