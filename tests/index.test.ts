@@ -229,7 +229,7 @@ function fakeRuntime(options: {
 				selections.push({ title, choices: selectChoices });
 				const choice = choices.shift();
 				if (choice !== undefined) return choice;
-				if (title === "Automatic compaction between tasks?") return "No";
+				if (title === "Automatic compaction between tasks?") return selectChoices[0];
 				if (title.startsWith("Implementation model for all tasks")) {
 					return `${currentModel.provider}/${currentModel.id}`;
 				}
@@ -758,7 +758,7 @@ test("/implement-tasks indexes titles but makes each turn read the authoritative
 		assert.equal(runtime.completeCalls.length, 1);
 		assert.deepEqual(runtime.execCalls[0].args, ["rev-parse", "--is-inside-work-tree"]);
 		assert.deepEqual(runtime.selections[0].choices, ["Implement", "Cancel"]);
-		assert.deepEqual(runtime.selections[1].choices, ["No", COMPACTION_ENABLED_CHOICE]);
+		assert.deepEqual(runtime.selections[1].choices, [COMPACTION_ENABLED_CHOICE, "No"]);
 		assert.equal(runtime.contextUsageCalls, 0);
 		assert.equal(runtime.compactCalls.length, 0);
 		assert.equal(runtime.sent.length, 2);
@@ -884,7 +884,7 @@ test("checkpoint mode creates a local branch and commits only successful tasks w
 		]);
 		assert.equal(runtime.sent.length, 2);
 		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 1);
-		assert.equal(runtime.inputPrompts[0].placeholder, "feature/task-checkpoints");
+		assert.equal(runtime.inputPrompts.find(({ title }) => title.startsWith("New local branch name"))?.placeholder, "feature/task-checkpoints");
 		assert.equal(runtime.confirmationPrompts.length, 0);
 		assertNoRemoteGit(runtime.execCalls);
 	});
@@ -907,7 +907,7 @@ for (const input of ["", "   "]) {
 			await waitFor(() => runtime.sent.length === 1);
 			assert.equal(runtime.confirmationPrompts.length, 1);
 			assert.match(runtime.confirmationPrompts[0].message, /commit changes directly to the current local branch/);
-			assert.equal(runtime.inputPrompts[0].placeholder, "feature/task-checkpoints");
+			assert.equal(runtime.inputPrompts.find(({ title }) => title.startsWith("New local branch name"))?.placeholder, "feature/task-checkpoints");
 			assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
 				["rev-parse", "--is-inside-work-tree"],
 				["status", "--porcelain"],
@@ -1240,12 +1240,12 @@ test("/implement-tasks stops after failure and does not start a subsequent task"
 	});
 });
 
-test("automatic compaction waits above 70% before starting the next task", async () => {
+test("automatic compaction defaults to Yes and waits above 70% before starting the next task", async () => {
 	await withTempDir(async (directory) => {
 		await writeFile(join(directory, "tasks.md"), "tasks");
 		const runtime = fakeRuntime({
 			cwd: directory,
-			choices: ["Implement", COMPACTION_ENABLED_CHOICE],
+			choices: ["Implement"],
 			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
 			contextUsages: [{ tokens: 74, contextWindow: 100, percent: 74 }],
 			compactionOutcomes: ["manual"],
@@ -1256,6 +1256,10 @@ test("automatic compaction waits above 70% before starting the next task", async
 
 		assert.equal(runtime.sent.length, 1);
 		assert.equal(runtime.compactCalls.length, 1);
+		assert.deepEqual(
+			runtime.selections.find(({ title }) => title === "Automatic compaction between tasks?")?.choices,
+			["Yes", "No"],
+		);
 		assert.equal((await loadState(directory))?.compactionThresholdPercent, 70);
 		assert.ok(runtime.inputPrompts.some(({ title, placeholder }) =>
 			title === "Compaction threshold percentage (default: 70%)" && placeholder === "70",

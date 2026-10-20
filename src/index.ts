@@ -360,8 +360,8 @@ async function selectExecutionOptions(
 	}
 
 	const compactionChoice = await ctx.ui.select("Automatic compaction between tasks?", [
-		COMPACTION_DISABLED_CHOICE,
 		COMPACTION_ENABLED_CHOICE,
+		COMPACTION_DISABLED_CHOICE,
 	]);
 	if (compactionChoice !== COMPACTION_DISABLED_CHOICE && compactionChoice !== COMPACTION_ENABLED_CHOICE) {
 		return undefined;
