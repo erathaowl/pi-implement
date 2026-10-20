@@ -90,7 +90,7 @@ This is useful when the input describes the work at plan level rather than as cl
 
 All preparation calls use the currently active model and thinking settings in isolation. Tools are omitted from those model calls, and their prompts and responses are not added to the active session history. For `/implement-plan`, both plan conversion and generated-task indexing finish before implementation settings are selected.
 
-Before execution, the detected tasks are previewed for confirmation. The workflow then asks for one implementation model and thinking level, defaulting to the currently active pair. That fixed pair is used for every task; there is no per-task selection or automatic model switching.
+Before execution, the detected tasks are previewed for confirmation. In the terminal UI, long previews scroll with PageUp/PageDown while the action menu remains visible; arrow keys select the action. The workflow then asks for one implementation model and thinking level, defaulting to the currently active pair. That fixed pair is used for every task; there is no per-task selection or automatic model switching.
 
 Tasks are implemented sequentially in the current pi session. The extension waits for the complete agent lifecycle, including tool calls and retries, to settle before starting the next task.
 

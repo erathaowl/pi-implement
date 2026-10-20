@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import { initTheme, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { getKeybindings } from "@earendil-works/pi-tui";
 import { COMPACTION_ENABLED_CHOICE, DEFAULT_COMPACTION_THRESHOLD_PERCENT } from "../src/compaction.ts";
 import implementExtension, { formatProgress, readMarkdownInput } from "../src/index.ts";
 import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from "../src/state.ts";
@@ -227,11 +228,11 @@ function fakeRuntime(options: {
 			},
 			async custom(factory: Parameters<ExtensionUIContext["custom"]>[0]) {
 				return new Promise((done) => {
-					const selector = factory({} as never, {} as never, {} as never, done);
+					const selector = factory({ terminal: { rows: 40 }, requestRender() {} } as never, {} as never, getKeybindings(), done);
 					assert.ok(!(selector instanceof Promise));
 					const lines = selector.render(200).map(stripVTControlCharacters);
 					const menuChoices = lines.map((line) => line.trim().replace(/^→ /, ""))
-						.filter((line) => ["Implement only", "Git checkpoints: new or current local branch", "Cancel"].includes(line));
+						.filter((line) => ["Implement", "Implement only", "Git checkpoints: new or current local branch", "Cancel"].includes(line));
 					selections.push({ title: lines.join("\n"), choices: menuChoices });
 					const choice = choices.shift();
 					if (choice !== undefined) {

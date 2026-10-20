@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import { ExtensionSelectorComponent, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
 	COMPACTION_DISABLED_CHOICE,
 	COMPACTION_ENABLED_CHOICE,
@@ -32,6 +32,8 @@ import {
 	type ImplementationState,
 } from "./state.ts";
 import { buildTaskFilePrompt, indexTaskFile } from "./tasks.ts";
+import { selectTaskAction } from "./preview.ts";
+export { formatPreview } from "./preview.ts";
 
 const PROGRESS_WIDGET = "implement-progress";
 const PROGRESS_TASK_LIMIT = 5;
@@ -124,13 +126,6 @@ function report(
 	} else {
 		console.error(`[${commandName.slice(1)}] ${message}`);
 	}
-}
-
-export function formatPreview(title: string, tasks: TitledTaskList): string {
-	const taskLines = tasks.tasks.map((task, index) => `${index + 1}. ${task.title}`);
-	return [title, ...taskLines, `${tasks.tasks.length} ${tasks.tasks.length === 1 ? "task" : "tasks"} detected.`].join(
-		"\n",
-	);
 }
 
 export function formatProgress(
@@ -349,17 +344,7 @@ async function selectExecutionOptions(
 	const choices = isRepository
 		? ["Implement only", GIT_CHECKPOINT_CHOICE, "Cancel"]
 		: ["Implement", "Cancel"];
-	const title = formatPreview(previewTitle, tasks);
-	const choice = isRepository && ctx.mode === "tui"
-		? await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
-			const selector = new ExtensionSelectorComponent(title, choices, done, () => done(undefined), {
-				onToggleToolsExpanded: () => ctx.ui.setToolsExpanded(!ctx.ui.getToolsExpanded()),
-			});
-			// The built-in selector has no initial-index option; move to Git checkpoints before showing it.
-			selector.handleInput("j");
-			return selector;
-		})
-		: await ctx.ui.select(title, choices);
+	const choice = await selectTaskAction(previewTitle, tasks, choices, isRepository ? 1 : 0, ctx);
 	if (choice !== "Implement" && choice !== "Implement only" && choice !== GIT_CHECKPOINT_CHOICE) {
 		return undefined;
 	}
