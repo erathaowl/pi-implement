@@ -939,6 +939,155 @@ test("missing source material stops review recoverably before an agent turn", as
 	}, { reviewStarted: true });
 });
 
+for (const command of ["implement-tasks", "implement-plan"]) {
+	for (const outcome of ["passed", "fixed", "follow_up", "blocked"] as const) {
+		test(`${command} end-to-end review ${outcome} preserves provenance and reports only fresh remediation`, async () => {
+			await withReviewPreferences(async (agentDir) => withTempDir(async (directory) => {
+				const plan = "# Requirements\nDocument CLI usage.\n";
+				const tasks = "## Task 1 - Document CLI usage\nRead the requirements and update README.md.\n";
+				await writeFile(join(directory, "original plan.md"), plan);
+				await writeFile(join(directory, "tasks.md"), tasks);
+				await writeFile(join(directory, "README.md"), "# CLI\n");
+				for (const file of ["plan-fixes.md", "tasks-fixes.md"]) await writeFile(join(directory, file), `Old ${file}\n`);
+				const noPlan = command === "implement-tasks" && outcome === "blocked";
+				const result = reviewResult(noPlan);
+				result.outcome = outcome;
+				if (outcome === "fixed") result.minorFixes = [{ path: "README.md", description: "Corrected the usage typo", verification: ["Read README"] }];
+				if (outcome === "follow_up") {
+					result.remediationGenerated = true;
+					result.findings = [{ severity: "major", requirement: "Document CLI usage", path: "README.md", evidence: "Read README.md:1; only a heading exists, with no usage example.", reason: null, actionable: true, action: "Add a CLI usage example." }];
+				}
+				if (outcome === "blocked") {
+					result.unavailableChecks.push({ area: "tests", check: "Integration environment", reason: "The fixture has no integration service." });
+					result.findings = [{ severity: "unable_to_verify", requirement: "Validate integration behavior", path: null, evidence: "No integration service is configured in this fixture.", reason: "The fixture has no integration service.", actionable: false, action: null }];
+				}
+				const runtime = fakeRuntime({
+					cwd: directory, choices: command === "implement-plan" ? ["Overwrite"] : [],
+					inputs: command === "implement-tasks" ? [noPlan ? "" : "original plan.md"] : [],
+					models: reviewModels(), reviewChoices: ["Yes"], reviewModelChoices: ["test/review"], reviewThinkingChoices: ["high"],
+					modelOutputs: command === "implement-plan" ? [tasks, { tasks: [{ title: "Document CLI usage" }] }] : [{ tasks: [{ title: "Document CLI usage" }] }],
+					reviewResponses: [reviewResponse(result)],
+					onTurn: async (message) => {
+						if (!message.startsWith("Perform one final implementation review")) {
+							if (outcome !== "follow_up") await writeFile(join(directory, "README.md"), outcome === "fixed" ? "Usage: exmaple\n" : "Usage: example\n");
+							return;
+						}
+						const state = (await loadState(directory))!;
+						assert.equal(state.phase, "review");
+						assert.equal(state.nextTaskIndex, 1);
+						assert.equal(state.originalPlanPath, noPlan ? null : "original plan.md");
+						assert.ok(message.includes(JSON.stringify("tasks.md")));
+						if (!noPlan) assert.ok(message.includes(JSON.stringify("original plan.md")));
+						if (outcome === "fixed") {
+							await writeFile(join(directory, "README.md"), "Usage: example\n");
+							assert.equal(await readFile(join(directory, "README.md"), "utf8"), "Usage: example\n");
+						}
+						if (outcome === "follow_up") {
+							assert.equal(await readFile(join(directory, "README.md"), "utf8"), "# CLI\n");
+							const common = `Requirement: Document CLI usage\nPath: "README.md"\nRemedy: Add a CLI usage example.\nAcceptance criteria:\n- README contains a working usage example.\nVerification:\n- Compare the example with the CLI.\n`;
+							await writeFile(join(directory, "plan-fixes.md"), `# Fix plan\n## Finding 1 - Document usage\n${common}Context: CLI documentation is incomplete.\nSeverity: major\nEvidence: Read README.md:1; only a heading exists, with no usage example.\nExpected behavior: Document CLI usage.\nConstraints: Preserve existing behavior.\n`);
+							await writeFile(join(directory, "tasks-fixes.md"), `# Fix tasks\nRead plan-fixes.md.\n## Task 1 - Document usage\nFinding: 1\n${common}Action: Add and validate the usage example.\n`);
+						}
+					},
+				});
+				await runtime.run(command, command === "implement-plan" ? "original plan.md" : "tasks.md");
+				const final = runtime.notifications.find(({ message }) => message.startsWith(`Final review: ${outcome}`));
+				assert.ok(final, JSON.stringify(runtime.notifications));
+				assert.equal(final.type, outcome === "passed" || outcome === "fixed" ? "info" : "warning");
+				assert.equal(await loadState(directory), undefined);
+				assert.equal(runtime.sent.length, 2);
+				assert.equal(runtime.completeCalls.length, command === "implement-plan" ? 2 : 1);
+				assert.deepEqual(runtime.sentSettings, [{ model: "test/selected", thinkingLevel: "medium" }, { model: "test/review", thinkingLevel: "high" }]);
+				assert.deepEqual(await loadReviewPreference(agentDir), { model: { provider: "test", id: "review" }, thinkingLevel: "high" });
+				assert.equal(await readFile(join(directory, "original plan.md"), "utf8"), plan);
+				for (const file of ["plan-fixes.md", "tasks-fixes.md"]) {
+					if (outcome === "follow_up") assert.ok(final.message.includes(resolve(directory, file)));
+					else {
+						assert.equal(await readFile(join(directory, file), "utf8"), `Old ${file}\n`);
+						assert.ok(!final.message.includes(resolve(directory, file)));
+					}
+				}
+				if (outcome === "blocked") assert.match(final.message, /Unverified checks:[\s\S]*Integration environment/);
+				if (noPlan) assert.ok(final.message.includes(SOURCE_PLAN_COMPLIANCE_CHECK));
+				assert.ok(!runtime.execCalls.some(({ args }) => ["add", "commit"].includes(args[0])));
+			}));
+		});
+	}
+
+	test(`${command} end-to-end confirmation, compaction, review checkpoint failure, and exact-phase resume`, async () => {
+		await withReviewPreferences(async (agentDir) => withTempDir(async (directory) => {
+			const originalTasks = "Original user tasks\n";
+			const generated = "## Task 1 - One\n## Task 2 - Two\n";
+			await writeFile(join(directory, "original plan.md"), "# Source requirements\n");
+			await writeFile(join(directory, "tasks.md"), originalTasks);
+			await writeFile(join(directory, ".gitignore"), "user-ignore\n");
+			const result = reviewResult();
+			result.outcome = "fixed";
+			result.minorFixes = [{ path: "README.md", description: "Corrected documentation", verification: ["Read README"] }];
+			const runtime: ReturnType<typeof fakeRuntime> = fakeRuntime({
+				cwd: directory, choices: [...(command === "implement-plan" ? ["Overwrite"] : []), "Git checkpoints: new or current local branch"],
+				inputs: ["", ...(command === "implement-tasks" ? ["original plan.md"] : [])], confirmations: [true],
+				models: reviewModels(), reviewChoices: ["Yes"], reviewModelChoices: ["test/review"], reviewThinkingChoices: ["high"],
+				modelOutputs: [...(command === "implement-plan" ? [generated] : []), { tasks: [{ title: "One" }, { title: "Two" }] }],
+				reviewResponses: [reviewResponse(result)],
+				gitResults: [gitResult("true\n"), gitResult(), gitResult("main\n"),
+					gitResult(), gitResult(), gitResult("", 1), gitResult(), gitResult(), gitResult(), gitResult("", 1), gitResult(),
+					gitResult("main\n"), gitResult(), gitResult(), gitResult("", 1), gitResult("", 1, "Review checkpoint rejected")],
+				contextUsages: [{ tokens: 80, contextWindow: 100, percent: 80 }, { tokens: 80, contextWindow: 100, percent: 80 }],
+				onSummary: async () => {
+					assert.equal(await loadState(directory), undefined);
+					assert.equal(await loadReviewPreference(agentDir), undefined);
+					assert.equal(await readFile(join(directory, "tasks.md"), "utf8"), originalTasks);
+					assert.equal(await readFile(join(directory, ".gitignore"), "utf8"), "user-ignore\n");
+					assert.deepEqual(runtime.setModelCalls, []);
+					assert.ok(!runtime.execCalls.some(({ args }) => ["add", "commit", "switch"].includes(args[0])));
+				},
+				onTurn: async (message) => {
+					if (!message.startsWith("Perform one final implementation review")) return;
+					assert.equal(runtime.compactCalls.length, 2);
+					assert.deepEqual(runtime.execCalls.filter(({ args }) => args[0] === "commit").map(({ args }) => args[2]), ["Task 1: One", "Task 2: Two"]);
+					assert.equal((await loadState(directory))?.pendingCheckpoint, undefined);
+					await writeFile(join(directory, "README.md"), "Corrected documentation\n");
+					assert.equal(await readFile(join(directory, "README.md"), "utf8"), "Corrected documentation\n");
+				},
+			});
+			runtime.ctx.mode = command === "implement-plan" ? "rpc" : "tui";
+			await runtime.run(command, command === "implement-plan" ? "original plan.md" : "tasks.md");
+			const saved = (await loadState(directory))!;
+			assert.equal(saved.phase, "review_checkpoint");
+			assert.equal(saved.reviewResult?.outcome, "fixed");
+			assert.equal(saved.pendingCheckpoint?.purpose, "review");
+			assert.equal(saved.nextTaskIndex, 2);
+			assert.equal(saved.originalPlanPath, "original plan.md");
+			assert.equal(saved.status, "failed");
+			assert.match(saved.error ?? "", /Review checkpoint rejected/);
+			assert.equal(runtime.sent.length, 3);
+			const preferenceBefore = await readFile(join(agentDir, PREFERENCES_FILE_NAME), "utf8");
+			const resumed = fakeRuntime({
+				cwd: directory, choices: ["Resume"], models: [fakeModel("test", "selected")],
+				gitExec: async (args) => {
+					if (args[0] === "branch") return gitResult("main\n");
+					if (args[0] === "rev-parse") return gitResult(`${saved.pendingCheckpoint!.headBefore}\n`);
+					if (args[0] === "diff") return gitResult("", 1);
+					if (args[0] === "reset") assert.deepEqual(args, UNSTAGE_STATE);
+					if (args[0] === "commit") assert.deepEqual(args, ["commit", "-m", reviewCheckpointMessage]);
+					return gitResult();
+				},
+			});
+			await resumed.run(command === "implement-plan" ? "implement-tasks" : "implement-plan", "unused.md");
+			assert.deepEqual(resumed.sent, []);
+			assert.equal(resumed.completeCalls.length, 0);
+			assert.equal(resumed.compactCalls.length, 0);
+			assert.equal(resumed.execCalls.filter(({ args }) => args[0] === "commit").length, 1);
+			assert.equal(await readFile(join(agentDir, PREFERENCES_FILE_NAME), "utf8"), preferenceBefore);
+			assert.equal(await readFile(join(directory, "tasks.md"), "utf8"), command === "implement-plan" ? generated : originalTasks);
+			assert.equal(await loadState(directory), undefined);
+			assert.ok(resumed.notifications.some(({ message }) => message.startsWith("Final review: fixed")));
+			assertNoRemoteGit([...runtime.execCalls, ...runtime.preflightCalls, ...resumed.execCalls]);
+		}));
+	});
+}
+
 for (const { command, reference } of [
 	{ command: "implement-tasks", reference: "reference.md" },
 	{ command: "implement-tasks", reference: "" },

@@ -137,6 +137,37 @@ test("long execution summaries scroll while actions stay visible across resizing
 });
 
 for (const resume of [false, true]) {
+	test(`review-enabled ${resume ? "resume" : "start"} summary keeps its selected action while scrolling and resizing`, async () => {
+		const dialog = openDialog((ctx) => confirmExecutionSummary({
+			...summary,
+			cwd: "/project/Long directory ＡＢＣ 😀/".repeat(50),
+			sourcePlanPath: "requirements with spaces/plan.md",
+			review: { enabled: true, model: { provider: "review", id: "independent-model" }, thinkingLevel: "high" },
+		}, ctx, resume));
+		const action = resume ? "Resume" : "Start implementation";
+		dialog.terminal.rows = 12;
+		const first = dialog.render(40);
+		assert.ok(first.some((line) => line.startsWith("→ ") && line.includes("Cancel")));
+		for (let page = 0; page < 1000; page++) dialog.input("\u001b[6~");
+		const last = dialog.render(40);
+		assert.deepEqual(last.slice(-3), first.slice(-3));
+		assert.ok(last.some((line) => line.includes(".gitignore:")));
+		dialog.input("\u001b[A");
+		for (const [width, rows] of [[80, 24], [40, 12], [30, 6], [10, 3], [1, 1], [120, 40]]) {
+			dialog.terminal.rows = rows;
+			dialog.invalidate();
+			const lines = dialog.render(width);
+			assert.ok(lines.length <= Math.max(1, rows - 2));
+			assert.ok(lines.every((line) => visibleWidth(line) <= width));
+			if (width >= 30) {
+				assert.ok(lines.some((line) => line.startsWith("→ ") && line.includes(action)));
+				assert.ok(lines.some((line) => line.includes("Cancel")));
+			}
+		}
+		dialog.input("\r");
+		assert.equal(await dialog.result, true);
+	});
+
 	for (const [name, keys, expected] of [
 		["defaults to Cancel", ["\r"], false],
 		["confirms with up and Enter", ["\u001b[A", "\r"], true],
