@@ -10,6 +10,7 @@ import { COMPACTION_ENABLED_CHOICE, DEFAULT_COMPACTION_THRESHOLD_PERCENT } from 
 import implementExtension, { formatProgress, readMarkdownInput, selectExecutionOptions, selectSourcePlan, startExecutionSetup } from "../src/index.ts";
 import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from "../src/state.ts";
 import { snapshotGeneratedTasks } from "../src/plan.ts";
+import { PREFERENCES_FILE_NAME, loadReviewPreference, saveReviewPreference } from "../src/preferences.ts";
 import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
 
 initTheme("dark");
@@ -72,6 +73,19 @@ async function withTempDir(run: (directory: string) => Promise<void>): Promise<v
 	}
 }
 
+async function withReviewPreferences(run: (agentDir: string) => Promise<void>): Promise<void> {
+	const agentDir = await mkdtemp(join(process.cwd(), ".review-config-test-"));
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	try {
+		await run(agentDir);
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+		await rm(agentDir, { recursive: true, force: true });
+	}
+}
+
 function fakeRuntime(options: {
 	cwd: string;
 	choices?: string[];
@@ -95,7 +109,14 @@ function fakeRuntime(options: {
 	onSummary?: () => void | Promise<void>;
 	preflightSnapshots?: string[];
 	currentBranch?: string;
+	reviewChoices?: Array<string | undefined>;
+	reviewModelChoices?: Array<string | undefined>;
+	reviewThinkingChoices?: Array<string | undefined>;
 }) {
+	const reviewChoices = [...(options.reviewChoices ?? [])];
+	const reviewModelChoices = [...(options.reviewModelChoices ?? [])];
+	const reviewThinkingChoices = [...(options.reviewThinkingChoices ?? [])];
+	const promptTitles: string[] = [];
 	const commands = new Map<string, Handler>();
 	const handlers = new Map<string, Handler[]>();
 	const sent: string[] = [];
@@ -259,6 +280,7 @@ function fakeRuntime(options: {
 					const selector = factory({ terminal: { rows: 40 }, requestRender() {} } as never, {} as never, getKeybindings(), done);
 					assert.ok(!(selector instanceof Promise));
 					const lines = selector.render(200).map(stripVTControlCharacters);
+					promptTitles.push(lines[0]);
 					const menuChoices = lines.map((line) => line.trim().replace(/^→ /, ""))
 						.filter((line) => ["Implement", "Implement only", "Git checkpoints: new or current local branch", "Start implementation", "Resume", "Cancel"].includes(line));
 					selections.push({ title: lines.join("\n"), choices: menuChoices });
@@ -279,6 +301,7 @@ function fakeRuntime(options: {
 				});
 			},
 			async select(title: string, selectChoices: string[]) {
+				promptTitles.push(title);
 				if (title.startsWith("Add .pi-implement-state.json")) {
 					ignoreStatePrompts.push({ title, choices: selectChoices });
 					return options.ignoreStateChoice ?? "Yes";
@@ -289,6 +312,9 @@ function fakeRuntime(options: {
 					const response = summaryActions.shift();
 					return response === "escape" ? undefined : response ?? selectChoices[1];
 				}
+				if (title === "Final review?") return reviewChoices.length ? reviewChoices.shift() : selectChoices[0];
+				if (title.startsWith("Review model")) return reviewModelChoices.length ? reviewModelChoices.shift() : selectChoices[0];
+				if (title.startsWith("Review thinking level")) return reviewThinkingChoices.length ? reviewThinkingChoices.shift() : selectChoices[0];
 				const choice = choices.shift();
 				if (choice !== undefined) return choice;
 				if (title === "Automatic compaction between tasks?") return selectChoices[0];
@@ -299,6 +325,7 @@ function fakeRuntime(options: {
 				return undefined;
 			},
 			async input(title: string, placeholder?: string) {
+				promptTitles.push(title);
 				inputPrompts.push({ title, placeholder });
 				if (title.startsWith("Compaction threshold percentage")) {
 					return thresholdInputs.length > 0 ? thresholdInputs.shift() : "";
@@ -334,6 +361,7 @@ function fakeRuntime(options: {
 	implementExtension(pi as never);
 	return {
 		commands,
+		promptTitles,
 		pi,
 		compactCalls,
 		completeCalls,
@@ -389,6 +417,170 @@ function savedState(cwd: string, overrides: Partial<Omit<ImplementationState, "p
 		...rest,
 		...(pendingCheckpoint ? { pendingCheckpoint: typeof pendingCheckpoint === "boolean" ? { purpose: "task", message: `Task ${overrides.nextTaskIndex ?? 1}: One` } : pendingCheckpoint } : {}),
 	};
+}
+
+for (const { command, reference } of [
+	{ command: "implement-tasks", reference: "reference.md" },
+	{ command: "implement-tasks", reference: "" },
+	{ command: "implement-plan", reference: undefined },
+]) {
+	test(`${command} confirms and saves independent review configuration (reference: ${JSON.stringify(reference)})`, async () => {
+		await withReviewPreferences(async (agentDir) => withTempDir(async (directory) => {
+			await writeFile(join(directory, "tasks.md"), "Original tasks\n");
+			await writeFile(join(directory, "plan.md"), "# Original plan\n");
+			await writeFile(join(directory, "reference.md"), "# Reference requirements\n");
+			await writeFile(join(directory, ".gitignore"), "original-ignore\n");
+			const implementationModel = fakeModel("test", "implementation");
+			const reviewModel = fakeModel("test", "review");
+			const review = { enabled: true, model: { provider: "test", id: "review" }, thinkingLevel: "high" };
+			const runtime: ReturnType<typeof fakeRuntime> = fakeRuntime({
+				cwd: directory,
+				choices: [...(command === "implement-plan" ? ["Overwrite"] : []), "Git checkpoints: new or current local branch", "Yes", "test/implementation", "low"],
+				inputs: ["feature/review-config", ...(reference === undefined ? [] : [reference])],
+				models: [fakeModel("test", "selected"), implementationModel, reviewModel],
+				modelOutputs: command === "implement-plan" ? ["## Task 1 - Generated\n", { tasks: [{ title: "Generated" }] }] : undefined,
+				gitResults: [gitResult("true\n"), gitResult(" M dirty.txt\n")],
+				reviewChoices: ["Yes"], reviewModelChoices: ["test/review"], reviewThinkingChoices: ["high"],
+				turnStopReasons: ["error"],
+				onSummary: async () => {
+					assert.equal(await loadState(directory), undefined);
+					assert.equal(await loadReviewPreference(agentDir), undefined);
+					assert.deepEqual(runtime.setModelCalls, []);
+					assert.deepEqual(runtime.setThinkingLevelCalls, []);
+					assert.equal(await readFile(join(directory, "tasks.md"), "utf8"), "Original tasks\n");
+					assert.equal(await readFile(join(directory, ".gitignore"), "utf8"), "original-ignore\n");
+					assert.ok(!runtime.execCalls.some(({ args }) => ["switch", "add", "commit"].includes(args[0])));
+				},
+			});
+			await runtime.run(command, command === "implement-plan" ? "plan.md" : "tasks.md");
+			const state = (await loadState(directory))!;
+			assert.deepEqual(state.review, review);
+			assert.deepEqual(state.implementationModel, { provider: "test", id: "implementation" });
+			assert.equal(state.implementationThinkingLevel, "low");
+			assert.equal(state.originalPlanPath, command === "implement-plan" ? "plan.md" : reference || null);
+			assert.equal(state.sourcePath, "tasks.md");
+			assert.equal(state.phase, "tasks");
+			assert.equal(state.status, "failed");
+			assert.deepEqual(await loadReviewPreference(agentDir), { model: review.model, thinkingLevel: "high" });
+			assert.deepEqual(runtime.sentSettings, [{ model: "test/implementation", thinkingLevel: "low" }]);
+			assert.deepEqual(runtime.setModelCalls.map(({ id }) => id), ["implementation"]);
+			const summary = runtime.selections.find(({ title }) => title.startsWith("Execution summary"))!;
+			for (const expected of ["Final review: Enabled", "Review model: test/review", "Review thinking: high", "Implementation model: test/implementation", "Implementation thinking: low",
+				`Source plan: ${state.originalPlanPath ?? "None"}`, "Task file: tasks.md"]) assert.ok(summary.title.includes(expected), expected);
+			if (reference === "") assert.match(summary.title, /original-plan compliance cannot be independently verified/);
+			assert.deepEqual(runtime.selections.find(({ title }) => title === "Final review?")?.choices, ["No", "Yes"]);
+			assert.equal(runtime.selections.find(({ title }) => title.startsWith("Review model"))?.choices[0], "test/implementation");
+			assert.equal(runtime.selections.find(({ title }) => title.startsWith("Review thinking"))?.choices[0], "low");
+			const ordered = ["Automatic compaction", "Compaction threshold", "Implementation model", "Thinking level for all implementation", "New local branch", "Final review?", "Review model", "Review thinking",
+				...(command === "implement-tasks" ? ["Optional reference plan"] : []), "Execution summary"];
+			const indices = ordered.map((prefix) => runtime.promptTitles.findIndex((title) => title.startsWith(prefix)));
+			assert.ok(indices.every((index, position) => index >= 0 && (position === 0 || index > indices[position - 1])), JSON.stringify(runtime.promptTitles));
+			assert.equal(runtime.inputPrompts.some(({ title }) => title.startsWith("Optional reference plan")), command === "implement-tasks");
+			assertNoRemoteGit([...runtime.execCalls, ...runtime.preflightCalls]);
+		}));
+	});
+}
+
+test("both commands propose the last review pair confirmed in another project without switching implementation settings", async () => {
+	await withReviewPreferences(async (agentDir) => {
+		const reviewModel = fakeModel("test", "review");
+		for (const command of ["implement-tasks", "implement-plan"]) {
+			await withTempDir(async (directory) => {
+				await writeFile(join(directory, "tasks.md"), "Tasks\n");
+				await writeFile(join(directory, "plan.md"), "# Plan\n");
+				const before = await loadReviewPreference(agentDir);
+				const runtime = fakeRuntime({
+					cwd: directory, choices: command === "implement-plan" ? ["Overwrite"] : [],
+					inputs: command === "implement-tasks" ? [""] : [],
+					models: [fakeModel("test", "selected"), reviewModel], reviewChoices: ["Yes"],
+					reviewModelChoices: command === "implement-tasks" ? ["test/review"] : undefined,
+					reviewThinkingChoices: command === "implement-tasks" ? ["high"] : undefined,
+					modelOutputs: command === "implement-plan" ? ["## Task 1 - Generated\n", { tasks: [{ title: "Generated" }] }] : undefined,
+					onSummary: async () => {
+						assert.deepEqual(await loadReviewPreference(agentDir), before);
+						assert.equal(await loadState(directory), undefined);
+					},
+				});
+				await runtime.run(command, command === "implement-plan" ? "plan.md" : "tasks.md");
+				const state = (await loadState(directory))!;
+				assert.deepEqual(state.review, { enabled: true, model: { provider: "test", id: "review" }, thinkingLevel: "high" });
+				assert.equal(state.phase, "review");
+				assert.equal(state.reviewResult, undefined);
+				assert.equal(runtime.sent.length, 1);
+				assert.deepEqual(runtime.setModelCalls.map(({ id }) => id), ["selected"]);
+				assert.deepEqual(runtime.sentSettings, [{ model: "test/selected", thinkingLevel: "medium" }]);
+				assert.deepEqual(await loadReviewPreference(agentDir), { model: { provider: "test", id: "review" }, thinkingLevel: "high" });
+				if (command === "implement-plan") {
+					assert.equal(runtime.selections.find(({ title }) => title.startsWith("Review model"))?.choices[0], "test/review");
+					assert.equal(runtime.selections.find(({ title }) => title.startsWith("Review thinking"))?.choices[0], "high");
+				}
+			});
+		}
+	});
+});
+
+for (const command of ["implement-tasks", "implement-plan"]) {
+	test(`${command} defaults review to No and completes without touching saved review preferences`, async () => {
+		await withReviewPreferences(async (agentDir) => withTempDir(async (directory) => {
+			await saveReviewPreference({ model: { provider: "unavailable", id: "saved-review" }, thinkingLevel: "high" }, agentDir);
+			const before = await readFile(join(agentDir, PREFERENCES_FILE_NAME), "utf8");
+			await writeFile(join(directory, "tasks.md"), "Original tasks\n");
+			await writeFile(join(directory, "plan.md"), "# Plan\n");
+			const runtime = fakeRuntime({
+				cwd: directory, choices: command === "implement-plan" ? ["Overwrite"] : [],
+				modelOutputs: command === "implement-plan" ? ["## Task 1 - Generated\n", { tasks: [{ title: "Generated" }] }] : undefined,
+				onSummary: async () => { assert.equal(await loadState(directory), undefined); },
+			});
+			await runtime.run(command, command === "implement-plan" ? "plan.md" : "tasks.md");
+			assert.deepEqual(runtime.selections.find(({ title }) => title === "Final review?")?.choices, ["No", "Yes"]);
+			assert.ok(!runtime.promptTitles.some((title) => /^(Review model|Review thinking|Optional reference plan)/.test(title)));
+			assert.ok(runtime.selections.some(({ title }) => title.includes("Final review: Disabled")));
+			assert.equal(runtime.sent.length, 1);
+			assert.equal(await loadState(directory), undefined);
+			assert.equal(await readFile(join(agentDir, PREFERENCES_FILE_NAME), "utf8"), before);
+			assert.ok(runtime.notifications.some(({ message }) => message === "Implementation complete."));
+		}));
+	});
+
+	for (const stage of ["toggle", "model", "thinking", "reference", "missing-reference", "summary", "escape"] as const) {
+		if (command === "implement-plan" && (stage === "reference" || stage === "missing-reference")) continue;
+		test(`${command} cancellation at review ${stage} preserves dirty files, old state, branch intent, and preferences`, async () => {
+			await withReviewPreferences(async (agentDir) => withTempDir(async (directory) => {
+				const preferred = { model: { provider: "test", id: "review" }, thinkingLevel: "high" as const };
+				await saveReviewPreference(preferred, agentDir);
+				const preferencesBefore = await readFile(join(agentDir, PREFERENCES_FILE_NAME), "utf8");
+				await writeFile(join(directory, "tasks.md"), "Original tasks\n");
+				await writeFile(join(directory, "plan.md"), "# Plan\n");
+				await writeFile(join(directory, ".gitignore"), "original-ignore\n");
+				await writeFile(join(directory, "dirty.txt"), "Dirty user work\n");
+				await saveState(directory, savedState(directory));
+				const stateBefore = await readFile(join(directory, STATE_FILE_NAME), "utf8");
+				const runtime = fakeRuntime({
+					cwd: directory,
+					choices: ["Discard and start new", ...(command === "implement-plan" ? ["Overwrite"] : []), "Git checkpoints: new or current local branch"],
+					inputs: ["feature/not-created", ...(stage === "reference" ? [] : [stage === "missing-reference" ? "missing.md" : ""])],
+					models: [fakeModel("test", "selected"), fakeModel("test", "review")],
+					modelOutputs: command === "implement-plan" ? ["## Task 1 - Generated\n", { tasks: [{ title: "Generated" }] }] : undefined,
+					gitResults: [gitResult("true\n"), gitResult(" M dirty.txt\n")],
+					reviewChoices: [stage === "toggle" ? undefined : "Yes"],
+					reviewModelChoices: stage === "model" ? [undefined] : undefined,
+					reviewThinkingChoices: stage === "thinking" ? [undefined] : ["low"],
+					summaryActions: [stage === "escape" ? "escape" : "Cancel"],
+				});
+				await runtime.run(command, command === "implement-plan" ? "plan.md" : "tasks.md");
+				assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), stateBefore);
+				assert.equal(await readFile(join(agentDir, PREFERENCES_FILE_NAME), "utf8"), preferencesBefore);
+				assert.equal(await readFile(join(directory, "tasks.md"), "utf8"), "Original tasks\n");
+				assert.equal(await readFile(join(directory, ".gitignore"), "utf8"), "original-ignore\n");
+				assert.equal(await readFile(join(directory, "dirty.txt"), "utf8"), "Dirty user work\n");
+				assert.deepEqual(runtime.sent, []);
+				assert.deepEqual(runtime.setModelCalls, []);
+				assert.deepEqual(runtime.setThinkingLevelCalls, []);
+				assert.ok(!runtime.execCalls.some(({ args }) => ["switch", "write-tree", "add", "reset", "commit"].includes(args[0])));
+				assert.ok(runtime.notifications.some(({ message }) => message.includes(stage === "missing-reference" ? "File not found" : "cancelled")));
+			}));
+		});
+	}
 }
 
 for (const command of ["implement-tasks", "implement-plan"]) {

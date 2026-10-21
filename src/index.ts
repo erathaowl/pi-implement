@@ -38,8 +38,9 @@ import {
 	loadState,
 	saveState,
 	type ImplementationState,
+	type ReviewSettings,
 } from "./state.ts";
-import { saveReviewPreference } from "./preferences.ts";
+import { saveReviewPreference, selectPreferredReviewSettings } from "./preferences.ts";
 import { buildTaskFilePrompt, indexTaskFile } from "./tasks.ts";
 import { confirmExecutionSummary, selectTaskAction } from "./preview.ts";
 export { formatPreview } from "./preview.ts";
@@ -49,6 +50,7 @@ const PROGRESS_TASK_LIMIT = 5;
 const GIT_CHECKPOINT_CHOICE = "Git checkpoints: new or current local branch";
 
 export type ExecutionOptions = ImplementationSettings & {
+	review: ReviewSettings;
 	createBranch: boolean;
 	initiallyDirty: boolean;
 	checkpoint: boolean;
@@ -439,8 +441,14 @@ export async function selectExecutionOptions(
 		}
 	}
 
+	const reviewChoice = await ctx.ui.select("Final review?", ["No", "Yes"]);
+	if (reviewChoice !== "No" && reviewChoice !== "Yes") return undefined;
+	const review = await selectPreferredReviewSettings(reviewChoice === "Yes", implementationSettings, ctx);
+	if (!review) return undefined;
+
 	return {
 		...implementationSettings,
+		review,
 		createBranch,
 		initiallyDirty,
 		checkpoint,
@@ -460,7 +468,7 @@ function createImplementationState(
 	return {
 		version: 2,
 		phase: "setup",
-		review: { enabled: false },
+		review: options.review,
 		cwd: resolve(cwd),
 		sourcePath,
 		originalPlanPath: null,
