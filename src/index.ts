@@ -10,6 +10,7 @@ import {
 } from "./compaction.ts";
 import { ActiveSessionExecutor, type TaskStatus } from "./executor.ts";
 import { createLocalGit, type LocalGit } from "./git.ts";
+import { assertFileUnchanged, snapshotFile } from "./files.ts";
 import {
 	applyImplementationSettings,
 	assertImplementationSettings,
@@ -29,13 +30,14 @@ import {
 import {
 	STATE_FILE_NAME,
 	addStateFileToGitignore,
+	gitignorePath,
 	deleteState,
 	loadState,
 	saveState,
 	type ImplementationState,
 } from "./state.ts";
 import { buildTaskFilePrompt, indexTaskFile } from "./tasks.ts";
-import { selectTaskAction } from "./preview.ts";
+import { confirmExecutionSummary, selectTaskAction } from "./preview.ts";
 export { formatPreview } from "./preview.ts";
 
 const PROGRESS_WIDGET = "implement-progress";
@@ -476,8 +478,13 @@ export async function runTasksWorkflow(
 	ignoreStateFile: boolean,
 	isRepository: boolean,
 	preparedTasks?: PreparedTaskDocument,
+	sourcePlan?: MarkdownInput,
 ): Promise<void> {
-	const commandName = "/implement-tasks";
+	const commandName = sourcePlan ? "/implement-plan" : "/implement-tasks";
+	const previousState = JSON.stringify(await loadState(ctx.cwd));
+	const gitSnapshot = isRepository ? await git.preflightSnapshot(ctx.cwd) : undefined;
+	const ignorePath = await gitignorePath(ctx.cwd);
+	const ignoreSnapshot = ignoreStateFile ? await snapshotFile(ignorePath) : undefined;
 	report(ctx, commandName, `Indexing tasks in ${input.sourcePath}...`, "info");
 	const taskIndex = await indexTaskFile(input.markdown, ctx);
 	const options = await selectExecutionOptions(
@@ -493,9 +500,38 @@ export async function runTasksWorkflow(
 		return;
 	}
 
-	await startExecutionSetup(ctx.cwd, git, options, ignoreStateFile, preparedTasks);
 	const prompts = taskIndex.tasks.map((task, index) => buildTaskFilePrompt(input.sourcePath, index + 1, task));
 	const state = createImplementationState(ctx.cwd, input.sourcePath, taskIndex, prompts, options);
+	const confirmed = await confirmExecutionSummary({
+		...options,
+		command: commandName,
+		cwd: state.cwd,
+		sourcePlanPath: sourcePlan?.sourcePath ?? null,
+		sourcePath: input.sourcePath,
+		taskCount: taskIndex.tasks.length,
+		review: { enabled: false },
+		preparedTasks: preparedTasks ? { overwrite: preparedTasks.destination !== null } : undefined,
+		ignoreStateFile,
+	}, ctx);
+	if (!confirmed) {
+		report(ctx, commandName, "Implementation cancelled.", "info");
+		return;
+	}
+
+	// Recheck all preview assumptions before the first write. The saved run is replaced, never deleted first.
+	if (JSON.stringify(await loadState(ctx.cwd)) !== previousState) {
+		throw new Error("Recovery state changed during preparation. Prepare the workflow again.");
+	}
+	if (isRepository && await git.preflightSnapshot(ctx.cwd) !== gitSnapshot) {
+		throw new Error("Git branch, HEAD, or working-tree status changed during preparation. Prepare the workflow again.");
+	}
+	for (const source of [preparedTasks ? undefined : input, sourcePlan]) {
+		if (source && await readFile(source.resolvedPath, "utf8") !== source.markdown) {
+			throw new Error(`${source.sourcePath} changed during preparation. Prepare the workflow again.`);
+		}
+	}
+	if (ignoreSnapshot !== undefined) await assertFileUnchanged(ignorePath, ignoreSnapshot);
+	await startExecutionSetup(ctx.cwd, git, options, ignoreStateFile, preparedTasks);
 	await saveState(ctx.cwd, state);
 	try {
 		await applyImplementationSettings(state, ctx, modelController);
@@ -553,12 +589,28 @@ async function handleExistingState(
 
 	const choice = await ctx.ui.select(formatRestorePrompt(state), ["Resume", "Discard and start new", "Cancel"]);
 	if (choice === "Discard and start new") {
-		await deleteState(ctx.cwd);
 		return false;
 	}
 	if (choice !== "Resume") {
 		report(ctx, requestedCommand, "Implementation resume cancelled.", "info");
 		return true;
+	}
+
+	if (!await confirmExecutionSummary({
+		...state,
+		command: "/implement-tasks",
+		sourcePlanPath: null,
+		taskCount: state.tasks.length,
+		createBranch: false,
+		initiallyDirty: false,
+		review: { enabled: false },
+		ignoreStateFile: false,
+	}, ctx, true)) {
+		report(ctx, requestedCommand, "Implementation resume cancelled.", "info");
+		return true;
+	}
+	if (JSON.stringify(await loadState(ctx.cwd)) !== JSON.stringify(state)) {
+		throw new Error("Recovery state changed during confirmation. Run the command again.");
 	}
 
 	const currentCwd = resolve(ctx.cwd);
@@ -626,6 +678,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 			const ignoreStateFile = isRepository
 				? await ctx.ui.select(`Add ${STATE_FILE_NAME} to .gitignore?`, ["Yes", "No"])
 				: "No";
+			if (ignoreStateFile !== "Yes" && ignoreStateFile !== "No") return;
 			await workflow(ignoreStateFile === "Yes", isRepository);
 		} catch (error) {
 			report(ctx, commandName, error instanceof Error ? error.message : String(error), "error");
@@ -687,6 +740,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 					ignoreStateFile,
 					isRepository,
 					{ markdown, destination, overwriteApproved },
+					input,
 				);
 			}),
 	});

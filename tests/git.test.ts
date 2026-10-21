@@ -61,6 +61,22 @@ for (const [name, result, detail] of [
 	});
 }
 
+test("Git preparation reads branch, HEAD, and worktree status without optional index writes", async () => {
+	const snapshot = "# branch.oid 123\n# branch.head main\n? untracked.txt\n";
+	const calls: string[][] = [];
+	const git = createLocalGit(async (command, args) => {
+		assert.equal(command, "git");
+		calls.push(args);
+		return { stdout: calls.length === 1 ? snapshot : "", stderr: "", code: 0, killed: false };
+	});
+	assert.equal(await git.preflightSnapshot(process.cwd()), snapshot);
+	assert.equal(await git.isWorkingTreeClean(process.cwd()), true);
+	assert.deepEqual(calls, [
+		["--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=all"],
+		["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"],
+	]);
+});
+
 test("repository detection reports execution exceptions", async () => {
 	const git = createLocalGit(async () => { throw new Error("spawn git ENOENT"); });
 	await assert.rejects(git.isRepository(process.cwd()), /Git repository check failed.*spawn git ENOENT/);

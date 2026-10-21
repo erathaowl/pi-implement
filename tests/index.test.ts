@@ -90,6 +90,9 @@ function fakeRuntime(options: {
 	scopedModels?: FakeModel[];
 	setModelOutcomes?: Array<boolean | Error>;
 	thresholdInputs?: Array<string | undefined>;
+	summaryActions?: Array<"Start implementation" | "Resume" | "Cancel" | "escape">;
+	onSummary?: () => void | Promise<void>;
+	preflightSnapshots?: string[];
 }) {
 	const commands = new Map<string, Handler>();
 	const handlers = new Map<string, Handler[]>();
@@ -101,6 +104,9 @@ function fakeRuntime(options: {
 	const widgets: Array<string[] | undefined> = [];
 	const workingMessages: Array<string | undefined> = [];
 	const execCalls: Array<{ command: string; args: string[]; cwd?: string }> = [];
+	const preflightCalls: Array<{ command: string; args: string[]; cwd?: string }> = [];
+	const summaryActions = [...(options.summaryActions ?? [])];
+	const preflightSnapshots = [...(options.preflightSnapshots ?? [])];
 	const inputPrompts: Array<{ title: string; placeholder?: string }> = [];
 	const confirmationPrompts: Array<{ title: string; message: string }> = [];
 	const ignoreStatePrompts: Array<{ title: string; choices: string[] }> = [];
@@ -164,6 +170,11 @@ function fakeRuntime(options: {
 			handlers.set(name, [...(handlers.get(name) ?? []), handler]);
 		},
 		async exec(command: string, args: string[], execOptions?: { cwd?: string }) {
+			// Keep the new read-only guards separate from legacy scripted Git results and assertions.
+			if (args.includes("--porcelain=v2")) {
+				preflightCalls.push({ command, args, cwd: execOptions?.cwd });
+				return gitResult(preflightSnapshots.shift() ?? "# branch.head main\n");
+			}
 			execCalls.push({ command, args, cwd: execOptions?.cwd });
 			if (options.gitUnavailable) {
 				throw new Error("git not found");
@@ -228,15 +239,16 @@ function fakeRuntime(options: {
 				notifications.push({ message, type });
 			},
 			async custom(factory: Parameters<ExtensionUIContext["custom"]>[0]) {
-				return new Promise((done) => {
+				return new Promise((done, reject) => {
 					const selector = factory({ terminal: { rows: 40 }, requestRender() {} } as never, {} as never, getKeybindings(), done);
 					assert.ok(!(selector instanceof Promise));
 					const lines = selector.render(200).map(stripVTControlCharacters);
 					const menuChoices = lines.map((line) => line.trim().replace(/^→ /, ""))
-						.filter((line) => ["Implement", "Implement only", "Git checkpoints: new or current local branch", "Cancel"].includes(line));
+						.filter((line) => ["Implement", "Implement only", "Git checkpoints: new or current local branch", "Start implementation", "Resume", "Cancel"].includes(line));
 					selections.push({ title: lines.join("\n"), choices: menuChoices });
-					const choice = choices.shift();
-					if (choice !== undefined) {
+					const isSummary = lines[0].includes("Execution summary");
+					const choice = isSummary ? summaryActions.shift() ?? (menuChoices.includes("Resume") ? "Resume" : "Start implementation") : choices.shift();
+					if (choice !== undefined && choice !== "escape") {
 						const selectedIndex = lines.filter((line) => line.trim().startsWith("→ "))
 							.map((line) => menuChoices.indexOf(line.trim().slice(2)))[0];
 						const targetIndex = menuChoices.indexOf(choice);
@@ -245,15 +257,22 @@ function fakeRuntime(options: {
 							selector.handleInput?.(targetIndex < selectedIndex ? "\u001b[A" : "\u001b[B");
 						}
 					}
-					selector.handleInput?.("\r");
+					const finish = () => selector.handleInput?.(choice === "escape" ? "\u001b" : "\r");
+					if (isSummary) void Promise.resolve().then(options.onSummary).then(finish, reject);
+					else finish();
 				});
 			},
 			async select(title: string, selectChoices: string[]) {
-				if (title.includes(".pi-implement-state.json")) {
+				if (title.startsWith("Add .pi-implement-state.json")) {
 					ignoreStatePrompts.push({ title, choices: selectChoices });
 					return options.ignoreStateChoice ?? "Yes";
 				}
 				selections.push({ title, choices: selectChoices });
+				if (title.startsWith("Execution summary")) {
+					await options.onSummary?.();
+					const response = summaryActions.shift();
+					return response === "escape" ? undefined : response ?? selectChoices[1];
+				}
 				const choice = choices.shift();
 				if (choice !== undefined) return choice;
 				if (title === "Automatic compaction between tasks?") return selectChoices[0];
@@ -309,6 +328,7 @@ function fakeRuntime(options: {
 		},
 		ctx,
 		execCalls,
+		preflightCalls,
 		inputPrompts,
 		ignoreStatePrompts,
 		notifications,
@@ -349,6 +369,164 @@ function savedState(cwd: string, overrides: Partial<ImplementationState> = {}): 
 		...overrides,
 	};
 }
+
+for (const command of ["implement-tasks", "implement-plan"]) {
+	for (const previous of [false, true]) {
+		for (const action of ["Cancel", "escape"] as const) {
+			test(`${command}: ${action} at summary preserves files and ${previous ? "old recovery state" : "absence of state"}`, async () => {
+				await withTempDir(async (directory) => {
+					await writeFile(join(directory, "plan.md"), "Original plan\n");
+					await writeFile(join(directory, "tasks.md"), "Original tasks\n");
+					await writeFile(join(directory, ".gitignore"), "original-ignore\n");
+					if (previous) await saveState(directory, savedState(directory));
+					const before = previous ? await readFile(join(directory, STATE_FILE_NAME), "utf8") : undefined;
+					const runtime = fakeRuntime({
+						cwd: directory,
+						choices: [...(previous ? ["Discard and start new"] : []), ...(command === "implement-plan" ? ["Overwrite"] : []), "Git checkpoints: new or current local branch"],
+						inputs: ["feature/not-created"],
+						gitResults: [gitResult("true\n"), gitResult(" M dirty.txt\n")],
+						modelOutputs: command === "implement-plan" ? ["## Task 1 - One\n", { tasks: [{ title: "One" }] }] : undefined,
+						summaryActions: [action],
+					});
+					await runtime.run(command, command === "implement-plan" ? "plan.md" : "tasks.md");
+					assert.equal(await readFile(join(directory, "tasks.md"), "utf8"), "Original tasks\n");
+					assert.equal(await readFile(join(directory, ".gitignore"), "utf8"), "original-ignore\n");
+					if (previous) assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), before);
+					else assert.equal(await loadState(directory), undefined);
+					assert.deepEqual(runtime.execCalls.map(({ args }) => args[0]), ["rev-parse", "--no-optional-locks"]);
+					assert.deepEqual(runtime.sent, []);
+					assert.deepEqual(runtime.setModelCalls, []);
+					const summary = runtime.selections.find(({ title }) => title.startsWith("Execution summary"));
+					assert.ok(summary);
+					assert.match(summary.title, new RegExp(`Command: /${command}`));
+					assert.match(summary.title, /Initial dirty-state commit: Planned/);
+					assert.match(summary.title, /Final review: Disabled/);
+					if (command === "implement-plan") assert.match(summary.title, /Source plan: plan.md/);
+				});
+			});
+		}
+	}
+
+	test(`${command}: confirmed setup starts only after the summary`, async () => {
+		await withTempDir(async (directory) => {
+			await writeFile(join(directory, "plan.md"), "Plan\n");
+			await writeFile(join(directory, "tasks.md"), "Original tasks\n");
+			let confirmed = false;
+			const runtime: ReturnType<typeof fakeRuntime> = fakeRuntime({
+				cwd: directory,
+				choices: [...(command === "implement-plan" ? ["Overwrite"] : []), "Git checkpoints: new or current local branch"],
+				inputs: ["feature/confirmed"],
+				gitResults: [gitResult("true\n"), gitResult(" M dirty.txt\n")],
+				modelOutputs: command === "implement-plan" ? ["## Task 1 - One\n", { tasks: [{ title: "One" }] }] : undefined,
+				turnStopReasons: ["error"],
+				onSummary: async () => {
+					assert.equal(await loadState(directory), undefined);
+					await assert.rejects(readFile(join(directory, ".gitignore")), { code: "ENOENT" });
+					assert.equal(await readFile(join(directory, "tasks.md"), "utf8"), "Original tasks\n");
+					assert.deepEqual(runtime.execCalls.map(({ args }) => args[0]), ["rev-parse", "--no-optional-locks"]);
+					assert.deepEqual(runtime.sent, []);
+					confirmed = true;
+				},
+			});
+			await runtime.run(command, command === "implement-plan" ? "plan.md" : "tasks.md");
+			assert.equal(confirmed, true);
+			assert.deepEqual(runtime.execCalls.map(({ args }) => args[0]), ["rev-parse", "--no-optional-locks", "switch", "write-tree", "add", "commit"]);
+			assert.match(await readFile(join(directory, ".gitignore"), "utf8"), /\.pi-implement-state.json/);
+			assert.equal(runtime.sent.length, 1);
+			assert.ok(await loadState(directory));
+			if (command === "implement-plan") assert.equal(await readFile(join(directory, "tasks.md"), "utf8"), "## Task 1 - One\n");
+			assertNoRemoteGit([...runtime.execCalls, ...runtime.preflightCalls]);
+		});
+	});
+}
+
+for (const changed of ["tasks", "gitignore", "branch", "HEAD", "recovery"] as const) {
+	test(`changed ${changed} at confirmation aborts before setup`, async () => {
+		await withTempDir(async (directory) => {
+			await writeFile(join(directory, "plan.md"), "Plan\n");
+			await writeFile(join(directory, "tasks.md"), "Original\n");
+			await writeFile(join(directory, ".gitignore"), "original-ignore\n");
+			await saveState(directory, savedState(directory));
+			const before = await readFile(join(directory, STATE_FILE_NAME), "utf8");
+			const runtime = fakeRuntime({
+				cwd: directory,
+				choices: ["Discard and start new", "Overwrite", "Git checkpoints: new or current local branch"],
+				inputs: ["feature/not-created"],
+				gitResults: [gitResult("true\n"), gitResult(" M dirty.txt\n")],
+				modelOutputs: ["## Task 1 - One\n", { tasks: [{ title: "One" }] }],
+				preflightSnapshots: ["original", changed === "branch" || changed === "HEAD" ? changed : "original"],
+				onSummary: async () => {
+					if (changed === "tasks") await writeFile(join(directory, "tasks.md"), "External tasks\n");
+					if (changed === "gitignore") await writeFile(join(directory, ".gitignore"), "external-ignore\n");
+					if (changed === "recovery") await saveState(directory, savedState(directory, { error: "External state" }));
+				},
+			});
+			await runtime.run("implement-plan", "plan.md");
+			assert.deepEqual(runtime.execCalls.map(({ args }) => args[0]), ["rev-parse", "--no-optional-locks"]);
+			assert.deepEqual(runtime.sent, []);
+			assert.equal(await readFile(join(directory, "tasks.md"), "utf8"), changed === "tasks" ? "External tasks\n" : "Original\n");
+			assert.equal(await readFile(join(directory, ".gitignore"), "utf8"), changed === "gitignore" ? "external-ignore\n" : "original-ignore\n");
+			if (changed !== "recovery") assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), before);
+			assert.ok(runtime.notifications.some(({ type, message }) => type === "error" && message.includes("changed")));
+		});
+	});
+}
+
+for (const command of ["implement-tasks", "implement-plan"]) {
+	for (const action of ["Start implementation", "Cancel"] as const) {
+		test(`RPC ${command} ${action} is gated by its execution summary`, async () => {
+			await withTempDir(async (directory) => {
+				await writeFile(join(directory, "plan.md"), "Plan\n");
+				await writeFile(join(directory, "tasks.md"), "Original tasks\n");
+				const runtime = fakeRuntime({
+					cwd: directory,
+					choices: [...(command === "implement-plan" ? ["Overwrite"] : []), "Implement"],
+					modelOutputs: command === "implement-plan" ? ["## Task 1 - One\n", { tasks: [{ title: "One" }] }] : undefined,
+					summaryActions: [action],
+				});
+				runtime.ctx.mode = "rpc";
+				await runtime.run(command, command === "implement-plan" ? "plan.md" : "tasks.md");
+				assert.equal(runtime.sent.length, action === "Start implementation" ? 1 : 0);
+				assert.ok(runtime.selections.some(({ choices }) => choices.join(",") === "Cancel,Start implementation"));
+				assert.equal(await loadState(directory), undefined);
+				if (action === "Cancel") assert.equal(await readFile(join(directory, "tasks.md"), "utf8"), "Original tasks\n");
+			});
+		});
+	}
+}
+
+for (const command of ["implement-tasks", "implement-plan"]) {
+	test(`${command}: changed source material aborts before setup`, async () => {
+		await withTempDir(async (directory) => {
+			const source = command === "implement-plan" ? "plan.md" : "tasks.md";
+			await writeFile(join(directory, source), "Original source\n");
+			const runtime = fakeRuntime({
+				cwd: directory,
+				modelOutputs: command === "implement-plan" ? ["## Task 1 - One\n", { tasks: [{ title: "One" }] }] : undefined,
+				onSummary: async () => { await writeFile(join(directory, source), "External source\n"); },
+			});
+			await runtime.run(command, source);
+			assert.deepEqual(runtime.sent, []);
+			assert.equal(await loadState(directory), undefined);
+			assert.equal(await readFile(join(directory, source), "utf8"), "External source\n");
+			assert.ok(runtime.notifications.some(({ message }) => message.includes(`${source} changed`)));
+		});
+	});
+}
+
+test("resume summary cancellation leaves pending recovery work untouched", async () => {
+	await withTempDir(async (directory) => {
+		await saveState(directory, savedState(directory, { checkpoint: true, branchName: "main", nextTaskIndex: 1, pendingCheckpoint: true }));
+		const before = await readFile(join(directory, STATE_FILE_NAME), "utf8");
+		const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], summaryActions: ["Cancel"] });
+		await runtime.run("implement-tasks", "missing.md");
+		assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), before);
+		assert.deepEqual(runtime.execCalls, []);
+		assert.deepEqual(runtime.sent, []);
+		assert.deepEqual(runtime.setModelCalls, []);
+		assert.ok(runtime.selections.some(({ choices }) => choices.join(",") === "Resume,Cancel"));
+	});
+});
 
 test("registers the two implementation commands and removes the old /implement command", () => {
 	const runtime = fakeRuntime({ cwd: process.cwd() });
@@ -495,7 +673,7 @@ for (const status of ["running", "failed"] as const) {
 	});
 }
 
-test("discard deletes saved state and starts the newly requested workflow", async () => {
+test("confirmed replacement supersedes saved state and starts the newly requested workflow", async () => {
 	await withTempDir(async (directory) => {
 		await saveState(directory, savedState(join(directory, "original")));
 		await writeFile(join(directory, "tasks.md"), "## Task 1 - New\nImplement it.");
@@ -890,7 +1068,7 @@ for (const branchInput of ["feature/checkpoints", ""]) {
 				await waitFor(() => runtime.sent.length === 1);
 				assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
 					["rev-parse", "--is-inside-work-tree"],
-					["status", "--porcelain", "--untracked-files=all"],
+					["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"],
 					branchInput ? ["switch", "-c", branchInput] : ["branch", "--show-current"],
 					["write-tree"],
 					["add", "-A"],
@@ -934,7 +1112,7 @@ test("Enter defaults to checkpoint mode, creating a local branch and committing 
 
 		assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
 			["rev-parse", "--is-inside-work-tree"],
-			["status", "--porcelain", "--untracked-files=all"],
+			["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"],
 			["switch", "-c", "feature/local-checkpoints"],
 			["add", "-A"],
 			["reset", "-q", "HEAD", "--", STATE_FILE_NAME],
@@ -975,7 +1153,7 @@ for (const input of ["", "   "]) {
 			assert.equal(runtime.inputPrompts.find(({ title }) => title.startsWith("New local branch name"))?.placeholder, "feature/task-checkpoints");
 			assert.deepEqual(runtime.execCalls.map(({ args }) => args), [
 				["rev-parse", "--is-inside-work-tree"],
-				["status", "--porcelain", "--untracked-files=all"],
+				["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"],
 				["branch", "--show-current"],
 			]);
 			assert.equal((await loadState(directory))?.branchName, "main");
@@ -1645,6 +1823,7 @@ for (const dirty of [false, true]) {
 			const git = {
 				isRepository: async () => true,
 				isWorkingTreeClean: async () => !dirty,
+				preflightSnapshot: async () => "main",
 				currentBranch: async () => "main",
 				createBranch: async () => { mutations.push("branch"); },
 				commitInitialChanges: async () => { mutations.push("initial commit"); },

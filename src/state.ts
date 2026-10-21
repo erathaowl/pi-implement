@@ -152,8 +152,12 @@ export async function deleteState(cwd: string): Promise<void> {
 	}
 }
 
+export async function gitignorePath(cwd: string): Promise<string> {
+	return join(await stateRoot(cwd), ".gitignore");
+}
+
 export async function addStateFileToGitignore(cwd: string): Promise<void> {
-	const path = join(await stateRoot(cwd), ".gitignore");
+	const path = await gitignorePath(cwd);
 	let content = "";
 	try {
 		content = await readFile(path, "utf8");

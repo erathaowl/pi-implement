@@ -1,7 +1,8 @@
-import { lstat, readFile, stat, writeFile } from "node:fs/promises";
+import { stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { completeIsolatedText } from "./model.ts";
+import { snapshotFile } from "./files.ts";
 
 export const GENERATED_TASKS_FILE = "tasks.md";
 
@@ -57,20 +58,8 @@ export interface PreparedTaskDocument {
 	overwriteApproved: boolean;
 }
 
-export async function snapshotGeneratedTasks(cwd: string): Promise<string | null> {
-	const path = generatedTasksPath(cwd);
-	try {
-		const info = await lstat(path);
-		if (!info.isFile()) {
-			throw new Error(`${GENERATED_TASKS_FILE} must be a regular file.`);
-		}
-		return JSON.stringify([info.dev, info.ino, info.mtimeMs, info.ctimeMs, await readFile(path, "utf8")]);
-	} catch (error) {
-		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
-			return null;
-		}
-		throw error;
-	}
+export function snapshotGeneratedTasks(cwd: string): Promise<string | null> {
+	return snapshotFile(generatedTasksPath(cwd));
 }
 
 export async function validatePreparedTaskDocument(cwd: string, prepared: PreparedTaskDocument): Promise<void> {
@@ -90,7 +79,7 @@ export async function writeGeneratedTaskDocument(
 		await validatePreparedTaskDocument(cwd, prepared);
 	}
 	try {
-		await writeFile(outputPath, markdown, "utf8");
+		await writeFile(outputPath, markdown, { encoding: "utf8", flag: prepared?.destination === null ? "wx" : "w" });
 	} catch {
 		throw new Error(`Unable to write ${GENERATED_TASKS_FILE}.`);
 	}

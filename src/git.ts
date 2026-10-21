@@ -4,6 +4,7 @@ import { STATE_FILE_NAME } from "./state.ts";
 export interface LocalGit {
 	isRepository(cwd: string): Promise<boolean>;
 	isWorkingTreeClean(cwd: string): Promise<boolean>;
+	preflightSnapshot(cwd: string): Promise<string>;
 	createBranch(cwd: string, branchName: string): Promise<void>;
 	currentBranch(cwd: string): Promise<string>;
 	commitInitialChanges(cwd: string): Promise<void>;
@@ -49,7 +50,12 @@ export function createLocalGit(exec: Exec): LocalGit {
 		},
 
 		async isWorkingTreeClean(cwd) {
-			return (await run(cwd, ["status", "--porcelain", "--untracked-files=all"], "status check")).stdout.trim() === "";
+			return (await run(cwd, ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"], "status check")).stdout.trim() === "";
+		},
+
+		async preflightSnapshot(cwd) {
+			// Include HEAD and branch identity; suppress optional index-refresh writes during preparation.
+			return (await run(cwd, ["--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=all"], "preflight")).stdout;
 		},
 
 		async createBranch(cwd, branchName) {
