@@ -2189,6 +2189,50 @@ for (const branchInput of ["feature/checkpoints", ""]) {
 	}
 }
 
+for (const commitFails of [false, true]) {
+	test(`the last task checkpoint is awaited before completion and ${commitFails ? "preserved on failure" : "completed before state cleanup"}`, async () => {
+		await withTempDir(async (directory) => {
+			await saveState(directory, savedState(directory, { checkpoint: true, branchName: "main", nextTaskIndex: 2 }));
+			let finishCommit!: (result: GitResult) => void;
+			const commit = new Promise<GitResult>((resolve) => { finishCommit = resolve; });
+			const runtime = fakeRuntime({
+				cwd: directory, choices: ["Resume"],
+				gitResults: [gitResult("main\n"), gitResult(), gitResult(), gitResult("", 1), commit],
+			});
+			const execution = runtime.run("implement-tasks", "unused.md");
+			await waitFor(() => runtime.execCalls.some(({ args }) => args[0] === "commit"));
+			const pending = (await loadState(directory))!;
+			assert.equal(pending.phase, "tasks");
+			assert.equal(pending.nextTaskIndex, 3);
+			assert.equal(pending.pendingCheckpoint?.message, "Task 3: Three");
+			assert.ok(!runtime.notifications.some(({ message }) => message === "Implementation complete."));
+			finishCommit(commitFails ? gitResult("", 1, "Final checkpoint rejected") : gitResult());
+			await execution;
+			assert.deepEqual(runtime.sent, ["saved prompt three"]);
+			assert.deepEqual(runtime.execCalls.filter(({ args }) => args[0] === "commit").map(({ args }) => args), [["commit", "-m", "Task 3: Three"]]);
+			if (commitFails) {
+				const failed = (await loadState(directory))!;
+				assert.equal(failed.status, "failed");
+				assert.equal(failed.nextTaskIndex, 3);
+				assert.equal(failed.pendingCheckpoint?.purpose, "task");
+				assert.match(failed.error ?? "", /Final checkpoint rejected/);
+				assert.ok(!runtime.notifications.some(({ message }) => message === "Implementation complete."));
+				const resumed = fakeRuntime({
+					cwd: directory, choices: ["Resume"],
+					gitResults: [gitResult("main\n"), gitResult(), gitResult(), gitResult("", 1), gitResult()],
+				});
+				await resumed.run("implement-tasks", "unused.md");
+				assert.deepEqual(resumed.sent, []);
+				assert.deepEqual(resumed.execCalls.filter(({ args }) => args[0] === "commit").map(({ args }) => args), [["commit", "-m", "Task 3: Three"]]);
+				assert.ok(resumed.notifications.some(({ message }) => message === "Implementation complete."));
+				assertNoRemoteGit(resumed.execCalls);
+			} else assert.ok(runtime.notifications.some(({ message }) => message === "Implementation complete."));
+			assert.equal(await loadState(directory), undefined);
+			assertNoRemoteGit(runtime.execCalls);
+		});
+	});
+}
+
 test("Enter defaults to checkpoint mode, creating a local branch and committing only successful tasks with changes", async () => {
 	await withTempDir(async (directory) => {
 		await writeFile(join(directory, "tasks.md"), "tasks");
