@@ -637,6 +637,36 @@ for (const [path, error] of [
 	});
 }
 
+for (const phase of ["tasks", "setup"] as const) {
+	for (const unavailable of ["model", "thinking"] as const) {
+		test(`resume rejects unavailable saved review ${unavailable} before ${phase} mutation or setting changes`, async () => {
+			await withTempDir(async (directory) => {
+				const plain = { provider: "test", id: "plain-review", reasoning: false };
+				const state = savedState(directory, {
+					phase, nextTaskIndex: phase === "setup" ? 0 : 1,
+					review: { enabled: true, model: unavailable === "model" ? { provider: "missing", id: "review" } : plain, thinkingLevel: "high" },
+					...(phase === "setup" ? {
+						checkpoint: true, branchName: "feature/not-created",
+						setup: { step: "branch" as const, createBranch: true, initialCheckpoint: true, baseBranch: "main", expectedHead: "baseline" },
+					} : {}),
+				});
+				await saveState(directory, state);
+				const before = await readFile(join(directory, STATE_FILE_NAME), "utf8");
+				const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], models: [fakeModel("test", "selected"), plain] });
+				await runtime.run("implement-tasks", "unused.md");
+				assert.ok(runtime.notifications.some(({ message }) => message.includes(`Cannot restore review ${unavailable}`)));
+				assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), before);
+				assert.deepEqual(runtime.sent, []);
+				assert.deepEqual(runtime.execCalls, []);
+				assert.deepEqual(runtime.preflightCalls, []);
+				assert.deepEqual(runtime.setModelCalls, []);
+				assert.deepEqual(runtime.setThinkingLevelCalls, []);
+				assert.deepEqual(runtime.inputPrompts, []);
+			});
+		});
+	}
+}
+
 for (const supplied of [false, true]) {
 	test(`review recovery retains ${supplied ? "an explicitly selected plan" : "explicit plan absence"} without re-prompting`, async () => {
 		await withTempDir(async (directory) => {

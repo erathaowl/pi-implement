@@ -2,6 +2,11 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 
 export type ImplementationThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
+export interface ModelThinkingSettings {
+	model: { provider: string; id: string };
+	thinkingLevel: ImplementationThinkingLevel;
+}
+
 export interface ImplementationSettings {
 	implementationModel: { provider: string; id: string };
 	implementationThinkingLevel: ImplementationThinkingLevel;
@@ -33,7 +38,7 @@ function modelsMatch(left: { provider: string; id: string } | undefined, right: 
 	return left?.provider === right.provider && left.id === right.id;
 }
 
-function supportedThinkingLevels(model: SessionModel): ImplementationThinkingLevel[] {
+export function supportedThinkingLevels(model: SessionModel): ImplementationThinkingLevel[] {
 	if (!model.reasoning) {
 		return ["off"];
 	}
@@ -43,53 +48,116 @@ function supportedThinkingLevels(model: SessionModel): ImplementationThinkingLev
 	});
 }
 
+async function selectModelThinking(
+	ctx: ExtensionCommandContext,
+	models: SessionModel[],
+	preferred: ModelThinkingSettings,
+	purpose: "implementation" | "review",
+): Promise<ModelThinkingSettings | undefined> {
+	const modelsByKey = new Map(models.map((model) => [modelKey(model), model]));
+	const key = modelKey(preferred.model);
+	const modelChoices = [...modelsByKey.keys()];
+	if (modelsByKey.has(key)) {
+		modelChoices.splice(modelChoices.indexOf(key), 1);
+		modelChoices.unshift(key);
+	}
+	const selectedKey = await ctx.ui.select(
+		purpose === "implementation" ? `Implementation model for all tasks (current: ${key})` : `Review model (default: ${key})`,
+		modelChoices,
+	);
+	if (!selectedKey) return undefined;
+	const selectedModel = modelsByKey.get(selectedKey);
+	if (!selectedModel) throw new Error(`Unknown ${purpose} model: ${selectedKey}`);
+	const levels = supportedThinkingLevels(selectedModel);
+	if (!levels.length) throw new Error(`No supported thinking levels for ${purpose} model ${selectedKey}.`);
+	const defaultLevel = preferred.thinkingLevel;
+	const choices = levels.includes(defaultLevel) ? [defaultLevel, ...levels.filter((level) => level !== defaultLevel)] : levels;
+	const thinkingLevel = await ctx.ui.select(
+		purpose === "implementation" ? `Thinking level for all implementation tasks (current: ${defaultLevel})` : `Review thinking level (default: ${choices[0]})`,
+		choices,
+	);
+	if (!thinkingLevel) return undefined;
+	if (!isImplementationThinkingLevel(thinkingLevel) || !levels.includes(thinkingLevel)) {
+		throw new Error(`Unsupported ${purpose} thinking level: ${thinkingLevel}`);
+	}
+	return { model: { provider: selectedModel.provider, id: selectedModel.id }, thinkingLevel };
+}
+
 export async function selectImplementationSettings(
 	ctx: ExtensionCommandContext,
 	controller: ImplementationModelController,
 ): Promise<ImplementationSettings | undefined> {
-	if (!ctx.model) {
-		throw new Error("No model is selected.");
-	}
-
+	if (!ctx.model) throw new Error("No model is selected.");
 	const currentModel = ctx.model;
-	const scopedOrAvailable = ctx.scopedModels.length > 0
-		? ctx.scopedModels.map(({ model }) => model)
-		: ctx.modelRegistry.getAvailable();
-	const models = [currentModel, ...scopedOrAvailable.filter((model) => !modelsMatch(model, currentModel))];
-	const modelsByKey = new Map(models.map((model) => [modelKey(model), model]));
-	const selectedModelKey = await ctx.ui.select(
-		`Implementation model for all tasks (current: ${modelKey(currentModel)})`,
-		[...modelsByKey.keys()],
-	);
-	if (!selectedModelKey) {
-		return undefined;
-	}
+	const scopedOrAvailable = ctx.scopedModels.length > 0 ? ctx.scopedModels.map(({ model }) => model) : ctx.modelRegistry.getAvailable();
+	const settings = await selectModelThinking(ctx,
+		[currentModel, ...scopedOrAvailable.filter((model) => !modelsMatch(model, currentModel))],
+		{ model: currentModel, thinkingLevel: controller.getThinkingLevel() as ImplementationThinkingLevel }, "implementation");
+	return settings ? { implementationModel: settings.model, implementationThinkingLevel: settings.thinkingLevel } : undefined;
+}
 
-	const selectedModel = modelsByKey.get(selectedModelKey);
-	if (!selectedModel) {
-		throw new Error(`Unknown implementation model: ${selectedModelKey}`);
+export async function selectReviewSettings(
+	enabled: boolean,
+	implementation: ImplementationSettings,
+	ctx: ExtensionCommandContext,
+	preferred?: ModelThinkingSettings,
+): Promise<({ enabled: true } & ModelThinkingSettings) | { enabled: false } | undefined> {
+	if (!enabled) return { enabled: false };
+	const models = ctx.modelRegistry.getAvailable().filter((model) => supportedThinkingLevels(model).length > 0);
+	if (!models.length) throw new Error("No models are available for final review with supported thinking levels.");
+	const implementationPair = { model: implementation.implementationModel, thinkingLevel: implementation.implementationThinkingLevel };
+	const savedModel = preferred && models.find((model) => modelsMatch(model, preferred.model));
+	if (preferred && (!savedModel || !supportedThinkingLevels(savedModel).includes(preferred.thinkingLevel))) {
+		ctx.ui.notify("The saved review model or thinking level is unavailable. Select an available review pair explicitly.", "warning");
 	}
+	const model = savedModel || models.find((model) => modelsMatch(model, implementationPair.model)) || models[0];
+	const levels = supportedThinkingLevels(model);
+	const thinkingLevel = savedModel && preferred && levels.includes(preferred.thinkingLevel) ? preferred.thinkingLevel
+		: levels.includes(implementationPair.thinkingLevel) ? implementationPair.thinkingLevel : levels[0];
+	if (!thinkingLevel) throw new Error(`No supported thinking levels for review model ${modelKey(model)}.`);
+	const selected = await selectModelThinking(ctx, models, { model, thinkingLevel }, "review");
+	return selected ? { enabled: true, ...selected } : undefined;
+}
 
-	const currentThinkingLevel = controller.getThinkingLevel() as ImplementationThinkingLevel;
-	const supportedLevels = supportedThinkingLevels(selectedModel);
-	const thinkingChoices = supportedLevels.includes(currentThinkingLevel)
-		? [currentThinkingLevel, ...supportedLevels.filter((level) => level !== currentThinkingLevel)]
-		: supportedLevels;
-	const implementationThinkingLevel = await ctx.ui.select(
-		`Thinking level for all implementation tasks (current: ${currentThinkingLevel})`,
-		thinkingChoices,
-	);
-	if (!implementationThinkingLevel) {
-		return undefined;
+export function assertReviewSettingsAvailable(
+	settings: { enabled: false } | ({ enabled: true } & ModelThinkingSettings),
+	ctx: ExtensionCommandContext,
+): void {
+	if (!settings.enabled) return;
+	const model = ctx.modelRegistry.getAvailable().find((candidate) => modelsMatch(candidate, settings.model));
+	if (!model) throw new Error(`Cannot restore review model ${JSON.stringify(modelKey(settings.model))}: the model is not available.`);
+	if (!supportedThinkingLevels(model).includes(settings.thinkingLevel)) {
+		throw new Error(`Cannot restore review thinking level ${JSON.stringify(settings.thinkingLevel)} with model ${JSON.stringify(modelKey(settings.model))}.`);
 	}
-	if (!isImplementationThinkingLevel(implementationThinkingLevel)) {
-		throw new Error(`Unknown implementation thinking level: ${implementationThinkingLevel}`);
-	}
+}
 
-	return {
-		implementationModel: { provider: selectedModel.provider, id: selectedModel.id },
-		implementationThinkingLevel,
-	};
+async function applyModelThinking(
+	settings: ModelThinkingSettings,
+	ctx: ExtensionCommandContext,
+	controller: ImplementationModelController,
+	purpose: "implementation" | "review",
+): Promise<void> {
+	const key = modelKey(settings.model);
+	const model = ctx.modelRegistry.find(settings.model.provider, settings.model.id);
+	if (!model) throw new Error(`Cannot use ${purpose} model ${JSON.stringify(key)}: the model is not available.`);
+	if (!supportedThinkingLevels(model).includes(settings.thinkingLevel)) {
+		throw new Error(`Cannot use ${purpose} thinking level ${JSON.stringify(settings.thinkingLevel)} with model ${JSON.stringify(key)}.`);
+	}
+	let selected: boolean;
+	try {
+		selected = await controller.setModel(model);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		throw new Error(`Cannot use ${purpose} model ${JSON.stringify(key)}: ${detail}`);
+	}
+	if (!selected || !modelsMatch(ctx.model, settings.model)) {
+		throw new Error(`Cannot use ${purpose} model ${JSON.stringify(key)}: model selection failed.`);
+	}
+	controller.setThinkingLevel(settings.thinkingLevel);
+	const effectiveLevel = controller.getThinkingLevel();
+	if (effectiveLevel !== settings.thinkingLevel) {
+		throw new Error(`Cannot use ${purpose} thinking level ${JSON.stringify(settings.thinkingLevel)} with model ${JSON.stringify(key)} (effective level: ${JSON.stringify(effectiveLevel)}).`);
+	}
 }
 
 export async function applyImplementationSettings(
@@ -97,30 +165,16 @@ export async function applyImplementationSettings(
 	ctx: ExtensionCommandContext,
 	controller: ImplementationModelController,
 ): Promise<void> {
-	const key = modelKey(settings.implementationModel);
-	const model = ctx.modelRegistry.find(settings.implementationModel.provider, settings.implementationModel.id);
-	if (!model) {
-		throw new Error(`Cannot use implementation model ${JSON.stringify(key)}: the model is not available.`);
-	}
+	await applyModelThinking({ model: settings.implementationModel, thinkingLevel: settings.implementationThinkingLevel }, ctx, controller, "implementation");
+}
 
-	let selected: boolean;
-	try {
-		selected = await controller.setModel(model);
-	} catch (error) {
-		const detail = error instanceof Error ? error.message : String(error);
-		throw new Error(`Cannot use implementation model ${JSON.stringify(key)}: ${detail}`);
-	}
-	if (!selected || !modelsMatch(ctx.model, settings.implementationModel)) {
-		throw new Error(`Cannot use implementation model ${JSON.stringify(key)}: model selection failed.`);
-	}
-
-	controller.setThinkingLevel(settings.implementationThinkingLevel);
-	const effectiveLevel = controller.getThinkingLevel();
-	if (effectiveLevel !== settings.implementationThinkingLevel) {
-		throw new Error(
-			`Cannot use implementation thinking level ${JSON.stringify(settings.implementationThinkingLevel)} with model ${JSON.stringify(key)} (effective level: ${JSON.stringify(effectiveLevel)}).`,
-		);
-	}
+export async function applyReviewSettings(
+	settings: ModelThinkingSettings,
+	ctx: ExtensionCommandContext,
+	controller: ImplementationModelController,
+): Promise<void> {
+	assertReviewSettingsAvailable({ enabled: true, ...settings }, ctx);
+	await applyModelThinking(settings, ctx, controller, "review");
 }
 
 export function assertImplementationSettings(

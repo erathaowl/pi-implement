@@ -17,6 +17,7 @@ import { assertFileUnchanged, snapshotFile } from "./files.ts";
 import {
 	applyImplementationSettings,
 	assertImplementationSettings,
+	assertReviewSettingsAvailable,
 	selectImplementationSettings,
 	type ImplementationModelController,
 	type ImplementationSettings,
@@ -38,6 +39,7 @@ import {
 	saveState,
 	type ImplementationState,
 } from "./state.ts";
+import { saveReviewPreference } from "./preferences.ts";
 import { buildTaskFilePrompt, indexTaskFile } from "./tasks.ts";
 import { confirmExecutionSummary, selectTaskAction } from "./preview.ts";
 export { formatPreview } from "./preview.ts";
@@ -560,6 +562,8 @@ export async function runTasksWorkflow(
 	}
 	if (ignoreSnapshot !== undefined) await assertFileUnchanged(ignorePath, ignoreSnapshot);
 	if (preparedTasks) await validatePreparedTaskDocument(ctx.cwd, preparedTasks);
+	assertReviewSettingsAvailable(state.review, ctx);
+	if (state.review.enabled) await saveReviewPreference(state.review);
 	// Persist all setup intent and generated Markdown before the first interruptible mutation.
 	await saveState(ctx.cwd, state);
 	try {
@@ -656,6 +660,7 @@ async function handleExistingState(
 		);
 	}
 
+	assertReviewSettingsAvailable(state.review, ctx);
 	if (state.phase === "setup") {
 		try {
 			await startExecutionSetup(ctx.cwd, git, state);
