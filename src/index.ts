@@ -9,6 +9,9 @@ import {
 	parseCompactionThresholdPercent,
 } from "./compaction.ts";
 import { ActiveSessionExecutor, type TaskStatus } from "./executor.ts";
+import { completeCheckpoint } from "./checkpoint.ts";
+import { startExecutionSetup } from "./setup.ts";
+export { startExecutionSetup } from "./setup.ts";
 import { createLocalGit, type LocalGit } from "./git.ts";
 import { assertFileUnchanged, snapshotFile } from "./files.ts";
 import {
@@ -24,12 +27,11 @@ import {
 	generatedTasksPath,
 	snapshotGeneratedTasks,
 	validatePreparedTaskDocument,
-	writeGeneratedTaskDocument,
 	type PreparedTaskDocument,
 } from "./plan.ts";
 import {
 	STATE_FILE_NAME,
-	addStateFileToGitignore,
+	stateFileGitignoreContent,
 	gitignorePath,
 	deleteState,
 	loadState,
@@ -206,19 +208,6 @@ async function saveFailure(
 	}
 }
 
-async function completeCheckpoint(
-	ctx: ExtensionCommandContext,
-	git: LocalGit,
-	state: ImplementationState,
-): Promise<void> {
-	const title = state.tasks[state.nextTaskIndex - 1].title.replace(/\s+/g, " ").trim();
-	await git.commitChanges(ctx.cwd, `Task ${state.nextTaskIndex}: ${title}`);
-	delete state.pendingCheckpoint;
-	state.status = "running";
-	delete state.error;
-	await saveState(ctx.cwd, state);
-}
-
 async function executeTaskSet(
 	commandName: string,
 	progressTitle: string,
@@ -228,6 +217,12 @@ async function executeTaskSet(
 	state: ImplementationState,
 	modelController: ImplementationModelController,
 ): Promise<void> {
+	if (state.phase === "completed") {
+		await deleteState(ctx.cwd);
+		report(ctx, commandName, "Implementation complete.", "info");
+		return;
+	}
+	if (state.phase !== "tasks") throw new Error(`Cannot execute tasks during phase ${state.phase}.`);
 	const tasks = { tasks: state.tasks };
 	const statuses: TaskStatus[] = state.tasks.map((_, index) =>
 		index < state.nextTaskIndex ? "completed" : "pending",
@@ -238,7 +233,7 @@ async function executeTaskSet(
 	const recoveringCheckpoint = state.pendingCheckpoint;
 	if (recoveringCheckpoint) {
 		try {
-			await completeCheckpoint(ctx, git, state);
+			await completeCheckpoint(ctx.cwd, git, state);
 		} catch (error) {
 			await saveFailure(ctx, commandName, state, state.nextTaskIndex, error);
 			return;
@@ -296,14 +291,15 @@ async function executeTaskSet(
 
 		state.nextTaskIndex = index + 1;
 		if (state.checkpoint) {
-			state.pendingCheckpoint = true;
+			const title = state.tasks[index].title.replace(/\s+/g, " ").trim();
+			state.pendingCheckpoint = { purpose: "task", message: `Task ${index + 1}: ${title}` };
 		}
 		state.status = "running";
 		delete state.error;
 		try {
 			await saveState(ctx.cwd, state);
 			if (state.pendingCheckpoint) {
-				await completeCheckpoint(ctx, git, state);
+				await completeCheckpoint(ctx.cwd, git, state);
 			}
 		} catch (error) {
 			await saveFailure(ctx, commandName, state, state.nextTaskIndex, error);
@@ -333,6 +329,12 @@ async function executeTaskSet(
 	}
 
 	try {
+		state.phase = state.review.enabled ? "review" : "completed";
+		await saveState(ctx.cwd, state);
+		if (state.phase !== "completed") {
+			report(ctx, commandName, "Final review execution is not available yet. Recovery state was preserved.", "error");
+			return;
+		}
 		await deleteState(ctx.cwd);
 		report(ctx, commandName, "Implementation complete.", "info");
 	} catch (error) {
@@ -420,32 +422,6 @@ export async function selectExecutionOptions(
 	};
 }
 
-export async function startExecutionSetup(
-	cwd: string,
-	git: LocalGit,
-	options: ExecutionOptions,
-	ignoreStateFile: boolean,
-	preparedTasks?: PreparedTaskDocument,
-): Promise<void> {
-	if (preparedTasks) {
-		await validatePreparedTaskDocument(cwd, preparedTasks);
-	}
-	if (options.checkpoint) {
-		if (options.createBranch) {
-			await git.createBranch(cwd, options.branchName!);
-		}
-		if (options.initiallyDirty) {
-			await git.commitInitialChanges(cwd);
-		}
-	}
-	if (ignoreStateFile) {
-		await addStateFileToGitignore(cwd);
-	}
-	if (preparedTasks) {
-		await writeGeneratedTaskDocument(cwd, preparedTasks.markdown, preparedTasks);
-	}
-}
-
 function createImplementationState(
 	cwd: string,
 	sourcePath: string,
@@ -454,7 +430,9 @@ function createImplementationState(
 	options: ExecutionOptions,
 ): ImplementationState {
 	return {
-		version: 1,
+		version: 2,
+		phase: "setup",
+		review: { enabled: false },
 		cwd: resolve(cwd),
 		sourcePath,
 		tasks: tasks.tasks.map((task, index) => ({ title: task.title, prompt: prompts[index] })),
@@ -502,6 +480,23 @@ export async function runTasksWorkflow(
 
 	const prompts = taskIndex.tasks.map((task, index) => buildTaskFilePrompt(input.sourcePath, index + 1, task));
 	const state = createImplementationState(ctx.cwd, input.sourcePath, taskIndex, prompts, options);
+	const baseBranch = gitSnapshot?.match(/^# branch.head (.*)$/m)?.[1];
+	const baseHead = gitSnapshot?.match(/^# branch.oid (.*)$/m)?.[1];
+	if (isRepository && (baseBranch === undefined || baseHead === undefined)) {
+		throw new Error("Unable to read the Git setup snapshot.");
+	}
+	state.setup = {
+		step: "branch",
+		createBranch: options.createBranch,
+		initialCheckpoint: options.initiallyDirty,
+		baseBranch: baseBranch === "(detached)" ? "" : baseBranch ?? null,
+		expectedHead: baseHead === "(initial)" ? null : baseHead ?? null,
+		gitignore: ignoreSnapshot === undefined ? undefined : {
+			before: ignoreSnapshot,
+			content: stateFileGitignoreContent(ignoreSnapshot === null ? "" : await readFile(ignorePath, "utf8")),
+		},
+	};
+	state.preparedTasks = preparedTasks;
 	const confirmed = await confirmExecutionSummary({
 		...options,
 		command: commandName,
@@ -531,9 +526,11 @@ export async function runTasksWorkflow(
 		}
 	}
 	if (ignoreSnapshot !== undefined) await assertFileUnchanged(ignorePath, ignoreSnapshot);
-	await startExecutionSetup(ctx.cwd, git, options, ignoreStateFile, preparedTasks);
+	if (preparedTasks) await validatePreparedTaskDocument(ctx.cwd, preparedTasks);
+	// Persist all setup intent and generated Markdown before the first interruptible mutation.
 	await saveState(ctx.cwd, state);
 	try {
+		await startExecutionSetup(ctx.cwd, git, state);
 		await applyImplementationSettings(state, ctx, modelController);
 	} catch (error) {
 		await saveFailure(ctx, commandName, state, 0, error);
@@ -557,6 +554,7 @@ function formatRestorePrompt(state: ImplementationState): string {
 		"Workflow: /implement-tasks",
 		`Task: ${taskNumber}/${state.tasks.length}`,
 		`Status: ${state.status}`,
+		`Phase: ${state.phase}`,
 		`Model: ${state.implementationModel.provider}/${state.implementationModel.id}`,
 		`Thinking: ${state.implementationThinkingLevel}`,
 	];
@@ -601,10 +599,13 @@ async function handleExistingState(
 		command: "/implement-tasks",
 		sourcePlanPath: null,
 		taskCount: state.tasks.length,
-		createBranch: false,
-		initiallyDirty: false,
-		review: { enabled: false },
-		ignoreStateFile: false,
+		createBranch: state.phase === "setup" && state.setup?.step === "branch" && state.setup.createBranch === true,
+		initiallyDirty: state.phase === "setup" && state.setup?.initialCheckpoint === true &&
+			(state.setup.step === "branch" || state.setup.step === "initial_checkpoint"),
+		review: state.review,
+		preparedTasks: state.phase === "setup" && state.preparedTasks ? { overwrite: state.preparedTasks.destination !== null } : undefined,
+		ignoreStateFile: state.phase === "setup" && state.setup?.gitignore !== undefined &&
+			state.setup.step !== "tasks_file",
 	}, ctx, true)) {
 		report(ctx, requestedCommand, "Implementation resume cancelled.", "info");
 		return true;
@@ -620,15 +621,28 @@ async function handleExistingState(
 		);
 	}
 
-	if (state.checkpoint) {
+	if (state.phase === "setup") {
+		try {
+			await startExecutionSetup(ctx.cwd, git, state);
+		} catch (error) {
+			await saveFailure(ctx, requestedCommand, state, state.nextTaskIndex, error);
+			return true;
+		}
+	}
+	const expectedBranch = state.checkpoint ? state.branchName : state.setup?.baseBranch;
+	if (expectedBranch !== undefined && expectedBranch !== null) {
 		const currentBranch = await git.currentBranch(ctx.cwd);
-		if (currentBranch !== state.branchName) {
+		if (currentBranch !== expectedBranch) {
 			throw new Error(
-				`Cannot resume: expected local branch ${JSON.stringify(state.branchName)}, but current branch is ${JSON.stringify(currentBranch || "detached HEAD")}. Switch branches manually and try again.`,
+				`Cannot resume: expected local branch ${JSON.stringify(expectedBranch)}, but current branch is ${JSON.stringify(currentBranch || "detached HEAD")}. Switch branches manually and try again.`,
 			);
 		}
 	}
 
+	if (state.phase === "review" || state.phase === "review_checkpoint") {
+		report(ctx, requestedCommand, "Final review execution is not available yet. Recovery state was preserved.", "error");
+		return true;
+	}
 	try {
 		await applyImplementationSettings(state, ctx, modelController);
 	} catch (error) {

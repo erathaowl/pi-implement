@@ -13,7 +13,9 @@ import {
 } from "../src/state.ts";
 
 const state: ImplementationState = {
-	version: 1,
+	version: 2,
+	phase: "tasks",
+	review: { enabled: false },
 	cwd: "/project",
 	sourcePath: "tasks.md",
 	tasks: [{ title: "One", prompt: "Implement one" }],
@@ -96,7 +98,7 @@ test("pending checkpoint state round-trips, including the final task", async () 
 			checkpoint: true,
 			branchName: "main",
 			nextTaskIndex: state.tasks.length,
-			pendingCheckpoint: true,
+			pendingCheckpoint: { purpose: "task", message: "Task 1: One" },
 			status: "failed",
 			error: "commit failed",
 		};
@@ -105,7 +107,7 @@ test("pending checkpoint state round-trips, including the final task", async () 
 	});
 });
 
-test("pending checkpoint validation requires a boolean, checkpoint mode, and a completed task", async () => {
+test("pending checkpoint validation requires metadata, checkpoint mode, and a completed task", async () => {
 	await withTempDir(async (directory) => {
 		for (const overrides of [
 			{ pendingCheckpoint: "true" },
@@ -119,7 +121,7 @@ test("pending checkpoint validation requires a boolean, checkpoint mode, and a c
 				checkpoint: true,
 				branchName: "main",
 				nextTaskIndex: 1,
-				pendingCheckpoint: true,
+				pendingCheckpoint: { purpose: "task", message: "Task 1: One" },
 				...overrides,
 			}));
 			await assert.rejects(loadState(directory), /Invalid implementation state/);
@@ -140,6 +142,16 @@ test("state validation rejects invalid implementation settings and compaction th
 			await writeFile(join(directory, STATE_FILE_NAME), JSON.stringify({ ...state, ...overrides }), "utf8");
 			await assert.rejects(loadState(directory), /Invalid implementation state/);
 		}
+	});
+});
+
+test("invalid state cannot replace an existing atomic recovery file", async () => {
+	await withTempDir(async (directory) => {
+		await saveState(directory, state);
+		const before = await readFile(join(directory, STATE_FILE_NAME), "utf8");
+		await assert.rejects(saveState(directory, { ...state, phase: "unknown" } as never), /Invalid implementation state/);
+		assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), before);
+		assert.equal((await readdir(directory)).includes(`${STATE_FILE_NAME}.tmp`), false);
 	});
 });
 

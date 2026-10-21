@@ -1,5 +1,5 @@
 import type { ExecResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { STATE_FILE_NAME } from "./state.ts";
+import { INITIAL_CHECKPOINT_MESSAGE, STATE_FILE_NAME } from "./state.ts";
 
 export interface LocalGit {
 	isRepository(cwd: string): Promise<boolean>;
@@ -7,7 +7,9 @@ export interface LocalGit {
 	preflightSnapshot(cwd: string): Promise<string>;
 	createBranch(cwd: string, branchName: string): Promise<void>;
 	currentBranch(cwd: string): Promise<string>;
-	commitInitialChanges(cwd: string): Promise<void>;
+	head(cwd: string): Promise<string | null>;
+	checkpointCommitted(cwd: string, headBefore: string | null, message: string): Promise<boolean>;
+	commitInitialChanges(cwd: string, message?: string): Promise<void>;
 	commitChanges(cwd: string, message: string): Promise<boolean>;
 }
 
@@ -26,7 +28,31 @@ export function createLocalGit(exec: Exec): LocalGit {
 		return result;
 	};
 
+	const head = async (cwd: string): Promise<string | null> => {
+		const result = await exec("git", ["rev-parse", "--verify", "--quiet", "HEAD"], { cwd });
+		if (!result.killed && result.code === 1 && !result.stderr.trim()) return null;
+		if (result.killed || result.code !== 0 || !result.stdout.trim()) {
+			throw new Error(`Git HEAD check failed: ${failureDetail(result)}`);
+		}
+		return result.stdout.trim();
+	};
+	const unstageState = async (cwd: string) => {
+		// Omitting HEAD also works on an unborn branch. Preserve any existing committed version.
+		await run(cwd, ["reset", "-q", "--", `:(top)${STATE_FILE_NAME}`, `:(top)${STATE_FILE_NAME}.tmp`], "state-file unstaging");
+	};
+
 	return {
+		head,
+		async checkpointCommitted(cwd, headBefore, message) {
+			const current = await head(cwd);
+			if (current === headBefore) return false;
+			if (current !== null) {
+				const commit = await run(cwd, ["log", "-1", "--format=%P%n%B"], "checkpoint recovery check");
+				const [parents, ...body] = commit.stdout.trimEnd().split("\n");
+				if (parents === (headBefore ?? "") && body.join("\n").trim() === message.trim()) return true;
+			}
+			throw new Error("Cannot recover checkpoint: Git HEAD changed unexpectedly. Inspect the local history before resuming.");
+		},
 		async isRepository(cwd) {
 			let result: ExecResult;
 			try {
@@ -66,13 +92,18 @@ export function createLocalGit(exec: Exec): LocalGit {
 			return (await run(cwd, ["branch", "--show-current"], "branch check")).stdout.trim();
 		},
 
-		async commitInitialChanges(cwd) {
+		async commitInitialChanges(cwd, message = INITIAL_CHECKPOINT_MESSAGE) {
+			const originalHead = await head(cwd);
 			// Save the staged tree before adding working-tree changes. This also rejects unresolved conflicts.
 			const stagedTree = (await run(cwd, ["write-tree"], "initial index snapshot")).stdout.trim();
 			try {
 				await run(cwd, ["add", "-A"], "initial checkpoint staging");
-				await run(cwd, ["commit", "-m", "chore: capture initial implementation state"], "initial checkpoint commit");
+				await unstageState(cwd);
+				const changes = await run(cwd, ["diff", "--cached", "--name-only"], "initial change check");
+				if (changes.stdout.trim()) await run(cwd, ["commit", "-m", message], "initial checkpoint commit");
 			} catch (error) {
+				// A process can report interruption after committing. Do not restore an index from the old HEAD.
+				if (await head(cwd) !== originalHead) throw error;
 				// Restore only the index; never reset or overwrite the user's working files.
 				try {
 					await run(cwd, ["read-tree", stagedTree], "initial index restoration");
@@ -85,7 +116,7 @@ export function createLocalGit(exec: Exec): LocalGit {
 
 		async commitChanges(cwd, message) {
 			await run(cwd, ["add", "-A"], "staging");
-			await run(cwd, ["reset", "-q", "HEAD", "--", STATE_FILE_NAME], "state-file unstaging");
+			await unstageState(cwd);
 
 			const stagedChanges = await exec("git", ["diff", "--cached", "--quiet"], { cwd });
 			if (stagedChanges.code === 0) {

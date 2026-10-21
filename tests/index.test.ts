@@ -38,6 +38,7 @@ type FakeModel = {
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 const gitResult = (stdout = "", code = 0, stderr = ""): GitResult => ({ stdout, stderr, code, killed: false });
+const UNSTAGE_STATE = ["reset", "-q", "--", `:(top)${STATE_FILE_NAME}`, `:(top)${STATE_FILE_NAME}.tmp`];
 
 const fakeModel = (provider: string, id: string): FakeModel => ({
 	provider,
@@ -93,6 +94,7 @@ function fakeRuntime(options: {
 	summaryActions?: Array<"Start implementation" | "Resume" | "Cancel" | "escape">;
 	onSummary?: () => void | Promise<void>;
 	preflightSnapshots?: string[];
+	currentBranch?: string;
 }) {
 	const commands = new Map<string, Handler>();
 	const handlers = new Map<string, Handler[]>();
@@ -107,6 +109,8 @@ function fakeRuntime(options: {
 	const preflightCalls: Array<{ command: string; args: string[]; cwd?: string }> = [];
 	const summaryActions = [...(options.summaryActions ?? [])];
 	const preflightSnapshots = [...(options.preflightSnapshots ?? [])];
+	let mockHead = "baseline";
+	let mockBranch = options.currentBranch ?? "main";
 	const inputPrompts: Array<{ title: string; placeholder?: string }> = [];
 	const confirmationPrompts: Array<{ title: string; message: string }> = [];
 	const ignoreStatePrompts: Array<{ title: string; choices: string[] }> = [];
@@ -173,13 +177,25 @@ function fakeRuntime(options: {
 			// Keep the new read-only guards separate from legacy scripted Git results and assertions.
 			if (args.includes("--porcelain=v2")) {
 				preflightCalls.push({ command, args, cwd: execOptions?.cwd });
-				return gitResult(preflightSnapshots.shift() ?? "# branch.head main\n");
+				return gitResult(preflightSnapshots.shift() ?? "# branch.head main\n# branch.oid baseline\n");
+			}
+			if (args.join(" ") === "rev-parse --verify --quiet HEAD") {
+				preflightCalls.push({ command, args, cwd: execOptions?.cwd });
+				return gitResult(`${mockHead}\n`);
+			}
+			const saved = await loadState(options.cwd);
+			if (saved?.phase === "setup" && (args[0] === "branch" || args[0] === "reset" || (args[0] === "diff" && args.includes("--name-only")))) {
+				preflightCalls.push({ command, args, cwd: execOptions?.cwd });
+				return gitResult(args[0] === "branch" ? `${mockBranch}\n` : args[0] === "diff" ? "dirty.txt\n" : "");
 			}
 			execCalls.push({ command, args, cwd: execOptions?.cwd });
 			if (options.gitUnavailable) {
 				throw new Error("git not found");
 			}
-			return gitResults.shift() ?? gitResult();
+			const result = await (gitResults.shift() ?? gitResult());
+			if (result.code === 0 && args[0] === "switch") mockBranch = args.at(-1)!;
+			if (result.code === 0 && args[0] === "commit") mockHead = `${mockHead}-commit`;
+			return result;
 		},
 		sendUserMessage(message: string) {
 			sent.push(message);
@@ -349,9 +365,12 @@ function fakeRuntime(options: {
 	};
 }
 
-function savedState(cwd: string, overrides: Partial<ImplementationState> = {}): ImplementationState {
+function savedState(cwd: string, overrides: Partial<Omit<ImplementationState, "pendingCheckpoint">> & { pendingCheckpoint?: ImplementationState["pendingCheckpoint"] | boolean } = {}): ImplementationState {
+	const { pendingCheckpoint, ...rest } = overrides;
 	return {
-		version: 1,
+		version: 2,
+		phase: "tasks",
+		review: { enabled: false },
 		cwd: resolve(cwd),
 		sourcePath: "tasks.md",
 		tasks: [
@@ -366,7 +385,8 @@ function savedState(cwd: string, overrides: Partial<ImplementationState> = {}): 
 		compactionThresholdPercent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
 		implementationModel: { provider: "test", id: "selected" },
 		implementationThinkingLevel: "medium",
-		...overrides,
+		...rest,
+		...(pendingCheckpoint ? { pendingCheckpoint: typeof pendingCheckpoint === "boolean" ? { purpose: "task", message: `Task ${overrides.nextTaskIndex ?? 1}: One` } : pendingCheckpoint } : {}),
 	};
 }
 
@@ -454,7 +474,7 @@ for (const changed of ["tasks", "gitignore", "branch", "HEAD", "recovery"] as co
 				inputs: ["feature/not-created"],
 				gitResults: [gitResult("true\n"), gitResult(" M dirty.txt\n")],
 				modelOutputs: ["## Task 1 - One\n", { tasks: [{ title: "One" }] }],
-				preflightSnapshots: ["original", changed === "branch" || changed === "HEAD" ? changed : "original"],
+				preflightSnapshots: ["# branch.head main\n# branch.oid baseline\n", changed === "branch" || changed === "HEAD" ? changed : "# branch.head main\n# branch.oid baseline\n"],
 				onSummary: async () => {
 					if (changed === "tasks") await writeFile(join(directory, "tasks.md"), "External tasks\n");
 					if (changed === "gitignore") await writeFile(join(directory, ".gitignore"), "external-ignore\n");
@@ -513,6 +533,60 @@ for (const command of ["implement-tasks", "implement-plan"]) {
 		});
 	});
 }
+
+test("version-1 workflows resume pending checkpoints and compaction without review prompts", async () => {
+	await withTempDir(async (directory) => {
+		const { phase: _phase, review: _review, ...common } = savedState(directory);
+		const legacy = {
+			...common, version: 1, checkpoint: true, branchName: "main", pendingCheckpoint: true,
+			pendingCompaction: true, automaticCompaction: true,
+		};
+		const raw = JSON.stringify(legacy);
+		await writeFile(join(directory, STATE_FILE_NAME), raw);
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], gitResults: [gitResult("main\n")],
+			onSummary: async () => {
+				assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), raw);
+			},
+		});
+		await runtime.run("implement-tasks", "missing.md");
+		assert.deepEqual(runtime.sent, legacy.tasks.slice(1).map(({ prompt }) => prompt));
+		assert.equal(runtime.completeCalls.length, 0);
+		assert.equal(runtime.compactCalls.length, 1);
+		assert.ok(runtime.selections.some(({ title }) => title.includes("Final review: Disabled")));
+		assert.ok(!runtime.selections.some(({ title }) => title === "Final review?"));
+		assert.equal(await loadState(directory), undefined);
+	});
+});
+
+test("interrupted plan setup resumes its saved branch and generated Markdown without reconversion", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "plan.md"), "Plan\n");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Git checkpoints: new or current local branch"], inputs: ["feature/setup"],
+			gitResults: [gitResult("true\n"), gitResult(" M tracked.txt\n"), gitResult(), gitResult("saved-tree\n"), gitResult("", 1, "index locked")],
+			modelOutputs: ["## Task 1 - Generated\n", { tasks: [{ title: "Generated" }] }],
+		});
+		await runtime.run("implement-plan", "plan.md");
+		const interrupted = (await loadState(directory))!;
+		assert.equal(interrupted.phase, "setup");
+		assert.equal(interrupted.setup?.step, "initial_checkpoint");
+		assert.equal(interrupted.pendingCheckpoint?.purpose, "initial");
+		assert.equal(interrupted.preparedTasks?.markdown, "## Task 1 - Generated\n");
+		await assert.rejects(readFile(join(directory, "tasks.md")), { code: "ENOENT" });
+		const resumed = fakeRuntime({
+			cwd: directory, choices: ["Resume"], currentBranch: "feature/setup",
+			gitResults: [gitResult("saved-tree\n"), gitResult(), gitResult(), gitResult("feature/setup\n")],
+		});
+		await resumed.run("implement-plan", "missing.md");
+		assert.equal(resumed.completeCalls.length, 0);
+		assert.equal(resumed.execCalls.some(({ args }) => args[0] === "switch"), false);
+		assert.equal(resumed.sent.length, 1);
+		assert.equal(await readFile(join(directory, "tasks.md"), "utf8"), "## Task 1 - Generated\n");
+		assert.equal(await loadState(directory), undefined);
+	});
+});
 
 test("resume summary cancellation leaves pending recovery work untouched", async () => {
 	await withTempDir(async (directory) => {
@@ -765,7 +839,7 @@ test("checkpoint restore validates the saved branch without switching", async ()
 		assert.equal(runtime.completeCalls.length, 0);
 		assert.ok(runtime.notifications.some(({ message }) => message.includes("expected local branch")));
 		assert.equal(runtime.compactCalls.length, 0);
-		assert.equal((await loadState(directory))?.pendingCheckpoint, true);
+		assert.equal((await loadState(directory))?.pendingCheckpoint?.purpose, "task");
 		assert.equal((await loadState(directory))?.status, "failed");
 	});
 });
@@ -1115,11 +1189,11 @@ test("Enter defaults to checkpoint mode, creating a local branch and committing 
 			["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"],
 			["switch", "-c", "feature/local-checkpoints"],
 			["add", "-A"],
-			["reset", "-q", "HEAD", "--", STATE_FILE_NAME],
+			UNSTAGE_STATE,
 			["diff", "--cached", "--quiet"],
 			["commit", "-m", "Task 1: One"],
 			["add", "-A"],
-			["reset", "-q", "HEAD", "--", STATE_FILE_NAME],
+			UNSTAGE_STATE,
 			["diff", "--cached", "--quiet"],
 		]);
 		assert.equal(runtime.sent.length, 2);
@@ -1178,7 +1252,7 @@ for (const scenario of [
 	{ name: "branch lookup failure", input: "", confirmed: true, result: gitResult("", 128, "lookup failed"), action: "branch", error: /Git branch check failed/ },
 	{ name: "branch creation failure", input: "feature/existing", confirmed: false, result: gitResult("", 128, "branch already exists"), action: "switch", error: /Git branch creation failed/ },
 ]) {
-	test(`checkpoint setup aborts without workflow state on ${scenario.name}`, async () => {
+	test(`checkpoint setup stops safely on ${scenario.name}`, async () => {
 		await withTempDir(async (directory) => {
 			await writeFile(join(directory, "tasks.md"), "tasks");
 			const runtime = fakeRuntime({
@@ -1192,7 +1266,8 @@ for (const scenario of [
 			await runtime.run("implement-tasks", "tasks.md");
 
 			assert.deepEqual(runtime.sent, []);
-			assert.equal(await loadState(directory), undefined);
+			if (scenario.action === "switch") assert.equal((await loadState(directory))?.phase, "setup");
+			else assert.equal(await loadState(directory), undefined);
 			await assert.rejects(readFile(join(directory, ".gitignore")), /ENOENT/);
 			assert.equal(runtime.confirmationPrompts.length, scenario.input === "" ? 1 : 0);
 			assert.equal(runtime.execCalls[2]?.args[0], scenario.action);
@@ -1223,7 +1298,8 @@ for (const [action, results, restoresIndex] of [
 			await runtime.run("implement-tasks", "tasks.md");
 
 			assert.deepEqual(runtime.sent, []);
-			assert.equal(await loadState(directory), undefined);
+			assert.equal((await loadState(directory))?.phase, "setup");
+			assert.equal((await loadState(directory))?.pendingCheckpoint?.purpose, "initial");
 			assert.equal(await readFile(join(directory, "existing.txt"), "utf8"), "existing work\n");
 			assert.equal(runtime.execCalls.some(({ args }) => args[0] === "read-tree"), restoresIndex);
 			if (restoresIndex) assert.deepEqual(runtime.execCalls.at(-1)?.args, ["read-tree", "saved-tree"]);
@@ -1253,7 +1329,7 @@ test("task completion and pending checkpoint are persisted before staging", asyn
 		await waitFor(() => runtime.execCalls.some(({ args }) => args[0] === "add"));
 		const pending = await loadState(directory);
 		assert.equal(pending?.nextTaskIndex, 1);
-		assert.equal(pending?.pendingCheckpoint, true);
+		assert.equal(pending?.pendingCheckpoint?.purpose, "task");
 		assert.equal(pending?.status, "running");
 		assert.equal(runtime.sent.length, 1);
 
@@ -1286,7 +1362,7 @@ for (const [action, results] of [
 
 			const saved = await loadState(directory);
 			assert.equal(saved?.nextTaskIndex, 1);
-			assert.equal(saved?.pendingCheckpoint, true);
+			assert.equal(saved?.pendingCheckpoint?.purpose, "task");
 			assert.equal(saved?.status, "failed");
 			assert.ok(saved?.error?.includes(`Git ${action} failed`));
 			assert.equal(runtime.sent.length, 1);
@@ -1322,7 +1398,7 @@ test("Git checkpoint failure stops before the next task", async () => {
 		const saved = await loadState(directory);
 		assert.equal(saved?.status, "failed");
 		assert.equal(saved?.nextTaskIndex, 1);
-		assert.equal(saved?.pendingCheckpoint, true);
+		assert.equal(saved?.pendingCheckpoint?.purpose, "task");
 		assert.match(saved?.error ?? "", /Git commit failed/);
 		assertNoRemoteGit(runtime.execCalls);
 
@@ -1334,7 +1410,7 @@ test("Git checkpoint failure stops before the next task", async () => {
 		await failedRecovery.run("implement-tasks", "missing.md");
 		assert.deepEqual(failedRecovery.sent, []);
 		assert.equal(failedRecovery.completeCalls.length, 0);
-		assert.equal((await loadState(directory))?.pendingCheckpoint, true);
+		assert.equal((await loadState(directory))?.pendingCheckpoint?.purpose, "task");
 		assert.equal((await loadState(directory))?.nextTaskIndex, 1);
 		assert.equal((await loadState(directory))?.status, "failed");
 
@@ -1351,11 +1427,11 @@ test("Git checkpoint failure stops before the next task", async () => {
 		assert.deepEqual(resumed.sent, []);
 		assert.equal(resumed.completeCalls.length, 0);
 		assert.match(resumed.selections[0].title, /Pending Git checkpoint: yes/);
-		assert.equal((await loadState(directory))?.pendingCheckpoint, true);
+		assert.equal((await loadState(directory))?.pendingCheckpoint?.purpose, "task");
 		assert.deepEqual(resumed.execCalls.map(({ args }) => args), [
 			["branch", "--show-current"],
 			["add", "-A"],
-			["reset", "-q", "HEAD", "--", STATE_FILE_NAME],
+			UNSTAGE_STATE,
 			["diff", "--cached", "--quiet"],
 			["commit", "-m", "Task 1: One"],
 		]);
@@ -1398,7 +1474,7 @@ for (const nextTaskIndex of [2, 3]) {
 			assert.deepEqual(runtime.execCalls.slice(0, 4).map(({ args }) => args), [
 				["branch", "--show-current"],
 				["add", "-A"],
-				["reset", "-q", "HEAD", "--", STATE_FILE_NAME],
+				UNSTAGE_STATE,
 				["diff", "--cached", "--quiet"],
 			]);
 			assert.equal(runtime.execCalls.some(({ args }) => args[0] === "commit"), false);
@@ -1419,6 +1495,7 @@ for (const pendingCompaction of [undefined, true]) {
 				nextTaskIndex: 2,
 			});
 			state.tasks[1].title = "Two\n  with spacing";
+			state.pendingCheckpoint!.message = "Task 2: Two with spacing";
 			await saveState(directory, state);
 			const failed = fakeRuntime({
 				cwd: directory,
@@ -1429,7 +1506,7 @@ for (const pendingCompaction of [undefined, true]) {
 			assert.deepEqual(failed.sent, []);
 			assert.equal(failed.compactCalls.length, 0);
 			assert.equal(failed.contextUsageCalls, 0);
-			assert.equal((await loadState(directory))?.pendingCheckpoint, true);
+			assert.equal((await loadState(directory))?.pendingCheckpoint?.purpose, "task");
 			assert.equal((await loadState(directory))?.pendingCompaction, pendingCompaction);
 
 			const runtime = fakeRuntime({
@@ -1825,6 +1902,8 @@ for (const dirty of [false, true]) {
 				isWorkingTreeClean: async () => !dirty,
 				preflightSnapshot: async () => "main",
 				currentBranch: async () => "main",
+				head: async () => "baseline",
+				checkpointCommitted: async () => false,
 				createBranch: async () => { mutations.push("branch"); },
 				commitInitialChanges: async () => { mutations.push("initial commit"); },
 				commitChanges: async () => false,
@@ -1837,7 +1916,10 @@ for (const dirty of [false, true]) {
 			assert.deepEqual(mutations, []);
 			assert.equal(await loadState(directory), undefined);
 			await assert.rejects(readFile(join(directory, ".gitignore")), { code: "ENOENT" });
-			await startExecutionSetup(directory, git, options, false);
+			await startExecutionSetup(directory, git, savedState(directory, {
+				...options, phase: "setup", nextTaskIndex: 0,
+				setup: { step: "branch", createBranch: true, initialCheckpoint: dirty, baseBranch: "main", expectedHead: "baseline" },
+			}));
 			assert.deepEqual(mutations, dirty ? ["branch", "initial commit"] : ["branch"]);
 		});
 	});

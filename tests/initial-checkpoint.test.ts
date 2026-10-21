@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { createLocalGit } from "../src/git.ts";
@@ -90,6 +90,43 @@ test("initial checkpoint integration restores staged changes and leaves files in
 		assert.equal(runGit(cwd, ["diff", "--cached"]), staged);
 		assert.equal(await readFile(join(cwd, "tracked.txt"), "utf8"), "unstaged version\n");
 		assert.equal(await readFile(join(cwd, "untracked.txt"), "utf8"), "untracked work\n");
+	});
+});
+
+for (const unborn of [false, true]) {
+	test(`initial checkpoint excludes staged recovery metadata (unborn: ${unborn})`, async () => {
+		await withRepository(async (cwd) => {
+			if (!unborn) {
+				await writeFile(join(cwd, "baseline.txt"), "Baseline\n");
+				runGit(cwd, ["add", "-A"]);
+				runGit(cwd, ["commit", "-q", "-m", "Baseline"]);
+			}
+			await writeFile(join(cwd, ".pi-implement-state.json"), "Recovery intent\n");
+			await writeFile(join(cwd, ".pi-implement-state.json.tmp"), "Pending state write\n");
+			await writeFile(join(cwd, "work.txt"), "User work\n");
+			runGit(cwd, ["add", "-A"]);
+			const nested = join(cwd, "packages", "app");
+			await mkdir(nested, { recursive: true });
+			const git = createLocalGit(async (_command, args, options) => executeGit(options?.cwd ?? cwd, args));
+			await git.commitInitialChanges(nested);
+			const files = runGit(cwd, ["ls-tree", "-r", "--name-only", "HEAD"]);
+			assert.ok(files.includes("work.txt"));
+			assert.ok(!files.includes(".pi-implement-state.json"));
+			assert.equal(await readFile(join(cwd, ".pi-implement-state.json"), "utf8"), "Recovery intent\n");
+			assert.equal(await readFile(join(cwd, ".pi-implement-state.json.tmp"), "utf8"), "Pending state write\n");
+			await writeFile(join(cwd, "work.txt"), "Task work\n");
+			await git.commitChanges(nested, "Task checkpoint");
+			assert.ok(!runGit(cwd, ["ls-tree", "-r", "--name-only", "HEAD"]).includes(".pi-implement-state.json"));
+		});
+	});
+}
+
+test("initial checkpoint skips a metadata-only worktree without creating an empty commit", async () => {
+	await withRepository(async (cwd) => {
+		await writeFile(join(cwd, ".pi-implement-state.json"), "Recovery intent\n");
+		const git = createLocalGit(async (_command, args) => executeGit(cwd, args));
+		await git.commitInitialChanges(cwd);
+		assert.equal(await git.head(cwd), null);
 	});
 });
 
