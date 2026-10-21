@@ -3,12 +3,16 @@ import test from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import { initTheme, type ExtensionCommandContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { getKeybindings, visibleWidth, type Component } from "@earendil-works/pi-tui";
-import { formatPreview, selectTaskAction } from "../src/preview.ts";
+import { confirmExecutionSummary, formatExecutionSummary, formatPreview, selectTaskAction, type ExecutionSummary } from "../src/preview.ts";
 
 initTheme("dark");
 const choices = ["Implement only", "Git checkpoints: new or current local branch", "Cancel"];
 
 function openPreview(tasks: Array<{ title: string }>, menu = choices, defaultIndex = 1) {
+	return openDialog((ctx) => selectTaskAction("Implement tasks", { tasks }, menu, defaultIndex, ctx));
+}
+
+function openDialog(select: (ctx: ExtensionCommandContext) => Promise<unknown>) {
 	const terminal = { rows: 24 };
 	let component!: Component;
 	let customOptions: unknown;
@@ -16,6 +20,7 @@ function openPreview(tasks: Array<{ title: string }>, menu = choices, defaultInd
 	let toolsExpanded = false;
 	const ctx = {
 		mode: "tui",
+		hasUI: true,
 		ui: {
 			custom(factory: Parameters<ExtensionUIContext["custom"]>[0], options: unknown) {
 				customOptions = options;
@@ -29,7 +34,7 @@ function openPreview(tasks: Array<{ title: string }>, menu = choices, defaultInd
 			setToolsExpanded(value: boolean) { toolsExpanded = value; },
 		},
 	} as unknown as ExtensionCommandContext;
-	const result = selectTaskAction("Implement tasks", { tasks }, menu, defaultIndex, ctx);
+	const result = select(ctx);
 	return {
 		terminal,
 		result,
@@ -40,6 +45,139 @@ function openPreview(tasks: Array<{ title: string }>, menu = choices, defaultInd
 		get renders() { return renders; },
 	};
 }
+
+const summary: ExecutionSummary = {
+	command: "/implement-plan",
+	cwd: "/project",
+	sourcePlanPath: "plan.md",
+	sourcePath: "tasks.md",
+	taskCount: 12,
+	implementationModel: { provider: "implementation", id: "model" },
+	implementationThinkingLevel: "medium",
+	checkpoint: true,
+	branchName: "feature/implementation",
+	createBranch: true,
+	initiallyDirty: true,
+	automaticCompaction: true,
+	compactionThresholdPercent: 80,
+	review: { enabled: false },
+	preparedTasks: { overwrite: true },
+	ignoreStateFile: true,
+};
+
+test("execution summary includes settings and pending writes with review disabled", () => {
+	assert.equal(formatExecutionSummary(summary), [
+		"Execution summary",
+		"Command: /implement-plan",
+		"Working directory: /project",
+		"Source plan: plan.md",
+		"Task file: tasks.md",
+		"Tasks: 12",
+		"Implementation model: implementation/model",
+		"Implementation thinking: medium",
+		"Git checkpoints: Enabled (local only)",
+		"Branch: feature/implementation (create new)",
+		"Initial dirty-state commit: Planned",
+		"Automatic compaction: Enabled (threshold: 80%)",
+		"Final review: Disabled",
+		"tasks.md: Overwrite existing file (approved)",
+		".gitignore: Add .pi-implement-state.json if missing",
+	].join("\n"));
+});
+
+test("execution summary shows independent review settings and omitted options accurately", () => {
+	const text = formatExecutionSummary({
+		...summary,
+		command: "/implement-tasks",
+		sourcePlanPath: null,
+		checkpoint: false,
+		automaticCompaction: false,
+		preparedTasks: undefined,
+		ignoreStateFile: false,
+		review: { enabled: true, model: { provider: "review", id: "other" }, thinkingLevel: "high" },
+	});
+	for (const expected of ["Command: /implement-tasks", "Source plan: None", "Git checkpoints: Disabled",
+		"Initial dirty-state commit: Not planned", "Automatic compaction: Disabled", "Final review: Enabled",
+		"Review model: review/other", "Review thinking: high", "Review scope: plan compliance, tests, and documentation",
+		".gitignore: No update planned"]) assert.ok(text.includes(expected), expected);
+	assert.ok(!text.includes("Branch:"));
+	assert.ok(!text.includes("tasks.md: Overwrite"));
+	assert.match(formatExecutionSummary({ ...summary, createBranch: false, preparedTasks: { overwrite: false } }),
+		/Branch: feature\/implementation \(use current\)/);
+	assert.match(formatExecutionSummary({ ...summary, preparedTasks: { overwrite: false } }), /Create generated task file/);
+});
+
+test("long execution summaries scroll while actions stay visible across resizing", async () => {
+	const dialog = openDialog((ctx) => confirmExecutionSummary({
+		...summary, cwd: "Long directory ＡＢＣ 😀 ".repeat(100),
+	}, ctx));
+	dialog.terminal.rows = 12;
+	const first = dialog.render(40);
+	assert.ok(first.some((line) => line.includes("Start implementation")));
+	assert.ok(first.some((line) => line.startsWith("→ ") && line.includes("Cancel")));
+	dialog.input("\u001b[6~");
+	const next = dialog.render(40);
+	assert.notDeepEqual(next.slice(0, -3), first.slice(0, -3));
+	assert.deepEqual(next.slice(-3), first.slice(-3));
+	dialog.input("\u001b[5~");
+	assert.deepEqual(dialog.render(40), first);
+	for (const [rows, width] of [[6, 30], [3, 10], [1, 1], [24, 80]]) {
+		dialog.terminal.rows = rows;
+		dialog.invalidate();
+		const lines = dialog.render(width);
+		assert.ok(lines.length <= Math.max(1, rows - 2));
+		assert.ok(lines.every((line) => visibleWidth(line) <= width));
+		if (width >= 30) {
+			assert.ok(lines.some((line) => line.includes("Start implementation")));
+			assert.ok(lines.some((line) => line.includes("Cancel")));
+		}
+	}
+	dialog.input("\r");
+	assert.equal(await dialog.result, false);
+});
+
+for (const resume of [false, true]) {
+	for (const [name, keys, expected] of [
+		["defaults to Cancel", ["\r"], false],
+		["confirms with up and Enter", ["\u001b[A", "\r"], true],
+		["confirms with up and newline", ["\u001b[A", "\n"], true],
+		["returns to Cancel with down", ["\u001b[A", "\u001b[B", "\r"], false],
+		["cancels with Escape", ["\u001b"], false],
+		["cancels with Ctrl+C", ["\u0003"], false],
+	] as const) {
+		test(`${resume ? "resume" : "start"} summary ${name} without mutating input`, async () => {
+			const before = structuredClone(summary);
+			const dialog = openDialog((ctx) => confirmExecutionSummary(summary, ctx, resume));
+			assert.ok(dialog.render().some((line) => line.includes(resume ? "Resume" : "Start implementation")));
+			for (const key of keys) dialog.input(key);
+			assert.equal(await dialog.result, expected);
+			assert.deepEqual(summary, before);
+		});
+	}
+	for (const response of ["Cancel", undefined, "unexpected", resume ? "Resume" : "Start implementation"]) {
+		test(`non-TUI ${resume ? "resume" : "start"} summary handles ${response}`, async () => {
+			const action = resume ? "Resume" : "Start implementation";
+			let calls = 0;
+			const ctx = {
+				hasUI: true,
+				mode: "rpc",
+				ui: { async select(title: string, options: string[]) {
+					calls++;
+					assert.ok(title.startsWith(formatExecutionSummary(summary)));
+					assert.match(title, /Choose an action explicitly/);
+					assert.deepEqual(options, ["Cancel", action]);
+					return response;
+				} },
+			} as unknown as ExtensionCommandContext;
+			assert.equal(await confirmExecutionSummary(summary, ctx, resume), response === action);
+			assert.equal(calls, 1);
+		});
+	}
+}
+
+test("execution summary fails closed without an interactive UI", async () => {
+	assert.equal(await confirmExecutionSummary(summary, { hasUI: false } as ExtensionCommandContext), false);
+});
 
 const manyTasks = Array.from({ length: 100 }, (_, index) => ({ title: `Task ${index + 1}: ${"long title ".repeat(10)}` }));
 

@@ -1,7 +1,81 @@
 import { getSelectListTheme, keyHint, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { SelectList, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import type { ImplementationSettings } from "./model.ts";
 
 type TaskList = { tasks: readonly { title: string }[] };
+
+export type ExecutionSummary = ImplementationSettings & {
+	command: "/implement-tasks" | "/implement-plan";
+	cwd: string;
+	sourcePlanPath: string | null;
+	sourcePath: string;
+	taskCount: number;
+	checkpoint: boolean;
+	branchName?: string;
+	createBranch: boolean;
+	initiallyDirty: boolean;
+	automaticCompaction: boolean;
+	compactionThresholdPercent: number;
+	review: { enabled: false } | {
+		enabled: true;
+		model: ImplementationSettings["implementationModel"];
+		thinkingLevel: ImplementationSettings["implementationThinkingLevel"];
+	};
+	preparedTasks?: { overwrite: boolean };
+	ignoreStateFile: boolean;
+};
+
+export function formatExecutionSummary(summary: ExecutionSummary): string {
+	const lines = [
+		"Execution summary",
+		`Command: ${summary.command}`,
+		`Working directory: ${summary.cwd}`,
+		`Source plan: ${summary.sourcePlanPath ?? "None"}`,
+		`Task file: ${summary.sourcePath}`,
+		`Tasks: ${summary.taskCount}`,
+		`Implementation model: ${summary.implementationModel.provider}/${summary.implementationModel.id}`,
+		`Implementation thinking: ${summary.implementationThinkingLevel}`,
+		`Git checkpoints: ${summary.checkpoint ? "Enabled (local only)" : "Disabled"}`,
+	];
+	if (summary.checkpoint) {
+		lines.push(`Branch: ${summary.branchName} (${summary.createBranch ? "create new" : "use current"})`);
+	}
+	lines.push(
+		`Initial dirty-state commit: ${summary.checkpoint && summary.initiallyDirty ? "Planned" : "Not planned"}`,
+		`Automatic compaction: ${summary.automaticCompaction ? `Enabled (threshold: ${summary.compactionThresholdPercent}%)` : "Disabled"}`,
+		`Final review: ${summary.review.enabled ? "Enabled" : "Disabled"}`,
+	);
+	if (summary.review.enabled) {
+		lines.push(
+			`Review model: ${summary.review.model.provider}/${summary.review.model.id}`,
+			`Review thinking: ${summary.review.thinkingLevel}`,
+			"Review scope: plan compliance, tests, and documentation",
+		);
+	}
+	if (summary.preparedTasks) {
+		lines.push(`tasks.md: ${summary.preparedTasks.overwrite ? "Overwrite existing file (approved)" : "Create generated task file"}`);
+	}
+	lines.push(`.gitignore: ${summary.ignoreStateFile ? "Add .pi-implement-state.json if missing" : "No update planned"}`);
+	return lines.join("\n");
+}
+
+export async function confirmExecutionSummary(
+	summary: ExecutionSummary,
+	ctx: ExtensionCommandContext,
+	resume = false,
+): Promise<boolean> {
+	if (!ctx.hasUI) return false;
+	const action = resume ? "Resume" : "Start implementation";
+	const preview = formatExecutionSummary(summary);
+	let selected: string | undefined;
+	if (ctx.mode === "tui") {
+		selected = await selectPreviewAction(preview, "Default: Cancel", [action, "Cancel"], 1, ctx);
+	} else {
+		// The standard dialog has no selected-index option. Put Cancel first and require an exact affirmative response.
+		selected = await ctx.ui.select(`${preview}\nChoose an action explicitly (Cancel is listed first).`, ["Cancel", action]);
+	}
+	return selected === action;
+}
 
 export function formatPreview(title: string, tasks: TaskList): string {
 	const taskLines = tasks.tasks.map((task, index) => `${index + 1}. ${task.title}`);
@@ -15,7 +89,18 @@ export async function selectTaskAction(
 	defaultIndex: number,
 	ctx: ExtensionCommandContext,
 ): Promise<string | undefined> {
-	const preview = formatPreview(title, tasks);
+	return selectPreviewAction(formatPreview(title, tasks),
+		`${tasks.tasks.length} ${tasks.tasks.length === 1 ? "task" : "tasks"}`,
+		choices, defaultIndex, ctx);
+}
+
+async function selectPreviewAction(
+	preview: string,
+	footer: string,
+	choices: string[],
+	defaultIndex: number,
+	ctx: ExtensionCommandContext,
+): Promise<string | undefined> {
 	if (ctx.mode !== "tui") return ctx.ui.select(preview, choices);
 
 	return ctx.ui.custom<string | undefined>((tui, _theme, kb, done) => {
@@ -45,8 +130,7 @@ export async function selectTaskAction(
 				const scrollHint = maxOffset > 0
 					? `${keyHint("tui.select.pageUp", "")}/${keyHint("tui.select.pageDown", "preview")}  `
 					: "";
-				const count = `${tasks.tasks.length} ${tasks.tasks.length === 1 ? "task" : "tasks"}`;
-				const hint = `${count}  ${scrollHint}↑↓ navigate  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", "cancel")}`;
+				const hint = `${footer}  ${scrollHint}↑↓ navigate  ${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", "cancel")}`;
 				return [...lines.slice(offset, offset + pageSize), ...menu, truncateToWidth(hint, width)];
 			},
 			invalidate() {
