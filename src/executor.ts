@@ -4,12 +4,13 @@ type AssistantTurn = {
 	role?: unknown;
 	stopReason?: unknown;
 	errorMessage?: unknown;
+	content?: unknown;
 };
 
 type PendingTurn = {
 	started: boolean;
 	lastAssistant?: AssistantTurn;
-	resolve: () => void;
+	resolve: (message: AssistantTurn) => void;
 	reject: (error: Error) => void;
 };
 
@@ -56,12 +57,23 @@ export class ActiveSessionExecutor {
 		this.sendUserMessage = sendUserMessage;
 	}
 
-	execute = (prompt: string): Promise<void> => {
+	execute = (prompt: string): Promise<void> => this.executeTurn(prompt).then(() => {});
+
+	executeForText = async (prompt: string): Promise<string> => {
+		const message = await this.executeTurn(prompt);
+		const text = Array.isArray(message.content) ? message.content
+			.filter((block) => typeof block === "object" && block !== null && block.type === "text" && typeof block.text === "string")
+			.map((block) => block.text as string).join("\n").trim() : "";
+		if (!text) throw new Error("Agent turn ended without final assistant text.");
+		return text;
+	};
+
+	private executeTurn(prompt: string): Promise<AssistantTurn> {
 		if (this.pending) {
 			return Promise.reject(new Error("Another implementation task is already running."));
 		}
 
-		return new Promise<void>((resolve, reject) => {
+		return new Promise<AssistantTurn>((resolve, reject) => {
 			this.pending = { started: false, resolve, reject };
 			try {
 				this.sendUserMessage(prompt);
@@ -70,7 +82,7 @@ export class ActiveSessionExecutor {
 				reject(error instanceof Error ? error : new Error(String(error)));
 			}
 		});
-	};
+	}
 
 	onAgentStart(): void {
 		if (this.pending) {
@@ -95,7 +107,7 @@ export class ActiveSessionExecutor {
 		if (error) {
 			pending.reject(error);
 		} else {
-			pending.resolve();
+			pending.resolve(pending.lastAssistant!);
 		}
 	}
 

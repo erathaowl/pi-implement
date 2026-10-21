@@ -7,7 +7,7 @@ import { completeCheckpoint } from "../src/checkpoint.ts";
 import { snapshotFile } from "../src/files.ts";
 import { createLocalGit } from "../src/git.ts";
 import { startExecutionSetup } from "../src/setup.ts";
-import { INITIAL_CHECKPOINT_MESSAGE, STATE_FILE_NAME, loadState, saveState, validateState, type ImplementationState } from "../src/state.ts";
+import { INITIAL_CHECKPOINT_MESSAGE, STATE_FILE_NAME, loadState, saveState, validateState, type ImplementationState, type ReviewResult } from "../src/state.ts";
 
 function executeGit(cwd: string, args: string[]) {
 	const result = spawnSync("git", args, { cwd, encoding: "utf8" });
@@ -191,7 +191,15 @@ test("version-1 state migrates without writing and preserves pending work", asyn
 	}
 });
 
-const reviewResult = { outcome: "passed" as const, reviewedAreas: ["tests"], checks: ["npm test"], minorFixes: [], findings: [], unavailableChecks: [], remediationGenerated: false };
+const reviewResult: ReviewResult = {
+	outcome: "passed", reviewedAreas: ["plan_compliance", "tests", "documentation"],
+	checks: [
+		{ area: "plan_compliance", check: "Inspect source", passed: true, evidence: "Compared plan.md and tasks.md against implementation files." },
+		{ area: "tests", check: "npm test", passed: true, evidence: "Test output showed all tests passing." },
+		{ area: "documentation", check: "Inspect README", passed: true, evidence: "Read README.md and compared the documented API with implementation." },
+	],
+	minorFixes: [], findings: [], unavailableChecks: [], remediationGenerated: false,
+};
 
 test("version-2 schema encodes review, review checkpoint, and completion explicitly", () => {
 	const state = { ...taskState("/project"), nextTaskIndex: 1, review: { enabled: true as const, model: { provider: "review", id: "independent" }, thinkingLevel: "high" as const } };
@@ -203,7 +211,7 @@ test("version-2 schema encodes review, review checkpoint, and completion explici
 
 test("review result metadata is validated before it can be restored", () => {
 	const state = {
-		...taskState("/project"), phase: "review", nextTaskIndex: 1,
+		...taskState("/project"), phase: "review", nextTaskIndex: 1, originalPlanPath: "plan.md",
 		review: { enabled: true, model: { provider: "review", id: "model" }, thinkingLevel: "high" },
 	};
 	for (const result of [

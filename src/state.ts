@@ -2,6 +2,8 @@ import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { isImplementationThinkingLevel, type ImplementationSettings } from "./model.ts";
 import type { PreparedTaskDocument } from "./plan.ts";
+import { validateReviewResult, type ReviewResult, type ReviewSources } from "./review.ts";
+export type { ReviewResult } from "./review.ts";
 
 export const STATE_FILE_NAME = ".pi-implement-state.json";
 export const INITIAL_CHECKPOINT_MESSAGE = "chore: capture initial implementation state";
@@ -12,19 +14,6 @@ export type ReviewSettings = { enabled: false } | {
 	model: ImplementationSettings["implementationModel"];
 	thinkingLevel: ImplementationSettings["implementationThinkingLevel"];
 };
-export interface ReviewResult {
-	outcome: "passed" | "fixed" | "follow_up" | "blocked";
-	reviewedAreas: string[];
-	checks: string[];
-	minorFixes: string[];
-	findings: Array<{
-		severity: "minor" | "major" | "critical" | "unable_to_verify";
-		evidence: string;
-		action: string;
-	}>;
-	unavailableChecks: Array<{ check: string; reason: string }>;
-	remediationGenerated: boolean;
-}
 export interface PendingCheckpoint {
 	purpose: "initial" | "task" | "review";
 	message: string;
@@ -99,16 +88,13 @@ function nullableText(value: unknown): boolean {
 function model(value: unknown): boolean {
 	return record(value) && text(value.provider) && text(value.id);
 }
-function strings(value: unknown): boolean {
-	return Array.isArray(value) && value.every(text);
-}
-function validReviewResult(value: unknown): boolean {
-	return record(value) && ["passed", "fixed", "follow_up", "blocked"].includes(String(value.outcome)) &&
-		strings(value.reviewedAreas) && strings(value.checks) && strings(value.minorFixes) &&
-		Array.isArray(value.findings) && value.findings.every((finding) => record(finding) &&
-			["minor", "major", "critical", "unable_to_verify"].includes(String(finding.severity)) && text(finding.evidence) && text(finding.action)) &&
-		Array.isArray(value.unavailableChecks) && value.unavailableChecks.every((check) => record(check) && text(check.check) && text(check.reason)) &&
-		typeof value.remediationGenerated === "boolean";
+function validReviewResult(value: unknown, sources: ReviewSources): boolean {
+	try {
+		validateReviewResult(value, sources);
+		return true;
+	} catch {
+		return false;
+	}
 }
 function invalid(): never {
 	throw new Error("Invalid implementation state file.");
@@ -149,7 +135,7 @@ export function validateState(value: unknown): ImplementationState {
 		!record(s.review) || typeof s.review.enabled !== "boolean" ||
 		(s.review.enabled && (!model(s.review.model) || !isImplementationThinkingLevel(s.review.thinkingLevel))) ||
 		(s.originalPlanPath !== undefined && !nullableText(s.originalPlanPath)) ||
-		(s.reviewResult !== undefined && (!s.review.enabled || !["review", "review_checkpoint", "completed"].includes(String(s.phase)) || !validReviewResult(s.reviewResult)))) invalid();
+		(s.reviewResult !== undefined && (!s.review.enabled || !["review", "review_checkpoint", "completed"].includes(String(s.phase)) || !validReviewResult(s.reviewResult, { sourcePath: s.sourcePath, originalPlanPath: s.originalPlanPath as string | null | undefined })))) invalid();
 	if (s.preparedTasks !== undefined && (!record(s.preparedTasks) || !text(s.preparedTasks.markdown) ||
 		!nullableText(s.preparedTasks.destination) || typeof s.preparedTasks.overwriteApproved !== "boolean" ||
 		(s.preparedTasks.destination !== null && !s.preparedTasks.overwriteApproved))) invalid();

@@ -34,6 +34,57 @@ test("active-session execution treats every non-stop reason, including toolUse, 
 	}
 });
 
+test("text execution extracts only the settled final assistant text blocks", async () => {
+	const executor = new ActiveSessionExecutor(() => {});
+	const execution = executor.executeForText("review one");
+	executor.onAgentStart();
+	executor.onAgentEnd([{ role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "Intermediate text" }] }]);
+	executor.onAgentEnd([
+		{ role: "assistant", stopReason: "stop", content: [
+			{ type: "thinking", thinking: "Do not expose reasoning" },
+			{ type: "text", text: "Final summary" }, { type: "text", text: "Final JSON" },
+		] },
+		{ role: "toolResult", content: [{ type: "text", text: "Ignore tool output" }] },
+	]);
+	executor.onAgentSettled();
+	assert.equal(await execution, "Final summary\nFinal JSON");
+});
+
+for (const content of [undefined, [], [{ type: "thinking", thinking: "No final answer" }], [{ type: "text", text: " " }]]) {
+	test("text execution rejects a successful stop without final text while task execution remains compatible", async () => {
+		const executor = new ActiveSessionExecutor(() => {});
+		const execution = executor.executeForText("review one");
+		executor.onAgentStart();
+		executor.onAgentEnd([{ role: "assistant", stopReason: "stop", content }]);
+		executor.onAgentSettled();
+		await assert.rejects(execution, /without final assistant text/);
+		const task = executor.execute("implement one");
+		executor.onAgentStart();
+		executor.onAgentEnd([{ role: "assistant", stopReason: "stop", content }]);
+		executor.onAgentSettled();
+		assert.equal(await task, undefined);
+	});
+}
+
+test("text and task execution share overlap guards and cancellation", async () => {
+	const executor = new ActiveSessionExecutor(() => {});
+	const review = executor.executeForText("review one");
+	await assert.rejects(executor.execute("implement one"), /already running/);
+	await assert.rejects(executor.executeForText("review two"), /already running/);
+	executor.cancel("Session changed");
+	await assert.rejects(review, /Session changed/);
+});
+
+test("text execution uses the last lifecycle response rather than an earlier successful report", async () => {
+	const executor = new ActiveSessionExecutor(() => {});
+	const execution = executor.executeForText("review one");
+	executor.onAgentStart();
+	executor.onAgentEnd([{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Earlier success" }] }]);
+	executor.onAgentEnd([{ role: "assistant", stopReason: "error", errorMessage: "Final attempt failed" }]);
+	executor.onAgentSettled();
+	await assert.rejects(execution, /Final attempt failed/);
+});
+
 test("active-session executor rejects overlapping prompts", async () => {
 	const executor = new ActiveSessionExecutor(() => {});
 	const first = executor.execute("one");
