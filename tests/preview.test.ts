@@ -308,5 +308,18 @@ test("RPC retains the full preview and existing select dialog", async () => {
 		ui: { async select(title: string, options: string[]) { selection = { title, options }; return "Cancel"; } },
 	} as unknown as ExtensionCommandContext;
 	assert.equal(await selectTaskAction("Implement tasks", tasks, choices, 1, ctx), "Cancel");
-	assert.deepEqual(selection, { title: formatPreview("Implement tasks", tasks), options: choices });
+	assert.deepEqual(selection, {
+		title: formatPreview("Implement tasks", tasks),
+		options: ["Git checkpoints: new or current local branch", "Implement only", "Cancel"],
+	});
+});
+
+test("RPC non-Git preview keeps its existing option order", async () => {
+	let selectedOptions: string[] = [];
+	const ctx = {
+		mode: "rpc",
+		ui: { async select(_title: string, options: string[]) { selectedOptions = options; return "Cancel"; } },
+	} as unknown as ExtensionCommandContext;
+	await selectTaskAction("Implement tasks", { tasks: manyTasks }, ["Implement", "Cancel"], 0, ctx);
+	assert.deepEqual(selectedOptions, ["Implement", "Cancel"]);
 });

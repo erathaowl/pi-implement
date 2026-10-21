@@ -104,7 +104,13 @@ async function selectPreviewAction(
 	defaultIndex: number,
 	ctx: ExtensionCommandContext,
 ): Promise<string | undefined> {
-	if (ctx.mode !== "tui") return ctx.ui.select(preview, choices);
+	if (ctx.mode !== "tui") {
+		const rpcChoices = [...choices];
+		if (defaultIndex > 0 && defaultIndex < rpcChoices.length) {
+			rpcChoices.unshift(...rpcChoices.splice(defaultIndex, 1));
+		}
+		return ctx.ui.select(preview, rpcChoices);
+	}
 
 	return ctx.ui.custom<string | undefined>((tui, _theme, kb, done) => {
 		const text = new Text(preview, 0, 0);
