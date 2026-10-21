@@ -1,8 +1,13 @@
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import type { ActiveSessionExecutor } from "./executor.ts";
+import { snapshotFile } from "./files.ts";
 
 export const REVIEW_RESULT_START = "<<<PI_IMPLEMENT_REVIEW_RESULT>>>";
 export const REVIEW_RESULT_END = "<<<END_PI_IMPLEMENT_REVIEW_RESULT>>>";
 export const SOURCE_PLAN_COMPLIANCE_CHECK = "source_plan_compliance";
+export const REMEDIATION_FILES = ["plan-fixes.md", "tasks-fixes.md"] as const;
+export type ReviewArtifactSnapshot = Record<typeof REMEDIATION_FILES[number], string | null>;
 const REVIEW_AREAS = ["plan_compliance", "tests", "documentation"] as const;
 export type ReviewArea = typeof REVIEW_AREAS[number];
 export interface ReviewSources {
@@ -36,7 +41,7 @@ checks records actual inspections or executed validation and their final observe
 minorFixes may cite only passing checks, by their exact names. Do not claim a fix was verified if its validation failed or was unavailable.
 Every finding needs a requirement, affected path (or null), and evidence. Use severity unable_to_verify with a nonempty reason for missing evidence or unavailable verification. For other severities reason is null. Every unresolved minor/major/critical finding is actionable. For a non-actionable limitation use actionable=false and action=null; otherwise action must describe concrete follow-up.
 Use passed only for a fully verified review with no fixes, unresolved findings, failed checks, or unavailable checks. Use fixed only when verified minor fixes resolved everything and no limitations remain. Use follow_up when actionable unresolved findings remain. Use blocked for critical findings, blocking failures, or verification limitations with no actionable remedy; never report a critical finding as follow_up. Follow-up or blocked results may also contain verified minor fixes.
-remediationGenerated describes whether this review newly generated both plan-fixes.md and tasks-fixes.md, not whether stale files exist. It must be false when there are no actionable findings. Artifact handling is separate from this result contract.`;
+remediationGenerated describes whether this review newly generated both plan-fixes.md and tasks-fixes.md, not whether stale files exist. It must be true exactly when actionable unresolved findings remain; otherwise leave both documents untouched and report false.`;
 
 export function buildReviewPrompt(sources: ReviewSources): string {
 	if (!text(sources.sourcePath) || (sources.originalPlanPath != null && !text(sources.originalPlanPath))) {
@@ -55,6 +60,11 @@ Review all three areas:
 Classify findings as minor (localized, low-risk, directly verifiable), major (missing/incorrect behavior requiring meaningful development, broad changes, or nontrivial regression risk), critical (severe functional, security, or data-integrity issues), or unable_to_verify (insufficient evidence or unavailable checks, with a reason and whether follow-up is actionable).
 A finding is verified only when supported by files you actually inspected or checks you executed. Report insufficient evidence and failed/unavailable verification explicitly, using unable_to_verify with a reason where appropriate. Do not speculate or silently count an unavailable check as passed.
 You may apply only localized, low-risk minor corrections whose requirements are clear and which you can directly verify with pertinent tests or other direct validation. Avoid broad refactoring, speculative changes, new dependencies, or significant development. If a fix is larger than expected or cannot be verified, report it as unresolved instead of claiming success. Leave major and critical issues for explicit follow-up.
+After each minor edit, run pertinent tests or other direct validation and record the observed results. A failed or unavailable validation must be surfaced as unresolved; do not list that edit as a verified minorFix. Do not claim success from a merely successful agent stop.
+If actionable unresolved findings remain, create or overwrite BOTH plan-fixes.md and tasks-fixes.md in the current working directory. Include every actionable finding, including actionable unable_to_verify issues; do not invent work for non-actionable limitations. Never automatically execute the generated tasks.
+Use the following plain Markdown format so both files can be checked and tasks-fixes.md can be used with /implement-tasks:
+- Number findings by their one-based position in the JSON findings array, skipping non-actionable entries without renumbering. In plan-fixes.md use one level-2 heading per actionable finding, in that order: "## Finding N - Descriptive title". Include plain single-line fields Context:, Requirement:, Path:, Severity:, Evidence:, Expected behavior:, Remedy:, and Constraints:. Copy Requirement, Severity, Evidence, and Remedy from that finding (Remedy is its action), collapsing whitespace. Encode Path as a JSON string or null, preserving its contents exactly. Follow Acceptance criteria: and Verification: with nonempty bullet lists describing concrete expected behavior and feasible checks. For unable_to_verify also copy its reason into a Reason: field.
+- In tasks-fixes.md reference plan-fixes.md in the introduction. Use consecutive, ordered level-2 task headings starting with "## Task 1 - Descriptive title". Each small implementation task needs plain single-line fields Finding: (the corresponding finding number), Requirement:, Path:, Remedy: (copied from the finding), and Action: (the concrete implementation step), followed by Acceptance criteria: and Verification: with nonempty bullet lists. Cover every actionable finding and no non-actionable findings. Multiple tasks may reference the same finding. Put any common instructions before the first level-2 heading; reserve level-2 headings for findings/tasks, not examples or shared sections. Do not put the required sections inside code fences.
 Do not perform remote Git operations, create commits, modify recovery metadata, or automatically execute tasks-fixes.md. Do not modify or delete existing remediation documents when there are no new actionable findings.
 ${RESULT_CONTRACT}`;
 }
@@ -107,7 +117,7 @@ export function validateReviewResult(value: unknown, sources?: ReviewSources): R
 		(result.outcome === "fixed" && (unresolved || result.minorFixes.length === 0)) ||
 		(result.outcome === "follow_up" && !actionable) || (result.outcome === "blocked" && !unresolved) ||
 		(result.findings.some((finding) => finding.severity === "critical") && result.outcome !== "blocked") ||
-		(result.remediationGenerated && !actionable)) invalid("outcome or remediation claim contradicts the reported evidence.");
+		(result.remediationGenerated !== actionable)) invalid("outcome or remediation claim contradicts the reported evidence.");
 	if (sources && sources.originalPlanPath == null && !result.unavailableChecks.some((check) =>
 		check.area === "plan_compliance" && check.check === SOURCE_PLAN_COMPLIANCE_CHECK)) invalid("missing source-plan compliance limitation.");
 	return result;
@@ -126,6 +136,111 @@ export function parseReviewResult(response: string, sources?: ReviewSources): Re
 	return validateReviewResult(value, sources);
 }
 
-export async function executeReview(executor: ActiveSessionExecutor, sources: ReviewSources): Promise<ReviewResult> {
-	return parseReviewResult(await executor.executeForText(buildReviewPrompt(sources)), sources);
+export async function captureReviewArtifacts(cwd: string): Promise<ReviewArtifactSnapshot> {
+	const [plan, tasks] = await Promise.all(REMEDIATION_FILES.map((file) => snapshotFile(resolve(cwd, file))));
+	return { "plan-fixes.md": plan, "tasks-fixes.md": tasks };
+}
+
+function artifactError(reason: string): never {
+	throw new Error(`Invalid review artifacts: ${reason}`);
+}
+
+function outsideCode(markdown: string, file: string): string {
+	const lines: string[] = [];
+	let fence: string | undefined;
+	for (const line of markdown.split(/\r?\n/)) {
+		const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+		if (fence) {
+			if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = undefined;
+		} else if (marker) fence = marker[1];
+		else lines.push(line.trimEnd());
+	}
+	if (fence) artifactError(`${file} contains an unterminated code fence.`);
+	return lines.join("\n");
+}
+
+function sections(markdown: string, kind: "Finding" | "Task", file: string) {
+	const headings = [...markdown.matchAll(/^##(?:[ \t]+(.*))?$/gm)];
+	if (!headings.length) artifactError(`${file} needs ordered ${kind.toLowerCase()} sections.`);
+	return headings.map((heading, index) => {
+		const match = new RegExp(`^${kind} ([1-9]\\d*) - (\\S.*)$`).exec(heading[1] ?? "");
+		if (!match) artifactError(`${file} requires headings like "## ${kind} 1 - Title".`);
+		return { number: Number(match[1]), body: markdown.slice(heading.index! + heading[0].length, headings[index + 1]?.index) };
+	});
+}
+
+function scalar(body: string, label: string, location: string): string {
+	const matches = [...body.matchAll(new RegExp(`^${label}:[ \\t]*(.*)$`, "gm"))];
+	if (matches.length !== 1 || !text(matches[0][1])) artifactError(`${location} needs one nonempty ${label}: field.`);
+	return matches[0][1].trim();
+}
+function criteria(body: string, label: string, location: string): void {
+	const headings = [...body.matchAll(new RegExp(`^${label}:[ \\t]*$`, "gm"))];
+	const bullet = new RegExp(`^${label}:[ \\t]*\\n(?:[ \\t]*\\n)*[ \\t]*[-*][ \\t]+(.+)$`, "m").exec(body);
+	if (headings.length !== 1 || !bullet || !text(bullet[1].replace(/^\[[ xX]\][ \t]*/, ""))) {
+		artifactError(`${location} needs a nonempty ${label}: bullet list.`);
+	}
+}
+function normalized(value: string): string {
+	return value.replace(/\s+/g, " ").trim();
+}
+function findingFields(body: string, finding: ReviewResult["findings"][number], location: string): void {
+	if (scalar(body, "Path", location) !== JSON.stringify(finding.path)) artifactError(`${location} Path does not match the reported finding.`);
+	for (const [label, expected] of [["Requirement", finding.requirement], ["Remedy", finding.action!]]) {
+		if (normalized(scalar(body, label, location)) !== normalized(expected)) artifactError(`${location} ${label} does not match the reported finding.`);
+	}
+	criteria(body, "Acceptance criteria", location);
+	criteria(body, "Verification", location);
+}
+
+export async function validateReviewArtifacts(cwd: string, result: ReviewResult, before: ReviewArtifactSnapshot): Promise<void> {
+	validateReviewResult(result);
+	const after = await captureReviewArtifacts(cwd);
+	const actionable = new Map(result.findings.map((finding, index) => [index + 1, finding] as const).filter(([, finding]) => finding.actionable));
+	if (!actionable.size) {
+		if (REMEDIATION_FILES.some((file) => before[file] !== after[file])) artifactError("remediation documents changed without actionable findings.");
+		return;
+	}
+	for (const file of REMEDIATION_FILES) {
+		if (after[file] === null) artifactError(`${file} is required for actionable findings.`);
+		if (after[file] === before[file]) artifactError(`${file} was not newly generated or overwritten by this review.`);
+	}
+	const [plan, tasks] = await Promise.all(REMEDIATION_FILES.map(async (file) => {
+		const content = await readFile(resolve(cwd, file), "utf8");
+		if (!text(content)) artifactError(`${file} must not be empty.`);
+		return outsideCode(content, file);
+	}));
+	const findings = sections(plan, "Finding", REMEDIATION_FILES[0]);
+	if (findings.length !== actionable.size) artifactError("plan-fixes.md must cover exactly the actionable findings.");
+	for (const [index, [number, finding]] of [...actionable].entries()) {
+		const section = findings[index];
+		const location = `plan-fixes.md Finding ${number}`;
+		if (section.number !== number) artifactError(`${location} is missing or out of order.`);
+		findingFields(section.body, finding, location);
+		for (const label of ["Context", "Expected behavior", "Constraints"]) scalar(section.body, label, location);
+		for (const [label, expected] of [["Severity", finding.severity], ["Evidence", finding.evidence], ...(finding.reason ? [["Reason", finding.reason]] : [])]) {
+			if (normalized(scalar(section.body, label, location)) !== normalized(expected)) artifactError(`${location} ${label} does not match the reported finding.`);
+		}
+	}
+	if (!tasks.includes("plan-fixes.md")) artifactError("tasks-fixes.md must reference plan-fixes.md.");
+	const covered = new Set<number>();
+	for (const [index, task] of sections(tasks, "Task", REMEDIATION_FILES[1]).entries()) {
+		const location = `tasks-fixes.md Task ${index + 1}`;
+		if (task.number !== index + 1) artifactError(`${location} is missing or out of order.`);
+		const reference = scalar(task.body, "Finding", location);
+		const finding = /^[1-9]\d*$/.test(reference) ? actionable.get(Number(reference)) : undefined;
+		if (!finding) artifactError(`${location} references an unknown or non-actionable finding.`);
+		findingFields(task.body, finding, location);
+		scalar(task.body, "Action", location);
+		covered.add(Number(reference));
+	}
+	if (covered.size !== actionable.size) artifactError("tasks-fixes.md does not cover every actionable finding.");
+}
+
+export async function executeReview(executor: ActiveSessionExecutor, sources: ReviewSources, cwd: string): Promise<ReviewResult> {
+	const prompt = buildReviewPrompt(sources);
+	const before = await captureReviewArtifacts(cwd);
+	const result = parseReviewResult(await executor.executeForText(prompt), sources);
+	await validateReviewArtifacts(cwd, result, before);
+	return result;
 }

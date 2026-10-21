@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
 import { ActiveSessionExecutor } from "../src/executor.ts";
 import {
 	REVIEW_RESULT_START, REVIEW_RESULT_END, SOURCE_PLAN_COMPLIANCE_CHECK,
@@ -7,6 +9,18 @@ import {
 } from "../src/review.ts";
 
 const sources = { sourcePath: "tasks.md", originalPlanPath: "original plan.md" };
+async function withReviewDirectory(run: (cwd: string) => Promise<void>) {
+	const cwd = await mkdtemp(join(process.cwd(), ".review-test-"));
+	try { await run(cwd); }
+	finally { await rm(cwd, { recursive: true, force: true }); }
+}
+async function waitForSent(sent: string[], count = 1) {
+	for (let attempt = 0; attempt < 200; attempt++) {
+		if (sent.length >= count) return;
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	}
+	assert.fail("Review prompt was not submitted.");
+}
 function passedResult(): ReviewResult {
 	return {
 		outcome: "passed", reviewedAreas: ["plan_compliance", "tests", "documentation"],
@@ -73,8 +87,8 @@ test("verified minor fixes reference actual passing checks", () => {
 	assert.throws(() => validateReviewResult(result), /passing validation/);
 });
 
-test("follow-up and blocked results retain actionable findings without claiming remediation file existence", () => {
-	const followUp = { ...passedResult(), outcome: "follow_up", findings: [finding()], remediationGenerated: false };
+test("follow-up and blocked results claim generation that must be verified on disk separately", () => {
+	const followUp = { ...passedResult(), outcome: "follow_up", findings: [finding()], remediationGenerated: true };
 	assert.deepEqual(parseReviewResult(response(followUp), sources), followUp);
 	followUp.checks[1].passed = false;
 	followUp.checks[1].evidence = "npm test exited 1; invalid-input regression failed.";
@@ -149,11 +163,12 @@ for (const [name, candidate] of invalidCases) {
 	});
 }
 
-test("a valid review result is returned only after the active-session lifecycle settles", async () => {
+test("a valid review result is returned only after the active-session lifecycle settles", async () => withReviewDirectory(async (cwd) => {
 	const sent: string[] = [];
 	const executor = new ActiveSessionExecutor((prompt) => sent.push(prompt));
 	let resolved = false;
-	const execution = executeReview(executor, sources).then((result) => { resolved = true; return result; });
+	const execution = executeReview(executor, sources, cwd).then((result) => { resolved = true; return result; });
+	await waitForSent(sent);
 	executor.onAgentStart();
 	executor.onAgentEnd([
 		{ role: "toolResult", content: [{ type: "text", text: "Tool output, not the final report" }] },
@@ -165,24 +180,26 @@ test("a valid review result is returned only after the active-session lifecycle 
 	assert.deepEqual(await execution, passedResult());
 	assert.equal(sent.length, 1);
 	assert.equal(sent[0], buildReviewPrompt(sources));
-});
+}));
 
-test("invalid review output is recoverable and never triggers an automatic retry", async () => {
+test("invalid review output is recoverable and never triggers an automatic retry", async () => withReviewDirectory(async (cwd) => {
 	const sent: string[] = [];
 	const executor = new ActiveSessionExecutor((prompt) => sent.push(prompt));
-	const first = executeReview(executor, sources);
+	const first = executeReview(executor, sources, cwd);
+	await waitForSent(sent);
 	executor.onAgentStart();
 	executor.onAgentEnd([{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Looks good." }] }]);
 	executor.onAgentSettled();
 	await assert.rejects(first, /Invalid review result/);
 	assert.equal(sent.length, 1);
-	const retry = executeReview(executor, sources);
+	const retry = executeReview(executor, sources, cwd);
+	await waitForSent(sent, 2);
 	executor.onAgentStart();
 	executor.onAgentEnd([{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: response(passedResult()) }] }]);
 	executor.onAgentSettled();
 	assert.deepEqual(await retry, passedResult());
 	assert.equal(sent.length, 2);
-});
+}));
 
 for (const message of [
 	{ role: "assistant", stopReason: "error", errorMessage: "Provider failed", content: [{ type: "text", text: response(passedResult()) }] },
@@ -190,12 +207,14 @@ for (const message of [
 	{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Everything looks good." }] },
 	undefined,
 ]) {
-	test(`review rejects ${message?.stopReason ?? "missing response"} without treating agent completion as verification`, async () => {
-		const executor = new ActiveSessionExecutor(() => {});
-		const execution = executeReview(executor, sources);
+	test(`review rejects ${message?.stopReason ?? "missing response"} without treating agent completion as verification`, async () => withReviewDirectory(async (cwd) => {
+		const sent: string[] = [];
+		const executor = new ActiveSessionExecutor((prompt) => sent.push(prompt));
+		const execution = executeReview(executor, sources, cwd);
+		await waitForSent(sent);
 		executor.onAgentStart();
 		executor.onAgentEnd(message ? [message] : []);
 		executor.onAgentSettled();
 		await assert.rejects(execution, /Provider failed|without final assistant text|Invalid review result|without an assistant response/);
-	});
+	}));
 }
