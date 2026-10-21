@@ -15,9 +15,12 @@ function runtime(options: {
 	responses?: Array<string | undefined>;
 	selectionOutcome?: boolean | Error;
 	coerceThinking?: boolean;
+	scopedModels?: Array<typeof implementationModel>;
+	currentModel?: typeof implementationModel;
+	currentThinking?: string;
 } = {}) {
-	let currentModel = implementationModel;
-	let currentThinking = "medium";
+	let currentModel = options.currentModel ?? implementationModel;
+	let currentThinking = options.currentThinking ?? "medium";
 	const models = options.models ?? [implementationModel, reviewModel];
 	const responses = [...(options.responses ?? [])];
 	const prompts: Array<{ title: string; choices: string[] }> = [];
@@ -25,7 +28,7 @@ function runtime(options: {
 	const switches: string[] = [];
 	const ctx = {
 		get model() { return currentModel; },
-		scopedModels: [{ model: implementationModel }],
+		scopedModels: (options.scopedModels ?? [implementationModel]).map((model) => ({ model })),
 		modelRegistry: {
 			getAvailable: () => models,
 			find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id),
@@ -55,7 +58,7 @@ function runtime(options: {
 test("shared selectors preserve implementation defaults while review can choose an independent pair", async () => {
 	const implementationRuntime = runtime();
 	assert.deepEqual(await selectImplementationSettings(implementationRuntime.ctx, implementationRuntime.controller), implementation);
-	assert.equal(implementationRuntime.prompts[0].title, "Implementation model for all tasks (current: test/implementation)");
+	assert.equal(implementationRuntime.prompts[0].title, "Implementation model for all tasks (default: test/implementation)");
 	assert.deepEqual(implementationRuntime.prompts[0].choices, ["test/implementation"]);
 	assert.equal(implementationRuntime.prompts[1].choices[0], "medium");
 	const reviewRuntime = runtime({ responses: ["test/review", "high"] });
@@ -66,6 +69,55 @@ test("shared selectors preserve implementation defaults while review can choose 
 	assert.deepEqual(reviewRuntime.switches, []);
 	assert.equal(reviewRuntime.controller.getThinkingLevel(), "medium");
 	assert.equal(reviewRuntime.ctx.model?.id, "implementation");
+});
+
+test("implementation proposes a saved eligible pair without calling it current or switching settings", async () => {
+	const r = runtime({ scopedModels: [] });
+	assert.deepEqual(await selectImplementationSettings(r.ctx, r.controller, { model: reviewModel, thinkingLevel: "high" }), {
+		implementationModel: { provider: "test", id: "review" }, implementationThinkingLevel: "high",
+	});
+	assert.equal(r.prompts[0].title, "Implementation model for all tasks (default: test/review)");
+	assert.equal(r.prompts[1].title, "Thinking level for all implementation tasks (default: high)");
+	assert.deepEqual(r.prompts[0].choices, ["test/review", "test/implementation"]);
+	assert.deepEqual(r.switches, []);
+	assert.equal(r.ctx.model?.id, "implementation");
+	assert.equal(r.controller.getThinkingLevel(), "medium");
+});
+
+for (const scenario of ["unavailable", "out of scope", "incompatible thinking", "unavailable scoped model"] as const) {
+	test(`implementation warns and falls back to current settings for ${scenario}`, async () => {
+		const r = runtime({
+			scopedModels: scenario === "out of scope" ? [implementationModel] : [implementationModel, reviewModel],
+			models: scenario.includes("unavailable") ? [implementationModel] : undefined,
+		});
+		assert.deepEqual(await selectImplementationSettings(r.ctx, r.controller, { model: reviewModel, thinkingLevel: scenario === "incompatible thinking" ? "xhigh" : "high" }), implementation);
+		assert.equal(r.warnings.length, 1);
+		assert.equal(r.prompts[0].choices[0], "test/implementation");
+		assert.equal(r.prompts[1].choices[0], "medium");
+		assert.deepEqual(r.switches, []);
+	});
+}
+
+test("implementation thinking dialog describes the compatible default for a different selected model", async () => {
+	const plain = { ...reviewModel, reasoning: false };
+	const r = runtime({ models: [implementationModel, plain], scopedModels: [], responses: ["test/review", "off"] });
+	assert.deepEqual(await selectImplementationSettings(r.ctx, r.controller), {
+		implementationModel: { provider: "test", id: "review" }, implementationThinkingLevel: "off",
+	});
+	assert.deepEqual(r.prompts[1].choices, ["off"]);
+	assert.match(r.prompts[1].title, /default: off/);
+	const invalid = runtime({ models: [implementationModel, plain], scopedModels: [], responses: ["test/review", "high"] });
+	await assert.rejects(selectImplementationSettings(invalid.ctx, invalid.controller), /Unsupported implementation thinking level/);
+});
+
+test("incompatible current-session thinking is warned about and still requires explicit selection", async () => {
+	const plain = { ...implementationModel, reasoning: false };
+	const r = runtime({ currentModel: plain, models: [plain], responses: ["test/implementation", undefined] });
+	assert.equal(await selectImplementationSettings(r.ctx, r.controller), undefined);
+	assert.equal(r.warnings.length, 1);
+	assert.match(r.prompts[1].title, /default: off/);
+	assert.deepEqual(r.switches, []);
+	assert.equal(r.controller.getThinkingLevel(), "medium");
 });
 
 test("first review use proposes the implementation model and thinking without switching settings", async () => {

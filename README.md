@@ -98,13 +98,13 @@ An interactive TUI or RPC UI is required. Preparation uses the currently active 
 2. Supply the Markdown path if omitted. For `/implement-plan`, approve any future overwrite and prepare the generated tasks in memory.
 3. Preview the detected tasks and choose implementation-only or local Git checkpoints.
 4. Choose automatic compaction (default **Yes**) and, if enabled, its threshold (default **70%**).
-5. Select the implementation model and thinking level, defaulting to the active pair. With checkpoints enabled, enter a new local branch name or confirm using the current branch.
+5. Select the implementation model and thinking level, normally proposing the last confirmed implementation pair (or the active pair on first use). You can opt out of preference reuse in the configuration file below. With checkpoints enabled, enter a new local branch name or confirm using the current branch.
 6. Choose **Final review?** (default **No**). If enabled, select its independent model and thinking level. `/implement-tasks` also asks for an optional reference plan; blank means no source plan, not an inferred one.
 7. Confirm the mandatory **Execution summary** with **Start implementation / Cancel**, or **Resume / Cancel** for recovery. **Cancel is the default**, even when review is disabled.
 
 The summary includes the command, working directory, source paths, task count, implementation/review settings, Git branch and initial commit intent, compaction threshold, and pending `tasks.md`/`.gitignore` writes. TUI PageUp/PageDown scroll the content without moving the action selection; arrows (or `j`/`k`) select an action, Enter confirms, and Escape/Ctrl+C cancel. Actions stay visible as the terminal resizes; in extremely small viewports the selected action remains accessible. RPC uses a standard selection dialog with Cancel listed first and requires an explicit affirmative response.
 
-Before final confirmation, preparation does not create branches, stage/commit files, change `.gitignore`, write recovery state, overwrite `tasks.md`, switch models, or save review preferences. Cancelling a replacement run also preserves the old recovery state. Changed source files, overwrite targets, or Git assumptions abort setup rather than silently overwriting external work.
+Before final confirmation, preparation does not create branches, stage/commit files, change `.gitignore`, write recovery state, overwrite `tasks.md`, switch models, or save model/thinking preferences. Cancelling a replacement run also preserves the old recovery state. Changed source files, overwrite targets, or Git assumptions abort setup rather than silently overwriting external work.
 
 After confirmation, setup intent and prepared Markdown are saved, deferred Git setup and file writes run, and tasks execute sequentially in the active session. The implementation pair stays fixed through all tasks; review settings apply only at the final review stage. The extension waits for the full agent lifecycle, including tools and retries, to settle before advancing.
 
@@ -153,7 +153,7 @@ Final review is **off by default** for both commands. When enabled, one tool-ena
 
 The review model and thinking level are independent of the implementation pair. On first use the implementation pair is proposed when compatible; later runs propose the last **confirmed** review pair across projects. Unavailable/incompatible preferences require explicit compatible choices.
 
-Preferences are saved only after the final summary is confirmed, in `pi-implement-preferences.json` under the SDK's user agent directory (`getAgentDir()`, normally `~/.pi/agent`, respecting `PI_CODING_AGENT_DIR`). They are not repository recovery state or project configuration. Cancellation and review-disabled runs leave them unchanged. Resume uses the exact saved workflow settings, not a new preference or silent substitute.
+The review pair is saved only after the final summary is confirmed. Cancellation and review-disabled runs leave that pair unchanged, even when confirmed implementation settings are updated. Both pairs share the user-scoped file described below, but remain independent. Resume uses the exact workflow settings, not newer global preferences or a silent substitute.
 
 ### Fixes, findings, and output
 
@@ -179,6 +179,45 @@ For that later run, you can supply `plan-fixes.md` as the optional reference pla
 ### Limitations
 
 Review is model-assisted, not an independent correctness/security proof or a fixed coverage guarantee. Structured validation checks the result contract and remediation consistency, not the truth of every agent assertion. Inspect the cited files, checks, and unavailable-check reasons. Review instructions restrict edits and Git usage, but do not sandbox the agent's tools. There are no automatic repeat-review/remediation loops or independent review sessions.
+
+## Model and thinking preferences
+
+Both commands use `pi-implement-preferences.json` in the SDK's user agent directory (`getAgentDir()`, normally `~/.pi/agent`, respecting `PI_CODING_AGENT_DIR`). It is user-scoped, shared across projects, and separate from repository recovery state. Example configuration (replace the example identifiers with available models):
+
+```json
+{
+  "version": 1,
+  "reuseLastImplementationSettings": true,
+  "implementation": {
+    "model": {
+      "provider": "openai",
+      "id": "example-model"
+    },
+    "thinkingLevel": "medium"
+  },
+  "review": {
+    "model": {
+      "provider": "openai",
+      "id": "example-review-model"
+    },
+    "thinkingLevel": "high"
+  }
+}
+```
+
+Edit `reuseLastImplementationSettings` directly; there is no additional configuration dialog:
+
+- **`true` (default):** propose the last confirmed implementation model/thinking pair. Missing implementation history falls back to the active session pair.
+- **`false`:** propose the active session pair, preserving the previous default-selection policy.
+- A missing or non-boolean switch uses the default of `true`.
+
+The switch changes only the proposal. Both model and thinking dialogs still appear, and the last confirmed implementation pair is recorded in either mode. Re-enabling reuse therefore retains your history. The review default is independent and continues to use its own last confirmed pair.
+
+Saved implementation defaults must be available within the normal implementation model choices/scopes and support the saved thinking level. An unavailable, out-of-scope, or incompatible pair produces a warning and falls back to compatible current-session settings for explicit selection. Thinking choices show the actual supported default for the selected model; proposing a saved pair never switches the active session model or thinking level.
+
+Preferences are saved atomically only after the mandatory summary is confirmed, regardless of whether execution later succeeds. Earlier cancellation leaves the entire file unchanged. Updating either pair preserves the other, the reuse switch, and unrelated fields in valid version-1 configuration. Existing review-only version-1 files remain supported; neither pair is required. Malformed JSON/unsupported versions and malformed pairs are ignored for defaults; a confirmed save can replace an invalid document. Unreadable files cause an explicit error rather than silently continuing.
+
+Resume does not read, apply, or overwrite these newer global preferences. It restores the exact model/thinking pair stored in the workflow state for the remaining work; unavailable saved settings stop recovery instead of substituting another pair.
 
 ## Recovery
 
@@ -216,9 +255,9 @@ The state file is deleted only after all selected phases and required artifact v
 - one task at a time in the current session, with progress display;
 - optional local Git checkpoints and context-aware compaction;
 - a fixed implementation pair and optional independently configured final review;
-- cross-project review preferences and repository-local, single-file recovery.
+- independent cross-project implementation/review preferences and repository-local, single-file recovery.
 
-It does not provide task editing/reordering, parallel execution, subagents, dependency graphs, automatic failure retries, state history, per-task model selection, global implementation-model preferences, recursive remediation, or remote Git automation.
+It does not provide task editing/reordering, parallel execution, subagents, dependency graphs, automatic failure retries, state history, per-task model selection, recursive remediation, or remote Git automation.
 
 ## Release on npm
 

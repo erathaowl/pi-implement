@@ -62,7 +62,7 @@ async function selectModelThinking(
 		modelChoices.unshift(key);
 	}
 	const selectedKey = await ctx.ui.select(
-		purpose === "implementation" ? `Implementation model for all tasks (current: ${key})` : `Review model (default: ${key})`,
+		purpose === "implementation" ? `Implementation model for all tasks (default: ${key})` : `Review model (default: ${key})`,
 		modelChoices,
 	);
 	if (!selectedKey) return undefined;
@@ -73,7 +73,7 @@ async function selectModelThinking(
 	const defaultLevel = preferred.thinkingLevel;
 	const choices = levels.includes(defaultLevel) ? [defaultLevel, ...levels.filter((level) => level !== defaultLevel)] : levels;
 	const thinkingLevel = await ctx.ui.select(
-		purpose === "implementation" ? `Thinking level for all implementation tasks (current: ${defaultLevel})` : `Review thinking level (default: ${choices[0]})`,
+		purpose === "implementation" ? `Thinking level for all implementation tasks (default: ${choices[0]})` : `Review thinking level (default: ${choices[0]})`,
 		choices,
 	);
 	if (!thinkingLevel) return undefined;
@@ -86,13 +86,29 @@ async function selectModelThinking(
 export async function selectImplementationSettings(
 	ctx: ExtensionCommandContext,
 	controller: ImplementationModelController,
+	preferred?: ModelThinkingSettings,
 ): Promise<ImplementationSettings | undefined> {
 	if (!ctx.model) throw new Error("No model is selected.");
 	const currentModel = ctx.model;
-	const scopedOrAvailable = ctx.scopedModels.length > 0 ? ctx.scopedModels.map(({ model }) => model) : ctx.modelRegistry.getAvailable();
-	const settings = await selectModelThinking(ctx,
-		[currentModel, ...scopedOrAvailable.filter((model) => !modelsMatch(model, currentModel))],
-		{ model: currentModel, thinkingLevel: controller.getThinkingLevel() as ImplementationThinkingLevel }, "implementation");
+	const available = ctx.modelRegistry.getAvailable();
+	const scopedOrAvailable = ctx.scopedModels.length > 0
+		? ctx.scopedModels.map(({ model }) => model).filter((model) => available.some((candidate) => modelsMatch(candidate, model))) : available;
+	const models = [currentModel, ...scopedOrAvailable.filter((model) => !modelsMatch(model, currentModel))]
+		.filter((model) => supportedThinkingLevels(model).length > 0);
+	if (!models.length) throw new Error("No implementation models have supported thinking levels.");
+	const savedModel = preferred && models.find((model) => modelsMatch(model, preferred.model) && available.some((candidate) => modelsMatch(candidate, model)));
+	const useSaved = savedModel && preferred && supportedThinkingLevels(savedModel).includes(preferred.thinkingLevel);
+	if (preferred && !useSaved) {
+		ctx.ui.notify("The saved implementation model or thinking level is unavailable or outside the model scope. Select a compatible current-session pair explicitly.", "warning");
+	}
+	const model = useSaved ? savedModel : models.find((model) => modelsMatch(model, currentModel)) ?? models[0];
+	const levels = supportedThinkingLevels(model);
+	const currentThinking = controller.getThinkingLevel() as ImplementationThinkingLevel;
+	const thinkingLevel = useSaved ? preferred.thinkingLevel : levels.includes(currentThinking) ? currentThinking : levels[0];
+	if (!useSaved && (model !== currentModel || thinkingLevel !== currentThinking)) {
+		ctx.ui.notify("The current implementation settings are incompatible. Select a supported model and thinking level explicitly.", "warning");
+	}
+	const settings = await selectModelThinking(ctx, models, { model, thinkingLevel }, "implementation");
 	return settings ? { implementationModel: settings.model, implementationThinkingLevel: settings.thinkingLevel } : undefined;
 }
 

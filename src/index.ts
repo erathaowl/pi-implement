@@ -19,7 +19,6 @@ import {
 	applyReviewSettings,
 	assertImplementationSettings,
 	assertReviewSettingsAvailable,
-	selectImplementationSettings,
 	type ImplementationModelController,
 	type ImplementationSettings,
 } from "./model.ts";
@@ -41,7 +40,7 @@ import {
 	type ImplementationState,
 	type ReviewSettings,
 } from "./state.ts";
-import { saveReviewPreference, selectPreferredReviewSettings } from "./preferences.ts";
+import { saveImplementationPreference, saveReviewPreference, selectPreferredImplementationSettings, selectPreferredReviewSettings } from "./preferences.ts";
 import { executeReview, formatReviewResult } from "./review.ts";
 import { buildTaskFilePrompt, indexTaskFile } from "./tasks.ts";
 import { confirmExecutionSummary, selectTaskAction } from "./preview.ts";
@@ -485,7 +484,7 @@ export async function selectExecutionOptions(
 		}
 	}
 
-	const implementationSettings = await selectImplementationSettings(ctx, modelController);
+	const implementationSettings = await selectPreferredImplementationSettings(ctx, modelController);
 	if (!implementationSettings) {
 		return undefined;
 	}
@@ -643,6 +642,7 @@ export async function runTasksWorkflow(
 	if (ignoreSnapshot !== undefined) await assertFileUnchanged(ignorePath, ignoreSnapshot);
 	if (preparedTasks) await validatePreparedTaskDocument(ctx.cwd, preparedTasks);
 	assertReviewSettingsAvailable(state.review, ctx);
+	await saveImplementationPreference({ model: state.implementationModel, thinkingLevel: state.implementationThinkingLevel });
 	if (state.review.enabled) await saveReviewPreference(state.review);
 	// Persist all setup intent and generated Markdown before the first interruptible mutation.
 	await saveState(ctx.cwd, state);

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { link, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import test from "node:test";
+import test, { beforeEach, afterEach } from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import { initTheme, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { getKeybindings } from "@earendil-works/pi-tui";
@@ -10,11 +10,24 @@ import { COMPACTION_ENABLED_CHOICE, DEFAULT_COMPACTION_THRESHOLD_PERCENT } from 
 import implementExtension, { formatProgress, readMarkdownInput, selectExecutionOptions, selectSourcePlan, startExecutionSetup } from "../src/index.ts";
 import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from "../src/state.ts";
 import { snapshotGeneratedTasks } from "../src/plan.ts";
-import { PREFERENCES_FILE_NAME, loadReviewPreference, saveReviewPreference } from "../src/preferences.ts";
+import { PREFERENCES_FILE_NAME, loadImplementationPreference, loadReviewPreference, saveImplementationPreference, saveReviewPreference } from "../src/preferences.ts";
 import { REVIEW_RESULT_START, REVIEW_RESULT_END, SOURCE_PLAN_COMPLIANCE_CHECK, type ReviewResult } from "../src/review.ts";
 import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
 
 initTheme("dark");
+
+let testAgentDir: string;
+let previousAgentDir: string | undefined;
+beforeEach(async () => {
+	previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	testAgentDir = await mkdtemp(join(process.cwd(), ".implementation-preferences-test-"));
+	process.env.PI_CODING_AGENT_DIR = testAgentDir;
+});
+afterEach(async () => {
+	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	await rm(testAgentDir, { recursive: true, force: true });
+});
 
 type Handler = (event: any, ctx?: any) => void | Promise<void>;
 
@@ -354,9 +367,9 @@ function fakeRuntime(options: {
 				if (choice !== undefined) return choice;
 				if (title === "Automatic compaction between tasks?") return selectChoices[0];
 				if (title.startsWith("Implementation model for all tasks")) {
-					return `${currentModel.provider}/${currentModel.id}`;
+					return selectChoices[0];
 				}
-				if (title.startsWith("Thinking level for all implementation tasks")) return currentThinkingLevel;
+				if (title.startsWith("Thinking level for all implementation tasks")) return selectChoices[0];
 				return undefined;
 			},
 			async input(title: string, placeholder?: string) {
@@ -1211,7 +1224,9 @@ for (const command of ["implement-tasks", "implement-plan"]) {
 			assert.ok(runtime.selections.some(({ title }) => title.includes("Final review: Disabled")));
 			assert.equal(runtime.sent.length, 1);
 			assert.equal(await loadState(directory), undefined);
-			assert.equal(await readFile(join(agentDir, PREFERENCES_FILE_NAME), "utf8"), before);
+			const after = JSON.parse(await readFile(join(agentDir, PREFERENCES_FILE_NAME), "utf8"));
+			assert.deepEqual(after.review, JSON.parse(before).review);
+			assert.deepEqual(after.implementation, { model: { provider: "test", id: "selected" }, thinkingLevel: "medium" });
 			assert.ok(runtime.notifications.some(({ message }) => message === "Implementation complete."));
 		}));
 	});
@@ -1919,6 +1934,97 @@ test("workflow state is saved before each task, advances without Git, and is del
 		assert.equal(await loadState(directory), undefined);
 	});
 });
+
+for (const command of ["implement-tasks", "implement-plan"]) {
+	for (const reuse of [undefined, true, false]) {
+		test(`${command} implementation preferences honor reuse=${reuse}, preserve cancellation, and never override recovery`, async () => {
+			await withTempDir(async (directory) => {
+				const path = join(testAgentDir, PREFERENCES_FILE_NAME);
+				const review = { model: { provider: "test", id: "review" }, thinkingLevel: "low" };
+				await writeFile(path, JSON.stringify({ version: 1, review, custom: { keep: true },
+					...(reuse === undefined ? {} : { reuseLastImplementationSettings: reuse }) }));
+				const before = await readFile(path, "utf8");
+				await writeFile(join(directory, "tasks.md"), "Original tasks\n");
+				await writeFile(join(directory, "plan.md"), "# Original plan\n");
+				const implementationModel = fakeModel("test", "implementation");
+				const models = [fakeModel("test", "selected"), implementationModel];
+				const first: ReturnType<typeof fakeRuntime> = fakeRuntime({
+					cwd: directory, models,
+					choices: [...(command === "implement-plan" ? ["Overwrite"] : []), "Implement", "No", "test/implementation", "high"],
+					modelOutputs: command === "implement-plan" ? ["## Task 1 - Generated\n", { tasks: [{ title: "Generated" }] }] : undefined,
+					turnStopReasons: ["error"],
+					onSummary: async () => {
+						assert.equal(await readFile(path, "utf8"), before);
+						assert.equal(await loadImplementationPreference(), undefined);
+						assert.deepEqual(first.setModelCalls, []);
+						assert.deepEqual(first.setThinkingLevelCalls, []);
+					},
+				});
+				await first.run(command, command === "implement-plan" ? "plan.md" : "tasks.md");
+				assert.deepEqual(await loadImplementationPreference(), { model: { provider: "test", id: "implementation" }, thinkingLevel: "high" });
+				assert.deepEqual(await loadReviewPreference(), review);
+				const confirmed = JSON.parse(await readFile(path, "utf8"));
+				assert.equal(confirmed.reuseLastImplementationSettings, reuse);
+				assert.deepEqual(confirmed.custom, { keep: true });
+				assert.equal((await loadState(directory))?.status, "failed");
+				const confirmedBytes = await readFile(path, "utf8");
+
+				await withTempDir(async (otherProject) => {
+					const otherCommand = command === "implement-tasks" ? "implement-plan" : "implement-tasks";
+					await writeFile(join(otherProject, "tasks.md"), "Other tasks\n");
+					await writeFile(join(otherProject, "plan.md"), "# Other plan\n");
+					const second = fakeRuntime({
+						cwd: otherProject, models, thinkingLevel: "low", choices: otherCommand === "implement-plan" ? ["Overwrite"] : [],
+						modelOutputs: otherCommand === "implement-plan" ? ["## Task 1 - Generated\n", { tasks: [{ title: "Generated" }] }] : undefined,
+						summaryActions: ["Cancel"],
+					});
+					await second.run(otherCommand, otherCommand === "implement-plan" ? "plan.md" : "tasks.md");
+					const modelPrompt = second.selections.find(({ title }) => title.startsWith("Implementation model"))!;
+					const thinkingPrompt = second.selections.find(({ title }) => title.startsWith("Thinking level"))!;
+					const expectedModel = reuse === false ? "test/selected" : "test/implementation";
+					const expectedThinking = reuse === false ? "low" : "high";
+					assert.equal(modelPrompt.choices[0], expectedModel);
+					assert.ok(modelPrompt.title.includes(`default: ${expectedModel}`));
+					assert.equal(thinkingPrompt.choices[0], expectedThinking);
+					assert.ok(thinkingPrompt.title.includes(`default: ${expectedThinking}`));
+					assert.deepEqual(second.sent, []);
+					assert.deepEqual(second.setModelCalls, []);
+					assert.equal(await loadState(otherProject), undefined);
+					assert.equal(await readFile(path, "utf8"), confirmedBytes);
+				});
+
+				// New global choices must neither affect nor be overwritten by exact workflow recovery.
+				await saveImplementationPreference({ model: { provider: "test", id: "selected" }, thinkingLevel: "off" });
+				await saveReviewPreference({ model: { provider: "unavailable", id: "new-review" }, thinkingLevel: "off" });
+				const newerBytes = await readFile(path, "utf8");
+				const resumed = fakeRuntime({ cwd: directory, models, choices: ["Resume"] });
+				await resumed.run(command === "implement-tasks" ? "implement-plan" : "implement-tasks", "missing.md");
+				assert.deepEqual(resumed.sentSettings, [{ model: "test/implementation", thinkingLevel: "high" }]);
+				assert.equal(resumed.completeCalls.length, 0);
+				assert.ok(!resumed.selections.some(({ title }) => /^(Implementation model|Thinking level|Review model)/.test(title)));
+				assert.equal(await loadState(directory), undefined);
+				assert.equal(await readFile(path, "utf8"), newerBytes);
+			});
+		});
+	}
+}
+
+for (const command of ["implement-tasks", "implement-plan"]) {
+	test(`${command} recovery does not access an unreadable global preference file`, async () => {
+		await withTempDir(async (directory) => {
+			const preferences = join(testAgentDir, PREFERENCES_FILE_NAME);
+			await mkdir(preferences);
+			await saveState(directory, savedState(directory, {
+				tasks: [{ title: "One", prompt: "Saved implementation prompt" }], nextTaskIndex: 0, implementationThinkingLevel: "high",
+			}));
+			const resumed = fakeRuntime({ cwd: directory, choices: ["Resume"] });
+			await resumed.run(command, "missing.md");
+			assert.deepEqual(resumed.sentSettings, [{ model: "test/selected", thinkingLevel: "high" }]);
+			assert.equal(await loadState(directory), undefined);
+			assert.equal((await stat(preferences)).isDirectory(), true);
+		});
+	});
+}
 
 test("implementation model and thinking selections default to the current pair", async () => {
 	await withTempDir(async (directory) => {
