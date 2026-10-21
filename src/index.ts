@@ -243,12 +243,27 @@ async function saveFailure(
 async function finishWorkflow(
 	commandName: string,
 	ctx: ExtensionCommandContext,
+	git: LocalGit,
 	state: ImplementationState,
 	modelController: ImplementationModelController,
 ): Promise<void> {
-	if (state.pendingCheckpoint || state.pendingCompaction) throw new Error("Cannot finish while a checkpoint or compaction is pending.");
+	if (state.pendingCompaction || (state.pendingCheckpoint && state.phase !== "review_checkpoint")) {
+		throw new Error("Cannot finish while a checkpoint or compaction is pending.");
+	}
 	if (state.review.enabled) {
 		if (!state.reviewResult) throw new Error("Cannot finish before a validated review result is saved.");
+		if (state.phase === "review" && state.checkpoint) {
+			state.phase = "review_checkpoint";
+			state.pendingCheckpoint = { purpose: "review", message: "Review: apply fixes and record findings" };
+			await saveState(ctx.cwd, state);
+		}
+		if (state.phase === "review_checkpoint" && state.pendingCheckpoint) {
+			const branch = await git.currentBranch(ctx.cwd);
+			if (branch !== state.branchName) {
+				throw new Error(`Cannot checkpoint review: expected local branch ${JSON.stringify(state.branchName)}, but current branch is ${JSON.stringify(branch || "detached HEAD")}. Switch branches manually and try again.`);
+			}
+			await completeCheckpoint(ctx.cwd, git, state);
+		}
 		await applyImplementationSettings(state, ctx, modelController);
 	}
 	state.phase = "completed";
@@ -266,6 +281,7 @@ async function executeReviewPhase(
 	commandName: string,
 	ctx: ExtensionCommandContext,
 	executor: ActiveSessionExecutor,
+	git: LocalGit,
 	state: ImplementationState,
 	modelController: ImplementationModelController,
 ): Promise<void> {
@@ -295,7 +311,7 @@ async function executeReviewPhase(
 			// A completed, validated review must survive restoration, reporting, or cleanup failure.
 			await saveState(ctx.cwd, state);
 		}
-		await finishWorkflow(commandName, ctx, state, modelController);
+		await finishWorkflow(commandName, ctx, git, state, modelController);
 	} catch (error) {
 		await saveFailure(ctx, commandName, state, state.nextTaskIndex, error);
 	} finally {
@@ -421,8 +437,8 @@ async function executeTaskSet(
 	try {
 		state.phase = state.review.enabled ? "review" : "completed";
 		await saveState(ctx.cwd, state);
-		if (state.phase === "review") await executeReviewPhase(commandName, ctx, executor, state, modelController);
-		else await finishWorkflow(commandName, ctx, state, modelController);
+		if (state.phase === "review") await executeReviewPhase(commandName, ctx, executor, git, state, modelController);
+		else await finishWorkflow(commandName, ctx, git, state, modelController);
 	} catch (error) {
 		await saveFailure(ctx, commandName, state, state.nextTaskIndex, error);
 	}
@@ -743,17 +759,13 @@ async function handleExistingState(
 		}
 	}
 
-	if (state.phase === "review_checkpoint") {
-		report(ctx, requestedCommand, "Review checkpoint recovery is not available yet. Recovery state was preserved.", "error");
-		return true;
-	}
 	try {
 		if (state.phase === "tasks" || (state.phase === "review" && !state.reviewStarted && !state.reviewResult)) {
 			await applyImplementationSettings(state, ctx, modelController);
 		}
 		if (state.phase === "tasks") await executeTaskSet("/implement-tasks", "Task-file implementation", ctx, executor, git, state, modelController);
-		else if (state.phase === "review") await executeReviewPhase(requestedCommand, ctx, executor, state, modelController);
-		else await finishWorkflow(requestedCommand, ctx, state, modelController);
+		else if (state.phase === "review") await executeReviewPhase(requestedCommand, ctx, executor, git, state, modelController);
+		else await finishWorkflow(requestedCommand, ctx, git, state, modelController);
 	} catch (error) {
 		await saveFailure(ctx, requestedCommand, state, state.nextTaskIndex, error);
 	}

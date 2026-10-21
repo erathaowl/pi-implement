@@ -132,6 +132,7 @@ function fakeRuntime(options: {
 	onNotify?: (message: string) => void;
 	onTurn?: (message: string) => Promise<void>;
 	onSetModel?: (model: FakeModel) => Promise<void>;
+	gitExec?: (args: string[]) => Promise<GitResult>;
 }) {
 	const reviewChoices = [...(options.reviewChoices ?? [])];
 	const reviewModelChoices = [...(options.reviewModelChoices ?? [])];
@@ -220,6 +221,10 @@ function fakeRuntime(options: {
 			handlers.set(name, [...(handlers.get(name) ?? []), handler]);
 		},
 		async exec(command: string, args: string[], execOptions?: { cwd?: string }) {
+			if (options.gitExec) {
+				execCalls.push({ command, args, cwd: execOptions?.cwd });
+				return options.gitExec(args);
+			}
 			// Keep the new read-only guards separate from legacy scripted Git results and assertions.
 			if (args.includes("--porcelain=v2")) {
 				preflightCalls.push({ command, args, cwd: execOptions?.cwd });
@@ -469,9 +474,12 @@ const reviewModels = () => [fakeModel("test", "selected"), fakeModel("test", "re
 
 test("final review follows all tasks and task checkpoints with the saved pair, then restores implementation settings", async () => {
 	await withSavedReview(async (directory) => {
+		const result = reviewResult();
+		result.outcome = "fixed";
+		result.minorFixes = [{ path: "README.md", description: "Corrected documentation", verification: ["Read README"] }];
 		const runtime: ReturnType<typeof fakeRuntime> = fakeRuntime({
-			cwd: directory, choices: ["Resume"], models: reviewModels(),
-			gitResults: [gitResult("main\n"), gitResult(), gitResult(), gitResult("", 1), gitResult(), gitResult(), gitResult(), gitResult("", 1), gitResult()],
+			cwd: directory, choices: ["Resume"], models: reviewModels(), reviewResponses: [reviewResponse(result)],
+			gitResults: [gitResult("main\n"), gitResult(), gitResult(), gitResult("", 1), gitResult(), gitResult(), gitResult(), gitResult("", 1), gitResult(), gitResult("main\n"), gitResult(), gitResult(), gitResult("", 1), gitResult()],
 			onTurn: async (message) => {
 				if (!message.startsWith("Perform one final implementation review")) return;
 				const saved = (await loadState(directory))!;
@@ -481,15 +489,17 @@ test("final review follows all tasks and task checkpoints with the saved pair, t
 				assert.equal(saved.reviewStarted, true);
 				assert.equal(saved.reviewResult, undefined);
 				assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 2);
+				await writeFile(join(directory, "README.md"), "Corrected command documentation\n");
+				assert.equal(await readFile(join(directory, "README.md"), "utf8"), "Corrected command documentation\n");
 			},
 		});
 		await runtime.run("implement-tasks", "unused.md");
 		assert.equal(runtime.sent.length, 3);
 		assert.deepEqual(runtime.sentSettings, [{ model: "test/selected", thinkingLevel: "medium" }, { model: "test/selected", thinkingLevel: "medium" }, { model: "test/review", thinkingLevel: "high" }]);
 		assert.deepEqual(runtime.setModelCalls.map(({ id }) => id), ["selected", "review", "selected"]);
-		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 2);
+		assert.deepEqual(runtime.execCalls.filter(({ args }) => args[0] === "commit").map(({ args }) => args[2]), ["Task 1: One", "Task 2: Two", reviewCheckpointMessage]);
 		assert.equal(await loadState(directory), undefined);
-		assert.ok(runtime.notifications.some(({ message }) => message.startsWith("Final review: passed")));
+		assert.ok(runtime.notifications.some(({ message }) => message.startsWith("Final review: fixed")));
 		assertNoRemoteGit([...runtime.execCalls, ...runtime.preflightCalls]);
 	}, { phase: "tasks", nextTaskIndex: 0, checkpoint: true, branchName: "main", tasks: [{ title: "One", prompt: "Implement one" }, { title: "Two", prompt: "Implement two" }] });
 });
@@ -532,7 +542,7 @@ test("review model selection failure is recoverable without executing review or 
 for (const stopReason of ["error", "aborted", "length", "toolUse"]) {
 	test(`review ${stopReason} preserves the review phase and does not claim completion`, async () => {
 		await withSavedReview(async (directory) => {
-			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), turnStopReasons: [stopReason] });
+			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), turnStopReasons: [stopReason], gitResults: [gitResult("main\n")] });
 			await runtime.run("implement-tasks", "unused.md");
 			const saved = (await loadState(directory))!;
 			assert.equal(saved.phase, "review");
@@ -541,21 +551,23 @@ for (const stopReason of ["error", "aborted", "length", "toolUse"]) {
 			assert.equal(runtime.sent.length, 1);
 			assert.deepEqual(runtime.setModelCalls.map(({ id }) => id), ["review"]);
 			assert.ok(!runtime.notifications.some(({ message }) => message.startsWith("Final review: passed")));
-		}, { reviewStarted: true });
+			assert.ok(!runtime.execCalls.some(({ args }) => ["add", "commit"].includes(args[0])));
+		}, { reviewStarted: true, checkpoint: true, branchName: "main" });
 	});
 }
 
 for (const response of [undefined, "Looks good", reviewResponse({ ...reviewResult(), outcome: "fixed" })]) {
 	test(`review stop with invalid output ${String(response).slice(0, 20)} remains recoverable`, async () => {
 		await withSavedReview(async (directory) => {
-			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), reviewResponses: [response] });
+			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), reviewResponses: [response], gitResults: [gitResult("main\n")] });
 			await runtime.run("implement-tasks", "unused.md");
 			const saved = (await loadState(directory))!;
 			assert.equal(saved.status, "failed");
 			assert.equal(saved.phase, "review");
 			assert.equal(saved.reviewResult, undefined);
 			assert.equal(runtime.sent.length, 1);
-		}, { reviewStarted: true });
+			assert.ok(!runtime.execCalls.some(({ args }) => ["add", "commit"].includes(args[0])));
+		}, { reviewStarted: true, checkpoint: true, branchName: "main" });
 	});
 }
 
@@ -563,7 +575,7 @@ test("the final task checkpoint is recovered before threshold-triggered pre-revi
 	await withSavedReview(async (directory) => {
 		const runtime = fakeRuntime({
 			cwd: directory, choices: ["Resume"], models: reviewModels(),
-			gitResults: [gitResult("main\n"), gitResult(), gitResult(), gitResult()],
+			gitResults: [gitResult("main\n"), gitResult(), gitResult(), gitResult(), gitResult("main\n")],
 			contextUsages: [{ tokens: 75, contextWindow: 100, percent: 75 }], compactionOutcomes: ["manual"],
 		});
 		const execution = runtime.run("implement-tasks", "unused.md");
@@ -662,8 +674,9 @@ test("validated review reports verified fixes, unresolved findings, and exact ne
 		result.minorFixes = [{ path: "minor-fix.txt", description: "Corrected a verified text error.", verification: ["Verify corrected text"] }];
 		result.findings = [{ severity: "major", requirement: "Reject invalid input", path: "source.js", evidence: "Inspected source.js:1; validate always accepts input.",
 			reason: null, actionable: true, action: "Add validation and an invalid-input regression test." }];
+		const git = reviewCheckpointGit(directory);
 		const runtime = fakeRuntime({
-			cwd: directory, choices: ["Resume"], models: reviewModels(), reviewResponses: [reviewResponse(result)],
+			cwd: directory, choices: ["Resume"], models: reviewModels(), reviewResponses: [reviewResponse(result)], gitExec: git.exec,
 			onTurn: async () => {
 				await writeFile(join(directory, "minor-fix.txt"), "Corrected text\n");
 				assert.equal(await readFile(join(directory, "minor-fix.txt"), "utf8"), "Corrected text\n");
@@ -682,8 +695,9 @@ test("validated review reports verified fixes, unresolved findings, and exact ne
 		assert.equal(runtime.sent.length, 1);
 		assert.equal(runtime.completeCalls.length, 0);
 		assert.equal(await readFile(join(directory, "minor-fix.txt"), "utf8"), "Corrected text\n");
+		assert.equal(git.commits.length, 1);
 		assert.equal(await loadState(directory), undefined);
-	}, { reviewStarted: true });
+	}, { reviewStarted: true, checkpoint: true, branchName: "main" });
 });
 
 test("invalid remediation artifacts preserve failed review recovery state and never trigger a checkpoint", async () => {
@@ -702,6 +716,216 @@ test("invalid remediation artifacts preserve failed review recovery state and ne
 		assert.ok(!runtime.execCalls.some(({ args }) => ["add", "commit"].includes(args[0])));
 		assert.equal(runtime.sent.length, 1);
 	}, { reviewStarted: true, checkpoint: true, branchName: "main" });
+});
+
+const reviewCheckpointMessage = "Review: apply fixes and record findings";
+function reviewCheckpointGit(directory: string, changed = true) {
+	let head = "baseline";
+	const commits: Array<{ parent: string; message: string }> = [];
+	return {
+		commits,
+		async exec(args: string[]): Promise<GitResult> {
+			if (args[0] === "branch") return gitResult("main\n");
+			if (args[0] === "rev-parse") return gitResult(`${head}\n`);
+			if (args[0] === "log") {
+				const last = commits.at(-1)!;
+				return gitResult(`${last.parent}\n${last.message}\n`);
+			}
+			const saved = (await loadState(directory))!;
+			assert.equal(saved.phase, "review_checkpoint");
+			assert.ok(saved.reviewResult);
+			assert.equal(saved.pendingCheckpoint?.purpose, "review");
+			assert.equal(saved.pendingCheckpoint?.message, reviewCheckpointMessage);
+			assert.equal(saved.pendingCheckpoint?.headBefore, head);
+			if (args[0] === "add") { assert.deepEqual(args, ["add", "-A"]); return gitResult(); }
+			if (args[0] === "reset") { assert.deepEqual(args, UNSTAGE_STATE); return gitResult(); }
+			if (args[0] === "diff") { assert.deepEqual(args, ["diff", "--cached", "--quiet"]); return gitResult("", changed ? 1 : 0); }
+			assert.deepEqual(args, ["commit", "-m", reviewCheckpointMessage]);
+			commits.push({ parent: head, message: args[2] });
+			head = `review-checkpoint-${commits.length}`;
+			return gitResult();
+		},
+	};
+}
+
+for (const changed of [true, false]) {
+	test(`a validated ${changed ? "changed" : "unchanged"} review ${changed ? "creates a separate" : "does not create an empty"} checkpoint`, async () => {
+		await withSavedReview(async (directory) => {
+			const git = reviewCheckpointGit(directory, changed);
+			const result = reviewResult();
+			if (changed) {
+				result.outcome = "fixed";
+				result.checks.push({ area: "tests", check: "Verify review edit", passed: true, evidence: "Read implementation.txt and verified the corrected text." });
+				result.minorFixes = [{ path: "implementation.txt", description: "Corrected text", verification: ["Verify review edit"] }];
+			}
+			const runtime = fakeRuntime({
+				cwd: directory, choices: ["Resume"], models: reviewModels(), gitExec: git.exec, reviewResponses: [reviewResponse(result)],
+				onTurn: async () => {
+					if (changed) {
+						await writeFile(join(directory, "implementation.txt"), "Corrected text\n");
+						assert.equal(await readFile(join(directory, "implementation.txt"), "utf8"), "Corrected text\n");
+					}
+				},
+			});
+			await runtime.run("implement-tasks", "unused.md");
+			assert.equal(runtime.sent.length, 1);
+			assert.equal(git.commits.length, changed ? 1 : 0);
+			assert.equal(git.commits[0]?.message, changed ? reviewCheckpointMessage : undefined);
+			const staging = runtime.execCalls.filter(({ args }) => ["add", "reset", "diff", "commit"].includes(args[0])).map(({ args }) => args);
+			assert.deepEqual(staging, [["add", "-A"], UNSTAGE_STATE, ["diff", "--cached", "--quiet"], ...(changed ? [["commit", "-m", reviewCheckpointMessage]] : [])]);
+			assert.equal(await loadState(directory), undefined);
+			assertNoRemoteGit(runtime.execCalls);
+		}, { checkpoint: true, branchName: "main", reviewStarted: true });
+	});
+}
+
+for (const failure of ["add", "commit", "interrupted change check"] as const) {
+	test(`review checkpoint ${failure} failure resumes without rerunning the completed review`, async () => {
+		await withSavedReview(async (directory) => {
+			const git = reviewCheckpointGit(directory);
+			const failed = fakeRuntime({
+				cwd: directory, choices: ["Resume"], models: reviewModels(),
+				gitExec: async (args) => {
+					if (args[0] === failure) return gitResult("", 1, "Simulated checkpoint failure");
+					if (failure === "interrupted change check" && args[0] === "diff") return { ...gitResult(), killed: true };
+					return git.exec(args);
+				},
+			});
+			await failed.run("implement-tasks", "unused.md");
+			const saved = (await loadState(directory))!;
+			assert.equal(saved.phase, "review_checkpoint");
+			assert.equal(saved.status, "failed");
+			assert.equal(saved.reviewResult?.outcome, "passed");
+			assert.equal(saved.pendingCheckpoint?.purpose, "review");
+			assert.equal(saved.pendingCheckpoint?.headBefore, "baseline");
+			assert.equal(git.commits.length, 0);
+			const resumed = fakeRuntime({ cwd: directory, choices: ["Resume"], models: [fakeModel("test", "selected")], gitExec: git.exec });
+			await resumed.run("implement-plan", "unused.md");
+			assert.deepEqual([...failed.sent, ...resumed.sent], []);
+			assert.equal(git.commits.length, 1);
+			assert.equal(await loadState(directory), undefined);
+			assertNoRemoteGit([...failed.execCalls, ...resumed.execCalls]);
+		}, { checkpoint: true, branchName: "main", reviewStarted: true, reviewResult: reviewResult() });
+	});
+}
+
+test("a finished but unrecorded review checkpoint is recovered without staging later work or duplicating the commit", async () => {
+	await withSavedReview(async (directory) => {
+		const git = reviewCheckpointGit(directory);
+		const interrupted = fakeRuntime({
+			cwd: directory, choices: ["Resume"], models: reviewModels(),
+			gitExec: async (args) => {
+				const result = await git.exec(args);
+				if (args[0] === "commit") throw new Error("Simulated interruption after committing");
+				return result;
+			},
+		});
+		await interrupted.run("implement-tasks", "unused.md");
+		assert.equal(git.commits.length, 1);
+		assert.equal((await loadState(directory))?.pendingCheckpoint?.headBefore, "baseline");
+		await writeFile(join(directory, "external.txt"), "Later external work\n");
+		const resumed = fakeRuntime({ cwd: directory, choices: ["Resume"], models: [fakeModel("test", "selected")], gitExec: git.exec });
+		await resumed.run("implement-tasks", "unused.md");
+		assert.equal(git.commits.length, 1);
+		assert.deepEqual([...interrupted.sent, ...resumed.sent], []);
+		assert.ok(resumed.execCalls.some(({ args }) => args[0] === "log"));
+		assert.ok(!resumed.execCalls.some(({ args }) => ["add", "reset", "diff", "commit"].includes(args[0])));
+		assert.equal(await readFile(join(directory, "external.txt"), "utf8"), "Later external work\n");
+		assert.equal(await loadState(directory), undefined);
+	}, { checkpoint: true, branchName: "main", reviewStarted: true, reviewResult: reviewResult() });
+});
+
+test("review checkpoint recovery preserves its saved message instead of deriving a task message", async () => {
+	const message = "Review: saved checkpoint description";
+	await withSavedReview(async (directory) => {
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], models: [fakeModel("test", "selected")],
+			gitExec: async (args) => {
+				if (args[0] === "branch") return gitResult("main\n");
+				if (args[0] === "rev-parse") return gitResult("baseline\n");
+				if (args[0] === "diff") return gitResult("", 1);
+				return gitResult();
+			},
+		});
+		await runtime.run("implement-tasks", "unused.md");
+		assert.deepEqual(runtime.execCalls.filter(({ args }) => args[0] === "commit").map(({ args }) => args), [["commit", "-m", message]]);
+		assert.deepEqual(runtime.sent, []);
+		assert.equal(await loadState(directory), undefined);
+	}, { phase: "review_checkpoint", checkpoint: true, branchName: "main", reviewResult: reviewResult(), pendingCheckpoint: { purpose: "review", message, headBefore: "baseline" } });
+});
+
+test("review checkpoint recovery refuses an unrelated HEAD without staging", async () => {
+	await withSavedReview(async (directory) => {
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], models: [fakeModel("test", "selected")],
+			gitExec: async (args) => {
+				if (args[0] === "branch") return gitResult("main\n");
+				if (args[0] === "rev-parse") return gitResult("external-head\n");
+				assert.deepEqual(args, ["log", "-1", "--format=%P%n%B"]);
+				return gitResult("baseline\nUnrelated commit\n");
+			},
+		});
+		await runtime.run("implement-tasks", "unused.md");
+		assert.match((await loadState(directory))?.error ?? "", /HEAD changed unexpectedly/);
+		assert.equal((await loadState(directory))?.pendingCheckpoint?.headBefore, "baseline");
+		assert.ok(!runtime.execCalls.some(({ args }) => ["add", "commit"].includes(args[0])));
+		assert.deepEqual(runtime.sent, []);
+	}, { phase: "review_checkpoint", checkpoint: true, branchName: "main", reviewResult: reviewResult(), pendingCheckpoint: { purpose: "review", message: reviewCheckpointMessage, headBefore: "baseline" } });
+});
+
+test("restoration failure after the review checkpoint does not schedule another checkpoint", async () => {
+	await withSavedReview(async (directory) => {
+		const git = reviewCheckpointGit(directory);
+		const failed = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), gitExec: git.exec, setModelOutcomes: [false] });
+		await failed.run("implement-tasks", "unused.md");
+		assert.equal((await loadState(directory))?.phase, "review_checkpoint");
+		assert.equal((await loadState(directory))?.pendingCheckpoint, undefined);
+		assert.equal(git.commits.length, 1);
+		const resumed = fakeRuntime({ cwd: directory, choices: ["Resume"], models: [fakeModel("test", "selected")], gitExec: git.exec });
+		await resumed.run("implement-tasks", "unused.md");
+		assert.equal(git.commits.length, 1);
+		assert.deepEqual(resumed.execCalls.map(({ args }) => args), [["branch", "--show-current"]]);
+		assert.deepEqual([...failed.sent, ...resumed.sent], []);
+		assert.equal(await loadState(directory), undefined);
+	}, { checkpoint: true, branchName: "main", reviewResult: reviewResult() });
+});
+
+test("a branch changed during review stops the review checkpoint before staging", async () => {
+	await withSavedReview(async (directory) => {
+		const git = reviewCheckpointGit(directory);
+		let reviewed = false;
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], models: reviewModels(),
+			onTurn: async () => { reviewed = true; },
+			gitExec: async (args) => args[0] === "branch" && reviewed ? gitResult("unexpected\n") : git.exec(args),
+		});
+		await runtime.run("implement-tasks", "unused.md");
+		assert.equal((await loadState(directory))?.phase, "review_checkpoint");
+		assert.match((await loadState(directory))?.error ?? "", /Cannot checkpoint review: expected local branch/);
+		assert.equal(git.commits.length, 0);
+		assert.ok(!runtime.execCalls.some(({ args }) => args[0] === "add"));
+	}, { checkpoint: true, branchName: "main", reviewStarted: true });
+});
+
+test("review changes in no-Git mode remain uncommitted", async () => {
+	await withSavedReview(async (directory) => {
+		const result = reviewResult();
+		result.outcome = "fixed";
+		result.minorFixes = [{ path: "README.md", description: "Corrected documentation", verification: ["Read README"] }];
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], models: reviewModels(), reviewResponses: [reviewResponse(result)],
+			gitExec: async () => { throw new Error("Git must not be used"); },
+			onTurn: async () => {
+				await writeFile(join(directory, "README.md"), "Corrected documentation\n");
+				assert.equal(await readFile(join(directory, "README.md"), "utf8"), "Corrected documentation\n");
+			},
+		});
+		await runtime.run("implement-tasks", "unused.md");
+		assert.deepEqual(runtime.execCalls, []);
+		assert.equal(runtime.sent.length, 1);
+		assert.equal(await readFile(join(directory, "README.md"), "utf8"), "Corrected documentation\n");
+		assert.equal(await loadState(directory), undefined);
+	});
 });
 
 test("missing source material stops review recoverably before an agent turn", async () => {

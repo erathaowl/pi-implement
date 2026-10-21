@@ -119,6 +119,7 @@ export function createLocalGit(exec: Exec): LocalGit {
 			await unstageState(cwd);
 
 			const stagedChanges = await exec("git", ["diff", "--cached", "--quiet"], { cwd });
+			if (stagedChanges.killed) throw new Error("Git change check failed: command interrupted");
 			if (stagedChanges.code === 0) {
 				return false;
 			}
