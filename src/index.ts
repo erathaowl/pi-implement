@@ -20,8 +20,11 @@ import {
 import {
 	GENERATED_TASKS_FILE,
 	convertPlanToTaskDocument,
-	generatedTasksFileExists,
+	generatedTasksPath,
+	snapshotGeneratedTasks,
+	validatePreparedTaskDocument,
 	writeGeneratedTaskDocument,
+	type PreparedTaskDocument,
 } from "./plan.ts";
 import {
 	STATE_FILE_NAME,
@@ -39,7 +42,9 @@ const PROGRESS_WIDGET = "implement-progress";
 const PROGRESS_TASK_LIMIT = 5;
 const GIT_CHECKPOINT_CHOICE = "Git checkpoints: new or current local branch";
 
-type ExecutionOptions = ImplementationSettings & {
+export type ExecutionOptions = ImplementationSettings & {
+	createBranch: boolean;
+	initiallyDirty: boolean;
 	checkpoint: boolean;
 	automaticCompaction: boolean;
 	compactionThresholdPercent: number;
@@ -333,7 +338,7 @@ async function executeTaskSet(
 	}
 }
 
-async function selectExecutionOptions(
+export async function selectExecutionOptions(
 	previewTitle: string,
 	tasks: TitledTaskList,
 	isRepository: boolean,
@@ -380,14 +385,14 @@ async function selectExecutionOptions(
 	}
 
 	let branchName: string | undefined;
+	let createBranch = false;
 	if (checkpoint) {
 		branchName = (await ctx.ui.input("New local branch name (empty to use current branch)", "feature/task-checkpoints"))?.trim();
 		if (branchName === undefined) {
 			return undefined;
 		}
-		if (branchName) {
-			await git.createBranch(ctx.cwd, branchName);
-		} else {
+		createBranch = Boolean(branchName);
+		if (!branchName) {
 			const confirmed = await ctx.ui.confirm(
 				"Continue on the current branch?",
 				"Git checkpoints will commit changes directly to the current local branch.",
@@ -400,18 +405,43 @@ async function selectExecutionOptions(
 				throw new Error("Cannot start Git checkpoint mode on a detached HEAD. Switch to a local branch and try again.");
 			}
 		}
-		if (initiallyDirty) {
-			await git.commitInitialChanges(ctx.cwd);
-		}
 	}
 
 	return {
 		...implementationSettings,
+		createBranch,
+		initiallyDirty,
 		checkpoint,
 		automaticCompaction: compactionChoice === COMPACTION_ENABLED_CHOICE,
 		compactionThresholdPercent,
 		branchName,
 	};
+}
+
+export async function startExecutionSetup(
+	cwd: string,
+	git: LocalGit,
+	options: ExecutionOptions,
+	ignoreStateFile: boolean,
+	preparedTasks?: PreparedTaskDocument,
+): Promise<void> {
+	if (preparedTasks) {
+		await validatePreparedTaskDocument(cwd, preparedTasks);
+	}
+	if (options.checkpoint) {
+		if (options.createBranch) {
+			await git.createBranch(cwd, options.branchName!);
+		}
+		if (options.initiallyDirty) {
+			await git.commitInitialChanges(cwd);
+		}
+	}
+	if (ignoreStateFile) {
+		await addStateFileToGitignore(cwd);
+	}
+	if (preparedTasks) {
+		await writeGeneratedTaskDocument(cwd, preparedTasks.markdown, preparedTasks);
+	}
 }
 
 function createImplementationState(
@@ -445,6 +475,7 @@ export async function runTasksWorkflow(
 	modelController: ImplementationModelController,
 	ignoreStateFile: boolean,
 	isRepository: boolean,
+	preparedTasks?: PreparedTaskDocument,
 ): Promise<void> {
 	const commandName = "/implement-tasks";
 	report(ctx, commandName, `Indexing tasks in ${input.sourcePath}...`, "info");
@@ -462,9 +493,7 @@ export async function runTasksWorkflow(
 		return;
 	}
 
-	if (ignoreStateFile) {
-		await addStateFileToGitignore(ctx.cwd);
-	}
+	await startExecutionSetup(ctx.cwd, git, options, ignoreStateFile, preparedTasks);
 	const prompts = taskIndex.tasks.map((task, index) => buildTaskFilePrompt(input.sourcePath, index + 1, task));
 	const state = createImplementationState(ctx.cwd, input.sourcePath, taskIndex, prompts, options);
 	await saveState(ctx.cwd, state);
@@ -632,12 +661,15 @@ export default function implementExtension(pi: ExtensionAPI): void {
 					throw new Error("No model is selected.");
 				}
 
-				if (await generatedTasksFileExists(ctx.cwd)) {
+				const destination = await snapshotGeneratedTasks(ctx.cwd);
+				let overwriteApproved = false;
+				if (destination !== null) {
 					const overwrite = await ctx.ui.select(`${GENERATED_TASKS_FILE} already exists. Overwrite it?`, [
 						"Overwrite",
 						"Cancel",
 					]);
-					if (overwrite !== "Overwrite") {
+					overwriteApproved = overwrite === "Overwrite";
+					if (!overwriteApproved) {
 						report(ctx, "/implement-plan", "Plan conversion cancelled.", "info");
 						return;
 					}
@@ -645,8 +677,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 
 				report(ctx, "/implement-plan", `Converting ${input.sourcePath} to ${GENERATED_TASKS_FILE}...`, "info");
 				const markdown = await convertPlanToTaskDocument(input.markdown, ctx);
-				const resolvedPath = await writeGeneratedTaskDocument(ctx.cwd, markdown);
-				report(ctx, "/implement-plan", `Generated ${GENERATED_TASKS_FILE}.`, "info");
+				const resolvedPath = generatedTasksPath(ctx.cwd);
 				await runTasksWorkflow(
 					{ sourcePath: GENERATED_TASKS_FILE, resolvedPath, markdown },
 					ctx,
@@ -655,6 +686,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 					pi,
 					ignoreStateFile,
 					isRepository,
+					{ markdown, destination, overwriteApproved },
 				);
 			}),
 	});

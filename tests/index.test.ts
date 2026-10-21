@@ -7,8 +7,9 @@ import { stripVTControlCharacters } from "node:util";
 import { initTheme, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { getKeybindings } from "@earendil-works/pi-tui";
 import { COMPACTION_ENABLED_CHOICE, DEFAULT_COMPACTION_THRESHOLD_PERCENT } from "../src/compaction.ts";
-import implementExtension, { formatProgress, readMarkdownInput } from "../src/index.ts";
+import implementExtension, { formatProgress, readMarkdownInput, selectExecutionOptions, startExecutionSetup } from "../src/index.ts";
 import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from "../src/state.ts";
+import { snapshotGeneratedTasks } from "../src/plan.ts";
 import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
 
 initTheme("dark");
@@ -298,6 +299,7 @@ function fakeRuntime(options: {
 	implementExtension(pi as never);
 	return {
 		commands,
+		pi,
 		compactCalls,
 		completeCalls,
 		completeSettings,
@@ -1630,6 +1632,59 @@ test("/implement-plan overwrites with confirmation then delegates to the task-fi
 		assert.ok(runtime.sent.every((prompt) => !prompt.includes("Build it.")));
 	});
 });
+
+for (const dirty of [false, true]) {
+	test(`option preparation is read-only for a ${dirty ? "dirty" : "clean"} Git worktree`, async () => {
+		await withTempDir(async (directory) => {
+			const runtime = fakeRuntime({
+				cwd: directory,
+				choices: ["Git checkpoints: new or current local branch"],
+				inputs: ["feature/prepared"],
+			});
+			const mutations: string[] = [];
+			const git = {
+				isRepository: async () => true,
+				isWorkingTreeClean: async () => !dirty,
+				currentBranch: async () => "main",
+				createBranch: async () => { mutations.push("branch"); },
+				commitInitialChanges: async () => { mutations.push("initial commit"); },
+				commitChanges: async () => false,
+			};
+			const options = await selectExecutionOptions("Prepare", { tasks: [{ title: "One" }] }, true,
+				runtime.ctx as never, git, runtime.pi as never);
+			assert.ok(options);
+			assert.equal(options.branchName, "feature/prepared");
+			assert.equal(options.initiallyDirty, dirty);
+			assert.deepEqual(mutations, []);
+			assert.equal(await loadState(directory), undefined);
+			await assert.rejects(readFile(join(directory, ".gitignore")), { code: "ENOENT" });
+			await startExecutionSetup(directory, git, options, false);
+			assert.deepEqual(mutations, dirty ? ["branch", "initial commit"] : ["branch"]);
+		});
+	});
+}
+
+for (const existing of [false, true]) {
+	test(`/implement-plan defers tasks.md writes through indexing and cancellation (existing: ${existing})`, async () => {
+		await withTempDir(async (directory) => {
+			await writeFile(join(directory, "plan.md"), "Plan");
+			if (existing) await writeFile(join(directory, "tasks.md"), "Original tasks\n");
+			await writeFile(join(directory, ".gitignore"), "original-ignore\n");
+			const before = await snapshotGeneratedTasks(directory);
+			const runtime = fakeRuntime({
+				cwd: directory,
+				choices: existing ? ["Overwrite", "Cancel"] : ["Cancel"],
+				modelOutputs: ["## Task 1 - Generated\n", { tasks: [{ title: "Generated" }] }],
+			});
+			await runtime.run("implement-plan", "plan.md");
+			assert.equal(runtime.completeCalls.length, 2);
+			assert.equal(await snapshotGeneratedTasks(directory), before);
+			assert.equal(await readFile(join(directory, ".gitignore"), "utf8"), "original-ignore\n");
+			assert.equal(await loadState(directory), undefined);
+			assert.deepEqual(runtime.sent, []);
+		});
+	});
+}
 
 test("/implement-plan cancellation does not overwrite an existing tasks.md", async () => {
 	await withTempDir(async (directory) => {

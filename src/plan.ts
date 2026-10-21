@@ -1,4 +1,4 @@
-import { stat, writeFile } from "node:fs/promises";
+import { lstat, readFile, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { completeIsolatedText } from "./model.ts";
@@ -51,8 +51,44 @@ export async function generatedTasksFileExists(cwd: string): Promise<boolean> {
 	}
 }
 
-export async function writeGeneratedTaskDocument(cwd: string, markdown: string): Promise<string> {
+export interface PreparedTaskDocument {
+	markdown: string;
+	destination: string | null;
+	overwriteApproved: boolean;
+}
+
+export async function snapshotGeneratedTasks(cwd: string): Promise<string | null> {
+	const path = generatedTasksPath(cwd);
+	try {
+		const info = await lstat(path);
+		if (!info.isFile()) {
+			throw new Error(`${GENERATED_TASKS_FILE} must be a regular file.`);
+		}
+		return JSON.stringify([info.dev, info.ino, info.mtimeMs, info.ctimeMs, await readFile(path, "utf8")]);
+	} catch (error) {
+		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+			return null;
+		}
+		throw error;
+	}
+}
+
+export async function validatePreparedTaskDocument(cwd: string, prepared: PreparedTaskDocument): Promise<void> {
+	if ((prepared.destination !== null && !prepared.overwriteApproved) ||
+		await snapshotGeneratedTasks(cwd) !== prepared.destination) {
+		throw new Error(`${GENERATED_TASKS_FILE} changed or overwrite was not approved. Prepare the workflow again.`);
+	}
+}
+
+export async function writeGeneratedTaskDocument(
+	cwd: string,
+	markdown: string,
+	prepared?: PreparedTaskDocument,
+): Promise<string> {
 	const outputPath = generatedTasksPath(cwd);
+	if (prepared) {
+		await validatePreparedTaskDocument(cwd, prepared);
+	}
 	try {
 		await writeFile(outputPath, markdown, "utf8");
 	} catch {
