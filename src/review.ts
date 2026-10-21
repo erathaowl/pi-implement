@@ -237,6 +237,28 @@ export async function validateReviewArtifacts(cwd: string, result: ReviewResult,
 	if (covered.size !== actionable.size) artifactError("tasks-fixes.md does not cover every actionable finding.");
 }
 
+export function formatReviewResult(result: ReviewResult, cwd: string): string {
+	const lines = [
+		`Final review: ${result.outcome}`,
+		`Checked areas: ${result.reviewedAreas.map((area) => area.replaceAll("_", " ")).join(", ")}`,
+		"Checks performed:",
+		...result.checks.map((check) => `- ${check.passed ? "PASS" : "FAIL"} ${check.check}: ${check.evidence}`),
+		`Applied minor fixes: ${result.minorFixes.length ? "" : "none"}`,
+		...result.minorFixes.map((fix) => `- ${fix.path}: ${fix.description} (verified by: ${fix.verification.join(", ")})`),
+		`Unresolved findings: ${result.findings.length ? "" : "none"}`,
+	];
+	for (const finding of result.findings) {
+		lines.push(`- [${finding.severity}] ${finding.requirement}${finding.path ? ` (${finding.path})` : ""}: ${finding.evidence}`);
+		if (finding.reason) lines.push(`  Unable to verify: ${finding.reason}`);
+		if (finding.action) lines.push(`  Follow-up: ${finding.action}`);
+	}
+	lines.push(`Unverified checks: ${result.unavailableChecks.length ? "" : "none"}`,
+		...result.unavailableChecks.map((check) => `- ${check.check}: ${check.reason}`));
+	if (result.remediationGenerated) lines.push("Generated remediation files:", ...REMEDIATION_FILES.map((file) => `- ${resolve(cwd, file)}`), "Generated tasks were not executed.");
+	else lines.push("New remediation files: none (existing files were left untouched).");
+	return lines.join("\n");
+}
+
 export async function executeReview(executor: ActiveSessionExecutor, sources: ReviewSources, cwd: string): Promise<ReviewResult> {
 	const prompt = buildReviewPrompt(sources);
 	const before = await captureReviewArtifacts(cwd);

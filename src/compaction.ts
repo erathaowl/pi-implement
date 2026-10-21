@@ -24,7 +24,7 @@ export async function compactIfNeeded(
 	ctx: CompactionContext,
 	enabled: boolean,
 	thresholdPercent: number,
-	nextTaskNumber: number,
+	nextStep: number | "final review",
 	force = false,
 	beforeCompact?: () => Promise<void>,
 ): Promise<void> {
@@ -41,10 +41,9 @@ export async function compactIfNeeded(
 		percent = usage.percent;
 	}
 
+	const target = typeof nextStep === "number" ? `task ${nextStep}` : nextStep;
 	ctx.ui.setWorkingMessage(
-		percent === null
-			? `Compact context before task ${nextTaskNumber}`
-			: `Compact context before task ${nextTaskNumber} (${percent}%)`,
+		percent === null ? `Compact context before ${target}` : `Compact context before ${target} (${percent}%)`,
 	);
 	try {
 		await beforeCompact?.();

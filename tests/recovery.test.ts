@@ -209,6 +209,20 @@ test("version-2 schema encodes review, review checkpoint, and completion explici
 	}
 });
 
+test("review start and pending compaction metadata distinguish pre-review recovery from a completed review", () => {
+	const state = {
+		...taskState("/project"), phase: "review", nextTaskIndex: 1, originalPlanPath: "plan.md",
+		review: { enabled: true, model: { provider: "review", id: "model" }, thinkingLevel: "high" },
+	};
+	for (const candidate of [{ ...state, pendingCompaction: true }, { ...state, reviewStarted: true }, { ...state, reviewStarted: true, reviewResult }]) {
+		assert.deepEqual(validateState(candidate), candidate);
+	}
+	for (const overrides of [
+		{ reviewStarted: "yes" }, { reviewStarted: true, pendingCompaction: true },
+		{ reviewResult, pendingCompaction: true }, { reviewResult, reviewStarted: false },
+	]) assert.throws(() => validateState({ ...state, ...overrides }), /Invalid implementation state/);
+});
+
 test("review result metadata is validated before it can be restored", () => {
 	const state = {
 		...taskState("/project"), phase: "review", nextTaskIndex: 1, originalPlanPath: "plan.md",

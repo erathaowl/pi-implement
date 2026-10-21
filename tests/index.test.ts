@@ -11,6 +11,7 @@ import implementExtension, { formatProgress, readMarkdownInput, selectExecutionO
 import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from "../src/state.ts";
 import { snapshotGeneratedTasks } from "../src/plan.ts";
 import { PREFERENCES_FILE_NAME, loadReviewPreference, saveReviewPreference } from "../src/preferences.ts";
+import { REVIEW_RESULT_START, REVIEW_RESULT_END, SOURCE_PLAN_COMPLIANCE_CHECK, type ReviewResult } from "../src/review.ts";
 import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
 
 initTheme("dark");
@@ -86,6 +87,21 @@ async function withReviewPreferences(run: (agentDir: string) => Promise<void>): 
 	}
 }
 
+function reviewResult(noPlan = false): ReviewResult {
+	return {
+		outcome: noPlan ? "blocked" : "passed", reviewedAreas: ["plan_compliance", "tests", "documentation"],
+		checks: [
+			{ area: "plan_compliance", check: "Read requirements", passed: true, evidence: "Inspected tasks.md and the available source material against implementation files." },
+			{ area: "tests", check: "npm test", passed: true, evidence: "Inspected tests and observed all tests passing, exit code 0." },
+			{ area: "documentation", check: "Read README", passed: true, evidence: "Compared README.md usage with the implemented command." },
+		], minorFixes: [], findings: [], remediationGenerated: false,
+		unavailableChecks: noPlan ? [{ area: "plan_compliance", check: SOURCE_PLAN_COMPLIANCE_CHECK, reason: "No original source plan was supplied." }] : [],
+	};
+}
+function reviewResponse(result: ReviewResult): string {
+	return `${REVIEW_RESULT_START}\n${JSON.stringify(result)}\n${REVIEW_RESULT_END}`;
+}
+
 function fakeRuntime(options: {
 	cwd: string;
 	choices?: string[];
@@ -112,10 +128,15 @@ function fakeRuntime(options: {
 	reviewChoices?: Array<string | undefined>;
 	reviewModelChoices?: Array<string | undefined>;
 	reviewThinkingChoices?: Array<string | undefined>;
+	reviewResponses?: Array<string | undefined>;
+	onNotify?: (message: string) => void;
+	onTurn?: (message: string) => Promise<void>;
+	onSetModel?: (model: FakeModel) => Promise<void>;
 }) {
 	const reviewChoices = [...(options.reviewChoices ?? [])];
 	const reviewModelChoices = [...(options.reviewModelChoices ?? [])];
 	const reviewThinkingChoices = [...(options.reviewThinkingChoices ?? [])];
+	const reviewResponses = [...(options.reviewResponses ?? [])];
 	const promptTitles: string[] = [];
 	const commands = new Map<string, Handler>();
 	const handlers = new Map<string, Handler[]>();
@@ -163,6 +184,7 @@ function fakeRuntime(options: {
 	const thresholdInputs = [...(options.thresholdInputs ?? [])];
 	const sessionHistory = [{ role: "user", content: "existing context" }];
 	const pendingTurnReasons: string[] = [];
+	const pendingTurnText: Array<string | undefined> = [];
 
 	const emit = async (name: string, event: unknown = {}) => {
 		for (const handler of handlers.get(name) ?? []) {
@@ -171,6 +193,8 @@ function fakeRuntime(options: {
 	};
 
 	const settleTurn = async (override?: string) => {
+		const text = pendingTurnText.shift();
+		await options.onTurn?.(sent[sent.length - 1]);
 		const queuedStopReason = pendingTurnReasons.shift();
 		const stopReason = override ?? queuedStopReason ?? "stop";
 		await emit("agent_start", { type: "agent_start" });
@@ -181,6 +205,7 @@ function fakeRuntime(options: {
 					role: "assistant",
 					stopReason,
 					errorMessage: stopReason === "error" ? "provider failed" : undefined,
+					content: text === undefined ? undefined : [{ type: "text", text }],
 				},
 			],
 		});
@@ -222,12 +247,16 @@ function fakeRuntime(options: {
 			sent.push(message);
 			sentSettings.push({ model: `${currentModel.provider}/${currentModel.id}`, thinkingLevel: currentThinkingLevel });
 			pendingTurnReasons.push(stopReasons.shift() ?? "stop");
+			pendingTurnText.push(message.startsWith("Perform one final implementation review")
+				? reviewResponses.length ? reviewResponses.shift() : reviewResponse(reviewResult(message.includes("No source plan was supplied")))
+				: undefined);
 			if (!options.manualTurns) {
 				queueMicrotask(() => void settleTurn());
 			}
 		},
 		async setModel(model: FakeModel) {
 			setModelCalls.push(model);
+			await options.onSetModel?.(model);
 			const outcome = setModelOutcomes.shift() ?? true;
 			if (outcome instanceof Error) throw outcome;
 			if (outcome) currentModel = model;
@@ -273,6 +302,7 @@ function fakeRuntime(options: {
 		},
 		ui: {
 			notify(message: string, type?: string) {
+				options.onNotify?.(message);
 				notifications.push({ message, type });
 			},
 			async custom(factory: Parameters<ExtensionUIContext["custom"]>[0]) {
@@ -385,6 +415,7 @@ function fakeRuntime(options: {
 		widgets,
 		workingMessages,
 		settleTurn,
+		emit,
 		async run(command: string, argument: string) {
 			const handler = commands.get(command);
 			assert.ok(handler, `/${command} should be registered`);
@@ -418,6 +449,271 @@ function savedState(cwd: string, overrides: Partial<Omit<ImplementationState, "p
 		...(pendingCheckpoint ? { pendingCheckpoint: typeof pendingCheckpoint === "boolean" ? { purpose: "task", message: `Task ${overrides.nextTaskIndex ?? 1}: One` } : pendingCheckpoint } : {}),
 	};
 }
+
+async function withSavedReview(
+	run: (directory: string, state: ImplementationState) => Promise<void>,
+	overrides: Partial<ImplementationState> = {},
+): Promise<void> {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "## Task 1 - One\n## Task 2 - Two\n## Task 3 - Three\n");
+		await writeFile(join(directory, "plan.md"), "# Original requirements\n");
+		const state = savedState(directory, {
+			phase: "review", nextTaskIndex: 3, originalPlanPath: "plan.md",
+			review: { enabled: true, model: { provider: "test", id: "review" }, thinkingLevel: "high" }, ...overrides,
+		});
+		await saveState(directory, state);
+		await run(directory, state);
+	});
+}
+const reviewModels = () => [fakeModel("test", "selected"), fakeModel("test", "review")];
+
+test("final review follows all tasks and task checkpoints with the saved pair, then restores implementation settings", async () => {
+	await withSavedReview(async (directory) => {
+		const runtime: ReturnType<typeof fakeRuntime> = fakeRuntime({
+			cwd: directory, choices: ["Resume"], models: reviewModels(),
+			gitResults: [gitResult("main\n"), gitResult(), gitResult(), gitResult("", 1), gitResult(), gitResult(), gitResult(), gitResult("", 1), gitResult()],
+			onTurn: async (message) => {
+				if (!message.startsWith("Perform one final implementation review")) return;
+				const saved = (await loadState(directory))!;
+				assert.equal(saved.phase, "review");
+				assert.equal(saved.nextTaskIndex, 2);
+				assert.equal(saved.pendingCheckpoint, undefined);
+				assert.equal(saved.reviewStarted, true);
+				assert.equal(saved.reviewResult, undefined);
+				assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 2);
+			},
+		});
+		await runtime.run("implement-tasks", "unused.md");
+		assert.equal(runtime.sent.length, 3);
+		assert.deepEqual(runtime.sentSettings, [{ model: "test/selected", thinkingLevel: "medium" }, { model: "test/selected", thinkingLevel: "medium" }, { model: "test/review", thinkingLevel: "high" }]);
+		assert.deepEqual(runtime.setModelCalls.map(({ id }) => id), ["selected", "review", "selected"]);
+		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 2);
+		assert.equal(await loadState(directory), undefined);
+		assert.ok(runtime.notifications.some(({ message }) => message.startsWith("Final review: passed")));
+		assertNoRemoteGit([...runtime.execCalls, ...runtime.preflightCalls]);
+	}, { phase: "tasks", nextTaskIndex: 0, checkpoint: true, branchName: "main", tasks: [{ title: "One", prompt: "Implement one" }, { title: "Two", prompt: "Implement two" }] });
+});
+
+for (const failure of ["task", "checkpoint", "final checkpoint"] as const) {
+	test(`a failed ${failure} prevents final review`, async () => {
+		await withSavedReview(async (directory) => {
+			const runtime = fakeRuntime({
+				cwd: directory, choices: ["Resume"], models: reviewModels(),
+				turnStopReasons: failure === "task" ? ["error"] : [],
+				gitResults: [gitResult("main\n"), gitResult("", 1, "checkpoint staging failed")],
+			});
+			await runtime.run("implement-tasks", "unused.md");
+			assert.ok(!runtime.sent.some((message) => message.startsWith("Perform one final implementation review")));
+			assert.ok(!runtime.setModelCalls.some(({ id }) => id === "review"));
+			const saved = (await loadState(directory))!;
+			assert.equal(saved.status, "failed");
+			assert.equal(saved.phase, "tasks");
+			assert.equal(saved.reviewStarted, undefined);
+			assert.equal(saved.reviewResult, undefined);
+		}, { phase: "tasks", nextTaskIndex: failure === "final checkpoint" ? 3 : 0, checkpoint: true, branchName: "main",
+			...(failure === "final checkpoint" ? { pendingCheckpoint: { purpose: "task", message: "Task 3: Three" } } : {}) });
+	});
+}
+
+test("review model selection failure is recoverable without executing review or substituting settings", async () => {
+	await withSavedReview(async (directory) => {
+		const failed = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), setModelOutcomes: [false] });
+		await failed.run("implement-tasks", "unused.md");
+		assert.deepEqual(failed.sent, []);
+		assert.match((await loadState(directory))?.error ?? "", /Cannot use review model.*selection failed/);
+		assert.equal((await loadState(directory))?.reviewStarted, true);
+		const resumed = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels() });
+		await resumed.run("implement-plan", "unused.md");
+		assert.deepEqual(resumed.sentSettings, [{ model: "test/review", thinkingLevel: "high" }]);
+		assert.equal(await loadState(directory), undefined);
+	}, { reviewStarted: true });
+});
+
+for (const stopReason of ["error", "aborted", "length", "toolUse"]) {
+	test(`review ${stopReason} preserves the review phase and does not claim completion`, async () => {
+		await withSavedReview(async (directory) => {
+			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), turnStopReasons: [stopReason] });
+			await runtime.run("implement-tasks", "unused.md");
+			const saved = (await loadState(directory))!;
+			assert.equal(saved.phase, "review");
+			assert.equal(saved.status, "failed");
+			assert.equal(saved.reviewResult, undefined);
+			assert.equal(runtime.sent.length, 1);
+			assert.deepEqual(runtime.setModelCalls.map(({ id }) => id), ["review"]);
+			assert.ok(!runtime.notifications.some(({ message }) => message.startsWith("Final review: passed")));
+		}, { reviewStarted: true });
+	});
+}
+
+for (const response of [undefined, "Looks good", reviewResponse({ ...reviewResult(), outcome: "fixed" })]) {
+	test(`review stop with invalid output ${String(response).slice(0, 20)} remains recoverable`, async () => {
+		await withSavedReview(async (directory) => {
+			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), reviewResponses: [response] });
+			await runtime.run("implement-tasks", "unused.md");
+			const saved = (await loadState(directory))!;
+			assert.equal(saved.status, "failed");
+			assert.equal(saved.phase, "review");
+			assert.equal(saved.reviewResult, undefined);
+			assert.equal(runtime.sent.length, 1);
+		}, { reviewStarted: true });
+	});
+}
+
+test("the final task checkpoint is recovered before threshold-triggered pre-review compaction", async () => {
+	await withSavedReview(async (directory) => {
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], models: reviewModels(),
+			gitResults: [gitResult("main\n"), gitResult(), gitResult(), gitResult()],
+			contextUsages: [{ tokens: 75, contextWindow: 100, percent: 75 }], compactionOutcomes: ["manual"],
+		});
+		const execution = runtime.run("implement-tasks", "unused.md");
+		await waitFor(() => runtime.compactCalls.length === 1);
+		const pending = (await loadState(directory))!;
+		assert.equal(pending.phase, "review");
+		assert.equal(pending.pendingCheckpoint, undefined);
+		assert.equal(pending.pendingCompaction, true);
+		assert.equal(pending.reviewStarted, undefined);
+		assert.deepEqual(runtime.sent, []);
+		assert.deepEqual(runtime.setModelCalls.map(({ id }) => id), ["selected"]);
+		assert.ok(runtime.workingMessages.includes("Compact context before final review (75%)"));
+		runtime.compactCalls[0].onComplete?.({});
+		await execution;
+		assert.equal(runtime.sent.length, 1);
+		assert.equal(await loadState(directory), undefined);
+	}, { phase: "tasks", checkpoint: true, branchName: "main", automaticCompaction: true, compactionThresholdPercent: 60, pendingCheckpoint: { purpose: "task", message: "Task 3: Three" } });
+});
+
+test("interrupted pre-review compaction resumes forcibly before the review turn", async () => {
+	await withSavedReview(async (directory) => {
+		const failed = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), compactionOutcomes: ["error"], contextUsages: [{ tokens: 80, contextWindow: 100, percent: 80 }] });
+		await failed.run("implement-tasks", "unused.md");
+		assert.equal((await loadState(directory))?.pendingCompaction, true);
+		assert.deepEqual(failed.sent, []);
+		const resumed = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), compactionOutcomes: ["manual"], contextUsages: [{ tokens: 0, contextWindow: 100, percent: 0 }] });
+		const execution = resumed.run("implement-plan", "unused.md");
+		await waitFor(() => resumed.compactCalls.length === 1);
+		assert.equal(resumed.contextUsageCalls, 0);
+		assert.deepEqual(resumed.sent, []);
+		resumed.compactCalls[0].onComplete?.({});
+		await execution;
+		assert.equal(resumed.sent.length, 1);
+		assert.equal(await loadState(directory), undefined);
+	}, { automaticCompaction: true });
+});
+
+test("an interrupted review retries the review only, without repeating tasks or pre-review compaction", async () => {
+	await withSavedReview(async (directory) => {
+		const interrupted = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), manualTurns: true });
+		const execution = interrupted.run("implement-tasks", "unused.md");
+		await waitFor(() => interrupted.sent.length === 1);
+		assert.equal((await loadState(directory))?.reviewStarted, true);
+		await interrupted.emit("session_shutdown");
+		await execution;
+		assert.equal((await loadState(directory))?.status, "failed");
+		assert.equal((await loadState(directory))?.reviewResult, undefined);
+		const resumed = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), contextUsages: [{ tokens: 99, contextWindow: 100, percent: 99 }] });
+		await resumed.run("implement-tasks", "unused.md");
+		assert.equal(resumed.sent.length, 1);
+		assert.equal(resumed.contextUsageCalls, 0);
+		assert.equal(resumed.compactCalls.length, 0);
+		assert.equal(await loadState(directory), undefined);
+	});
+});
+
+for (const failure of ["restoration", "reporting"] as const) {
+	test(`a completed review is saved before ${failure} failure and is not rerun on resume`, async () => {
+		await withSavedReview(async (directory) => {
+			let resultWasDurable = false;
+			const failed = fakeRuntime({
+				cwd: directory, choices: ["Resume"], models: reviewModels(),
+				setModelOutcomes: failure === "restoration" ? [true, false] : undefined,
+				onSetModel: async (model) => {
+					if (model.id === "selected") resultWasDurable = (await loadState(directory))?.reviewResult?.outcome === "passed";
+				},
+				onNotify: (message) => { if (failure === "reporting" && message.startsWith("Final review:")) throw new Error("Report rendering failed"); },
+			});
+			await failed.run("implement-tasks", "unused.md");
+			assert.equal(resultWasDurable, true);
+			const saved = (await loadState(directory))!;
+			assert.equal(saved.reviewResult?.outcome, "passed");
+			assert.equal(saved.phase, failure === "restoration" ? "review" : "completed");
+			assert.equal(saved.status, "failed");
+			assert.equal(failed.sent.length, 1);
+			// The review model may now be unavailable: only implementation restoration and cleanup remain.
+			const resumed = fakeRuntime({ cwd: directory, choices: ["Resume"], models: [fakeModel("test", "selected")] });
+			await resumed.run("implement-plan", "unused.md");
+			assert.deepEqual(resumed.sent, []);
+			assert.equal(resumed.compactCalls.length, 0);
+			assert.equal(resumed.completeCalls.length, 0);
+			assert.ok(resumed.notifications.some(({ message }) => message.startsWith("Final review: passed")));
+			assert.equal(await loadState(directory), undefined);
+		}, { reviewStarted: true });
+	});
+}
+
+test("validated review reports verified fixes, unresolved findings, and exact new remediation paths without executing generated tasks", async () => {
+	await withSavedReview(async (directory) => {
+		await writeFile(join(directory, "minor-fix.txt"), "Original text\n");
+		await writeFile(join(directory, "source.js"), "export const validate = () => true;\n");
+		const result = reviewResult();
+		result.outcome = "follow_up";
+		result.remediationGenerated = true;
+		result.checks.push({ area: "tests", check: "Verify corrected text", passed: true, evidence: "Read minor-fix.txt after correction; it matched the expected text." });
+		result.minorFixes = [{ path: "minor-fix.txt", description: "Corrected a verified text error.", verification: ["Verify corrected text"] }];
+		result.findings = [{ severity: "major", requirement: "Reject invalid input", path: "source.js", evidence: "Inspected source.js:1; validate always accepts input.",
+			reason: null, actionable: true, action: "Add validation and an invalid-input regression test." }];
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], models: reviewModels(), reviewResponses: [reviewResponse(result)],
+			onTurn: async () => {
+				await writeFile(join(directory, "minor-fix.txt"), "Corrected text\n");
+				assert.equal(await readFile(join(directory, "minor-fix.txt"), "utf8"), "Corrected text\n");
+				assert.match(await readFile(join(directory, "source.js"), "utf8"), /validate = \(\) => true/);
+				const fields = `Requirement: Reject invalid input\nPath: "source.js"\nRemedy: Add validation and an invalid-input regression test.\nAcceptance criteria:\n- Invalid input is rejected.\nVerification:\n- Run the invalid-input regression test.\n`;
+				await writeFile(join(directory, "plan-fixes.md"), `# Remediation plan\n## Finding 1 - Validate input\n${fields}Context: The API currently accepts invalid input.\nSeverity: major\nEvidence: Inspected source.js:1; validate always accepts input.\nExpected behavior: Invalid input is rejected.\nConstraints: Preserve valid input behavior.\n`);
+				await writeFile(join(directory, "tasks-fixes.md"), `# Remediation tasks\nRead plan-fixes.md.\n## Task 1 - Add validation\nFinding: 1\n${fields}Action: Implement validation and its regression test.\n`);
+			},
+		});
+		await runtime.run("implement-tasks", "unused.md");
+		const final = runtime.notifications.find(({ message }) => message.startsWith("Final review: follow_up"));
+		assert.ok(final);
+		assert.equal(final.type, "warning");
+		for (const expected of ["Checked areas: plan compliance, tests, documentation", "Corrected a verified text error", "Verify corrected text", "[major] Reject invalid input", "Inspected source.js:1", "Add validation and an invalid-input regression test.",
+			resolve(directory, "plan-fixes.md"), resolve(directory, "tasks-fixes.md"), "Generated tasks were not executed."]) assert.ok(final.message.includes(expected), expected);
+		assert.equal(runtime.sent.length, 1);
+		assert.equal(runtime.completeCalls.length, 0);
+		assert.equal(await readFile(join(directory, "minor-fix.txt"), "utf8"), "Corrected text\n");
+		assert.equal(await loadState(directory), undefined);
+	}, { reviewStarted: true });
+});
+
+test("invalid remediation artifacts preserve failed review recovery state and never trigger a checkpoint", async () => {
+	await withSavedReview(async (directory) => {
+		const result = reviewResult();
+		result.outcome = "follow_up";
+		result.remediationGenerated = true;
+		result.findings = [{ severity: "major", requirement: "Required behavior", path: "source.js", evidence: "Inspected the missing guard.", reason: null, actionable: true, action: "Add the missing guard." }];
+		const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels(), gitResults: [gitResult("main\n")], reviewResponses: [reviewResponse(result)] });
+		await runtime.run("implement-tasks", "unused.md");
+		const saved = (await loadState(directory))!;
+		assert.equal(saved.phase, "review");
+		assert.equal(saved.status, "failed");
+		assert.equal(saved.reviewResult, undefined);
+		assert.match(saved.error ?? "", /plan-fixes.md is required/);
+		assert.ok(!runtime.execCalls.some(({ args }) => ["add", "commit"].includes(args[0])));
+		assert.equal(runtime.sent.length, 1);
+	}, { reviewStarted: true, checkpoint: true, branchName: "main" });
+});
+
+test("missing source material stops review recoverably before an agent turn", async () => {
+	await withSavedReview(async (directory) => {
+		await rm(join(directory, "plan.md"));
+		const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], models: reviewModels() });
+		await runtime.run("implement-tasks", "unused.md");
+		assert.deepEqual(runtime.sent, []);
+		assert.match((await loadState(directory))?.error ?? "", /File not found: plan.md/);
+		assert.equal((await loadState(directory))?.phase, "review");
+	}, { reviewStarted: true });
+});
 
 for (const { command, reference } of [
 	{ command: "implement-tasks", reference: "reference.md" },
@@ -481,7 +777,7 @@ for (const { command, reference } of [
 	});
 }
 
-test("both commands propose the last review pair confirmed in another project without switching implementation settings", async () => {
+test("both commands propose the last confirmed review pair and restore implementation settings after review", async () => {
 	await withReviewPreferences(async (agentDir) => {
 		const reviewModel = fakeModel("test", "review");
 		for (const command of ["implement-tasks", "implement-plan"]) {
@@ -489,6 +785,7 @@ test("both commands propose the last review pair confirmed in another project wi
 				await writeFile(join(directory, "tasks.md"), "Tasks\n");
 				await writeFile(join(directory, "plan.md"), "# Plan\n");
 				const before = await loadReviewPreference(agentDir);
+				let reviewState: ImplementationState | undefined;
 				const runtime = fakeRuntime({
 					cwd: directory, choices: command === "implement-plan" ? ["Overwrite"] : [],
 					inputs: command === "implement-tasks" ? [""] : [],
@@ -500,15 +797,19 @@ test("both commands propose the last review pair confirmed in another project wi
 						assert.deepEqual(await loadReviewPreference(agentDir), before);
 						assert.equal(await loadState(directory), undefined);
 					},
+					onTurn: async (message) => {
+						if (message.startsWith("Perform one final implementation review")) reviewState = await loadState(directory);
+					},
 				});
 				await runtime.run(command, command === "implement-plan" ? "plan.md" : "tasks.md");
-				const state = (await loadState(directory))!;
+				const state = reviewState!;
 				assert.deepEqual(state.review, { enabled: true, model: { provider: "test", id: "review" }, thinkingLevel: "high" });
 				assert.equal(state.phase, "review");
 				assert.equal(state.reviewResult, undefined);
-				assert.equal(runtime.sent.length, 1);
-				assert.deepEqual(runtime.setModelCalls.map(({ id }) => id), ["selected"]);
-				assert.deepEqual(runtime.sentSettings, [{ model: "test/selected", thinkingLevel: "medium" }]);
+				assert.equal(runtime.sent.length, 2);
+				assert.deepEqual(runtime.setModelCalls.map(({ id }) => id), ["selected", "review", "selected"]);
+				assert.deepEqual(runtime.sentSettings, [{ model: "test/selected", thinkingLevel: "medium" }, { model: "test/review", thinkingLevel: "high" }]);
+				assert.equal(await loadState(directory), undefined);
 				assert.deepEqual(await loadReviewPreference(agentDir), { model: { provider: "test", id: "review" }, thinkingLevel: "high" });
 				if (command === "implement-plan") {
 					assert.equal(runtime.selections.find(({ title }) => title.startsWith("Review model"))?.choices[0], "test/review");

@@ -16,6 +16,7 @@ import { createLocalGit, type LocalGit } from "./git.ts";
 import { assertFileUnchanged, snapshotFile } from "./files.ts";
 import {
 	applyImplementationSettings,
+	applyReviewSettings,
 	assertImplementationSettings,
 	assertReviewSettingsAvailable,
 	selectImplementationSettings,
@@ -41,6 +42,7 @@ import {
 	type ReviewSettings,
 } from "./state.ts";
 import { saveReviewPreference, selectPreferredReviewSettings } from "./preferences.ts";
+import { executeReview, formatReviewResult } from "./review.ts";
 import { buildTaskFilePrompt, indexTaskFile } from "./tasks.ts";
 import { confirmExecutionSummary, selectTaskAction } from "./preview.ts";
 export { formatPreview } from "./preview.ts";
@@ -238,6 +240,69 @@ async function saveFailure(
 	}
 }
 
+async function finishWorkflow(
+	commandName: string,
+	ctx: ExtensionCommandContext,
+	state: ImplementationState,
+	modelController: ImplementationModelController,
+): Promise<void> {
+	if (state.pendingCheckpoint || state.pendingCompaction) throw new Error("Cannot finish while a checkpoint or compaction is pending.");
+	if (state.review.enabled) {
+		if (!state.reviewResult) throw new Error("Cannot finish before a validated review result is saved.");
+		await applyImplementationSettings(state, ctx, modelController);
+	}
+	state.phase = "completed";
+	state.status = "running";
+	delete state.error;
+	await saveState(ctx.cwd, state);
+	if (state.reviewResult) {
+		report(ctx, commandName, formatReviewResult(state.reviewResult, ctx.cwd),
+			state.reviewResult.outcome === "passed" || state.reviewResult.outcome === "fixed" ? "info" : "warning");
+	} else report(ctx, commandName, "Implementation complete.", "info");
+	await deleteState(ctx.cwd);
+}
+
+async function executeReviewPhase(
+	commandName: string,
+	ctx: ExtensionCommandContext,
+	executor: ActiveSessionExecutor,
+	state: ImplementationState,
+	modelController: ImplementationModelController,
+): Promise<void> {
+	try {
+		if (state.phase !== "review" || !state.review.enabled || state.nextTaskIndex !== state.tasks.length || state.pendingCheckpoint) {
+			throw new Error("Cannot start final review before all tasks and task checkpoints complete.");
+		}
+		if (!state.reviewResult) {
+			if (!state.reviewStarted) {
+				await compactIfNeeded(ctx, state.automaticCompaction, state.compactionThresholdPercent, "final review",
+					state.pendingCompaction === true, async () => {
+						state.pendingCompaction = true;
+						await saveState(ctx.cwd, state);
+					});
+				delete state.pendingCompaction;
+			}
+			// Persist the start before model switching or submitting an interruptible agent turn.
+			state.reviewStarted = true;
+			state.status = "running";
+			delete state.error;
+			await saveState(ctx.cwd, state);
+			await readMarkdownInput(state.sourcePath, ctx.cwd, commandName);
+			if (state.originalPlanPath) await readSourcePlanInput(state.originalPlanPath, ctx.cwd, commandName);
+			await applyReviewSettings(state.review, ctx, modelController);
+			ctx.ui.setWorkingMessage("Final implementation review");
+			state.reviewResult = await executeReview(executor, state, ctx.cwd);
+			// A completed, validated review must survive restoration, reporting, or cleanup failure.
+			await saveState(ctx.cwd, state);
+		}
+		await finishWorkflow(commandName, ctx, state, modelController);
+	} catch (error) {
+		await saveFailure(ctx, commandName, state, state.nextTaskIndex, error);
+	} finally {
+		ctx.ui.setWorkingMessage();
+	}
+}
+
 async function executeTaskSet(
 	commandName: string,
 	progressTitle: string,
@@ -247,11 +312,6 @@ async function executeTaskSet(
 	state: ImplementationState,
 	modelController: ImplementationModelController,
 ): Promise<void> {
-	if (state.phase === "completed") {
-		await deleteState(ctx.cwd);
-		report(ctx, commandName, "Implementation complete.", "info");
-		return;
-	}
 	if (state.phase !== "tasks") throw new Error(`Cannot execute tasks during phase ${state.phase}.`);
 	const tasks = { tasks: state.tasks };
 	const statuses: TaskStatus[] = state.tasks.map((_, index) =>
@@ -270,7 +330,7 @@ async function executeTaskSet(
 		}
 	}
 
-	if (state.pendingCompaction || (recoveringCheckpoint && state.nextTaskIndex < state.tasks.length)) {
+	if (state.nextTaskIndex < state.tasks.length && (state.pendingCompaction || recoveringCheckpoint)) {
 		try {
 			await compactIfNeeded(
 				ctx,
@@ -361,14 +421,10 @@ async function executeTaskSet(
 	try {
 		state.phase = state.review.enabled ? "review" : "completed";
 		await saveState(ctx.cwd, state);
-		if (state.phase !== "completed") {
-			report(ctx, commandName, "Final review execution is not available yet. Recovery state was preserved.", "error");
-			return;
-		}
-		await deleteState(ctx.cwd);
-		report(ctx, commandName, "Implementation complete.", "info");
+		if (state.phase === "review") await executeReviewPhase(commandName, ctx, executor, state, modelController);
+		else await finishWorkflow(commandName, ctx, state, modelController);
 	} catch (error) {
-		report(ctx, commandName, error instanceof Error ? error.message : String(error), "error");
+		await saveFailure(ctx, commandName, state, state.nextTaskIndex, error);
 	}
 }
 
@@ -668,7 +724,7 @@ async function handleExistingState(
 		);
 	}
 
-	assertReviewSettingsAvailable(state.review, ctx);
+	if (!state.reviewResult && state.phase !== "completed") assertReviewSettingsAvailable(state.review, ctx);
 	if (state.phase === "setup") {
 		try {
 			await startExecutionSetup(ctx.cwd, git, state);
@@ -687,18 +743,20 @@ async function handleExistingState(
 		}
 	}
 
-	if (state.phase === "review" || state.phase === "review_checkpoint") {
-		report(ctx, requestedCommand, "Final review execution is not available yet. Recovery state was preserved.", "error");
+	if (state.phase === "review_checkpoint") {
+		report(ctx, requestedCommand, "Review checkpoint recovery is not available yet. Recovery state was preserved.", "error");
 		return true;
 	}
 	try {
-		await applyImplementationSettings(state, ctx, modelController);
+		if (state.phase === "tasks" || (state.phase === "review" && !state.reviewStarted && !state.reviewResult)) {
+			await applyImplementationSettings(state, ctx, modelController);
+		}
+		if (state.phase === "tasks") await executeTaskSet("/implement-tasks", "Task-file implementation", ctx, executor, git, state, modelController);
+		else if (state.phase === "review") await executeReviewPhase(requestedCommand, ctx, executor, state, modelController);
+		else await finishWorkflow(requestedCommand, ctx, state, modelController);
 	} catch (error) {
 		await saveFailure(ctx, requestedCommand, state, state.nextTaskIndex, error);
-		return true;
 	}
-
-	await executeTaskSet("/implement-tasks", "Task-file implementation", ctx, executor, git, state, modelController);
 	return true;
 }
 

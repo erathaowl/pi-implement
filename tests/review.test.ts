@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { ActiveSessionExecutor } from "../src/executor.ts";
 import {
 	REVIEW_RESULT_START, REVIEW_RESULT_END, SOURCE_PLAN_COMPLIANCE_CHECK,
-	buildReviewPrompt, executeReview, parseReviewResult, validateReviewResult, type ReviewResult,
+	buildReviewPrompt, executeReview, formatReviewResult, parseReviewResult, validateReviewResult, type ReviewResult,
 } from "../src/review.ts";
 
 const sources = { sourcePath: "tasks.md", originalPlanPath: "original plan.md" };
@@ -65,6 +65,30 @@ test("review source paths are encoded as data and invalid paths fail before exec
 	assert.ok(buildReviewPrompt({ sourcePath, originalPlanPath: null }).includes(JSON.stringify({ taskFile: sourcePath, sourcePlan: null })));
 	assert.throws(() => buildReviewPrompt({ sourcePath: "" }), /valid task/);
 	assert.throws(() => buildReviewPrompt({ sourcePath: "tasks.md", originalPlanPath: " " }), /valid task/);
+});
+
+test("final reporting distinguishes outcomes, fixes, findings, verification limitations, and stale remediation files", () => {
+	const passed = formatReviewResult(passedResult(), "/project");
+	assert.match(passed, /Final review: passed/);
+	assert.match(passed, /Checked areas: plan compliance, tests, documentation/);
+	assert.match(passed, /PASS npm test: Ran npm test/);
+	assert.match(passed, /Applied minor fixes: none/);
+	assert.match(passed, /Unresolved findings: none/);
+	assert.match(passed, /Unverified checks: none/);
+	assert.match(passed, /New remediation files: none \(existing files were left untouched\)/);
+	const fixed = passedResult();
+	fixed.outcome = "fixed";
+	fixed.minorFixes = [{ description: "Fixed input handling", path: "src/index.ts", verification: ["npm test"] }];
+	assert.match(formatReviewResult(fixed, "/project"), /src\/index.ts: Fixed input handling \(verified by: npm test\)/);
+	const blocked = passedResult();
+	blocked.outcome = "blocked";
+	blocked.findings = [{ ...finding("unable_to_verify"), actionable: false, action: null }];
+	blocked.unavailableChecks = [{ area: "tests", check: "Integration test", reason: "No database is available." }];
+	const report = formatReviewResult(blocked, "/project");
+	assert.match(report, /Final review: blocked/);
+	assert.match(report, /\[unable_to_verify\]/);
+	assert.match(report, /Unable to verify: The required integration environment is unavailable\./);
+	assert.match(report, /Integration test: No database is available\./);
 });
 
 test("a bounded result is parsed with evidence for all three areas", () => {

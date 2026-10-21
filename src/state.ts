@@ -53,6 +53,7 @@ export interface ImplementationState extends CommonState {
 	preparedTasks?: PreparedTaskDocument;
 	review: ReviewSettings;
 	reviewResult?: ReviewResult;
+	reviewStarted?: boolean;
 	pendingCheckpoint?: PendingCheckpoint;
 }
 
@@ -149,6 +150,10 @@ export function validateState(value: unknown): ImplementationState {
 			(setup.gitignore !== undefined && (!record(setup.gitignore) || !nullableText(setup.gitignore.before) || !text(setup.gitignore.content))) ||
 			(s.phase === "setup" ? setup.step === "done" : setup.step !== "done")) invalid();
 	}
+	if (s.reviewStarted !== undefined && (typeof s.reviewStarted !== "boolean" || !s.review.enabled ||
+		!["review", "review_checkpoint", "completed"].includes(String(s.phase)) ||
+		(s.reviewStarted && s.pendingCompaction) || (s.reviewStarted === false && s.reviewResult))) invalid();
+	if (s.reviewResult !== undefined && s.pendingCompaction) invalid();
 	if ((s.phase === "setup" && (!s.setup || s.nextTaskIndex !== 0)) ||
 		((s.phase === "review" || s.phase === "review_checkpoint") && (!s.review.enabled || s.nextTaskIndex !== s.tasks.length)) ||
 		(s.phase === "review_checkpoint" && !s.reviewResult) ||
