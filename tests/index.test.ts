@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -7,7 +7,7 @@ import { stripVTControlCharacters } from "node:util";
 import { initTheme, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { getKeybindings } from "@earendil-works/pi-tui";
 import { COMPACTION_ENABLED_CHOICE, DEFAULT_COMPACTION_THRESHOLD_PERCENT } from "../src/compaction.ts";
-import implementExtension, { formatProgress, readMarkdownInput, selectExecutionOptions, startExecutionSetup } from "../src/index.ts";
+import implementExtension, { formatProgress, readMarkdownInput, selectExecutionOptions, selectSourcePlan, startExecutionSetup } from "../src/index.ts";
 import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from "../src/state.ts";
 import { snapshotGeneratedTasks } from "../src/plan.ts";
 import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
@@ -373,6 +373,7 @@ function savedState(cwd: string, overrides: Partial<Omit<ImplementationState, "p
 		review: { enabled: false },
 		cwd: resolve(cwd),
 		sourcePath: "tasks.md",
+		originalPlanPath: null,
 		tasks: [
 			{ title: "One", prompt: "saved prompt one" },
 			{ title: "Two", prompt: "saved prompt two" },
@@ -534,6 +535,134 @@ for (const command of ["implement-tasks", "implement-plan"]) {
 	});
 }
 
+for (const command of ["implement-tasks", "implement-plan"]) {
+	test(`${command} saves and restores source provenance without adding review-disabled prompts`, async () => {
+		await withTempDir(async (directory) => {
+			await mkdir(join(directory, "documents"));
+			await writeFile(join(directory, "documents", "original plan.md"), "# Original requirements\n");
+			await writeFile(join(directory, "tasks.md"), "# Authoritative tasks\n");
+			const runtime = fakeRuntime({
+				cwd: directory,
+				choices: command === "implement-plan" ? ["Overwrite"] : [],
+				modelOutputs: command === "implement-plan" ? ["## Task 1 - Generated\n", { tasks: [{ title: "Generated" }] }] : undefined,
+				turnStopReasons: ["error"],
+			});
+			await runtime.run(command, command === "implement-plan" ? " documents/original plan.md " : "tasks.md");
+			const state = (await loadState(directory))!;
+			assert.equal(state.sourcePath, "tasks.md");
+			assert.equal(state.originalPlanPath, command === "implement-plan" ? "documents/original plan.md" : null);
+			assert.ok(!runtime.inputPrompts.some(({ title }) => title.startsWith("Optional reference plan")));
+			const resumed = fakeRuntime({ cwd: directory, choices: ["Resume"], turnStopReasons: ["error"] });
+			await resumed.run("implement-tasks", "unused.md");
+			const summary = resumed.selections.find(({ title }) => title.startsWith("Execution summary"));
+			assert.ok(summary);
+			assert.ok(summary.title.includes(`Command: /${command}`));
+			assert.ok(summary.title.includes(`Source plan: ${state.originalPlanPath ?? "None"}`));
+			assert.ok(summary.title.includes("Task file: tasks.md"));
+			assert.equal((await loadState(directory))?.originalPlanPath, state.originalPlanPath);
+			assert.equal(resumed.completeCalls.length, 0);
+			assert.equal(resumed.inputPrompts.length, 0);
+		});
+	});
+}
+
+for (const path of ["reference.md", "reference.MARKDOWN", "", "   ", undefined]) {
+	test(`review-enabled task source selection handles ${JSON.stringify(path)}`, async () => {
+		await withTempDir(async (directory) => {
+			await writeFile(join(directory, "reference.md"), "# Requirements\n");
+			await writeFile(join(directory, "reference.MARKDOWN"), "# Requirements\n");
+			await writeFile(join(directory, "plan.md"), "Do not infer this plan.\n");
+			const runtime = fakeRuntime({ cwd: directory, inputs: path === undefined ? [] : [path] });
+			const source = await selectSourcePlan(true, runtime.ctx as never);
+			assert.equal(runtime.inputPrompts.length, 1);
+			if (path === undefined) assert.equal(source, undefined);
+			else if (!path.trim()) assert.equal(source, null);
+			else {
+				assert.equal(source?.sourcePath, path);
+				assert.equal(source?.resolvedPath, join(directory, path));
+				assert.equal(source?.markdown, "# Requirements\n");
+			}
+			assert.equal(await loadState(directory), undefined);
+			assert.deepEqual(runtime.execCalls, []);
+			assert.deepEqual(runtime.sent, []);
+		});
+	});
+}
+
+for (const alias of [false, true]) {
+	test(`/implement-plan preserves an input that ${alias ? "aliases" : "is"} tasks.md`, async () => {
+		await withTempDir(async (directory) => {
+			await writeFile(join(directory, "tasks.md"), "# Original plan\n");
+			if (alias) await link(join(directory, "tasks.md"), join(directory, "plan.md"));
+			const runtime = fakeRuntime({ cwd: directory, choices: ["Overwrite"] });
+			await runtime.run("implement-plan", alias ? "plan.md" : "./tasks.md");
+			assert.equal(await readFile(join(directory, "tasks.md"), "utf8"), "# Original plan\n");
+			assert.equal(runtime.completeCalls.length, 0);
+			assert.ok(runtime.notifications.some(({ message }) => message.includes("source plan must be separate")));
+			assert.equal(await loadState(directory), undefined);
+		});
+	});
+}
+
+test("source-plan selection retains an existing plan and never prompts when review is disabled", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "plan.md"), "# Requirements\n");
+		const input = await readMarkdownInput("plan.md", directory, "/implement-plan");
+		const runtime = fakeRuntime({ cwd: directory });
+		assert.equal(await selectSourcePlan(false, runtime.ctx as never), null);
+		assert.equal(await selectSourcePlan(true, runtime.ctx as never, input), input);
+		assert.equal(await selectSourcePlan(false, runtime.ctx as never, input), input);
+		assert.deepEqual(runtime.inputPrompts, []);
+	});
+});
+
+for (const [path, error] of [
+	["missing.md", /File not found/], ["folder.md", /not a file/],
+	["empty.md", /empty/], ["reference.txt", /Markdown file/], ["binary.md", /Markdown text/],
+] as const) {
+	test(`source-plan validation rejects ${path} without mutation`, async () => {
+		await withTempDir(async (directory) => {
+			await mkdir(join(directory, "folder.md"));
+			await writeFile(join(directory, "empty.md"), " \n");
+			await writeFile(join(directory, "reference.txt"), "# Requirements\n");
+			await writeFile(join(directory, "binary.md"), "Binary\0data");
+			const runtime = fakeRuntime({ cwd: directory, inputs: [path] });
+			await assert.rejects(selectSourcePlan(true, runtime.ctx as never), error);
+			assert.equal(await loadState(directory), undefined);
+			await runtime.run("implement-plan", path);
+			assert.ok(runtime.notifications.some(({ type, message }) => type === "error" && error.test(message)));
+			assert.equal(runtime.completeCalls.length, 0);
+			await assert.rejects(readFile(join(directory, "tasks.md")), { code: "ENOENT" });
+		});
+	});
+}
+
+for (const supplied of [false, true]) {
+	test(`review recovery retains ${supplied ? "an explicitly selected plan" : "explicit plan absence"} without re-prompting`, async () => {
+		await withTempDir(async (directory) => {
+			await writeFile(join(directory, "reference.md"), "# Requirements\n");
+			const preparation = fakeRuntime({ cwd: directory, inputs: [supplied ? "reference.md" : ""] });
+			const input = await selectSourcePlan(true, preparation.ctx as never);
+			assert.notEqual(input, undefined);
+			const state = savedState(directory, {
+				phase: "review", nextTaskIndex: 3, originalPlanPath: input?.sourcePath ?? null,
+				review: { enabled: true, model: { provider: "test", id: "selected" }, thinkingLevel: "high" },
+			});
+			await saveState(directory, state);
+			const resumed = fakeRuntime({ cwd: directory, choices: ["Resume"] });
+			await resumed.run("implement-plan", "unused.md");
+			const summary = resumed.selections.find(({ title }) => title.startsWith("Execution summary"));
+			assert.ok(summary);
+			assert.match(summary.title, /Command: \/implement-tasks/);
+			assert.ok(summary.title.includes(`Source plan: ${supplied ? "reference.md" : "None"}`));
+			if (!supplied) assert.match(summary.title, /original-plan compliance cannot be independently verified/);
+			assert.equal((await loadState(directory))?.sourcePath, "tasks.md");
+			assert.equal((await loadState(directory))?.originalPlanPath, supplied ? "reference.md" : null);
+			assert.deepEqual(resumed.inputPrompts, []);
+		});
+	});
+}
+
 test("version-1 workflows resume pending checkpoints and compaction without review prompts", async () => {
 	await withTempDir(async (directory) => {
 		const { phase: _phase, review: _review, ...common } = savedState(directory);
@@ -574,6 +703,8 @@ test("interrupted plan setup resumes its saved branch and generated Markdown wit
 		assert.equal(interrupted.setup?.step, "initial_checkpoint");
 		assert.equal(interrupted.pendingCheckpoint?.purpose, "initial");
 		assert.equal(interrupted.preparedTasks?.markdown, "## Task 1 - Generated\n");
+		assert.equal(interrupted.originalPlanPath, "plan.md");
+		assert.equal(interrupted.sourcePath, "tasks.md");
 		await assert.rejects(readFile(join(directory, "tasks.md")), { code: "ENOENT" });
 		const resumed = fakeRuntime({
 			cwd: directory, choices: ["Resume"], currentBranch: "feature/setup",
@@ -582,6 +713,7 @@ test("interrupted plan setup resumes its saved branch and generated Markdown wit
 		await resumed.run("implement-plan", "missing.md");
 		assert.equal(resumed.completeCalls.length, 0);
 		assert.equal(resumed.execCalls.some(({ args }) => args[0] === "switch"), false);
+		assert.ok(resumed.selections.some(({ title }) => title.startsWith("Execution summary") && title.includes("Source plan: plan.md")));
 		assert.equal(resumed.sent.length, 1);
 		assert.equal(await readFile(join(directory, "tasks.md"), "utf8"), "## Task 1 - Generated\n");
 		assert.equal(await loadState(directory), undefined);

@@ -110,6 +110,30 @@ export async function readMarkdownInput(
 	return { sourcePath, resolvedPath, markdown };
 }
 
+async function readSourcePlanInput(argument: string, cwd: string, commandName: string): Promise<MarkdownInput> {
+	if (!/\.(?:md|markdown)$/i.test(argument.trim())) {
+		throw new Error("Source plan must be a Markdown file (.md or .markdown).");
+	}
+	const input = await readMarkdownInput(argument, cwd, commandName);
+	if (input.markdown.includes("\0")) {
+		throw new Error(`Source plan must contain Markdown text: ${input.sourcePath}`);
+	}
+	return input;
+}
+
+export async function selectSourcePlan(
+	reviewEnabled: boolean,
+	ctx: ExtensionCommandContext,
+	sourcePlan?: MarkdownInput,
+): Promise<MarkdownInput | null | undefined> {
+	if (sourcePlan) return sourcePlan;
+	if (!reviewEnabled) return null;
+	const path = await ctx.ui.input("Optional reference plan for final review (blank for task-file-only review)", "path/to/plan.md");
+	if (path === undefined) return undefined;
+	if (!path.trim()) return null;
+	return readSourcePlanInput(path, ctx.cwd, "/implement-tasks");
+}
+
 async function requestMarkdownInput(
 	argument: string,
 	ctx: ExtensionCommandContext,
@@ -121,7 +145,9 @@ async function requestMarkdownInput(
 	if (!sourcePath?.trim()) {
 		return undefined;
 	}
-	return readMarkdownInput(sourcePath, ctx.cwd, commandName);
+	return commandName === "/implement-plan"
+		? readSourcePlanInput(sourcePath, ctx.cwd, commandName)
+		: readMarkdownInput(sourcePath, ctx.cwd, commandName);
 }
 
 function report(
@@ -435,6 +461,7 @@ function createImplementationState(
 		review: { enabled: false },
 		cwd: resolve(cwd),
 		sourcePath,
+		originalPlanPath: null,
 		tasks: tasks.tasks.map((task, index) => ({ title: task.title, prompt: prompts[index] })),
 		nextTaskIndex: 0,
 		status: "running",
@@ -480,6 +507,12 @@ export async function runTasksWorkflow(
 
 	const prompts = taskIndex.tasks.map((task, index) => buildTaskFilePrompt(input.sourcePath, index + 1, task));
 	const state = createImplementationState(ctx.cwd, input.sourcePath, taskIndex, prompts, options);
+	const referencePlan = await selectSourcePlan(state.review.enabled, ctx, sourcePlan);
+	if (referencePlan === undefined) {
+		report(ctx, commandName, "Implementation cancelled.", "info");
+		return;
+	}
+	state.originalPlanPath = referencePlan?.sourcePath ?? null;
 	const baseBranch = gitSnapshot?.match(/^# branch.head (.*)$/m)?.[1];
 	const baseHead = gitSnapshot?.match(/^# branch.oid (.*)$/m)?.[1];
 	if (isRepository && (baseBranch === undefined || baseHead === undefined)) {
@@ -501,10 +534,10 @@ export async function runTasksWorkflow(
 		...options,
 		command: commandName,
 		cwd: state.cwd,
-		sourcePlanPath: sourcePlan?.sourcePath ?? null,
+		sourcePlanPath: state.originalPlanPath,
 		sourcePath: input.sourcePath,
 		taskCount: taskIndex.tasks.length,
-		review: { enabled: false },
+		review: state.review,
 		preparedTasks: preparedTasks ? { overwrite: preparedTasks.destination !== null } : undefined,
 		ignoreStateFile,
 	}, ctx);
@@ -520,7 +553,7 @@ export async function runTasksWorkflow(
 	if (isRepository && await git.preflightSnapshot(ctx.cwd) !== gitSnapshot) {
 		throw new Error("Git branch, HEAD, or working-tree status changed during preparation. Prepare the workflow again.");
 	}
-	for (const source of [preparedTasks ? undefined : input, sourcePlan]) {
+	for (const source of [preparedTasks ? undefined : input, referencePlan]) {
 		if (source && await readFile(source.resolvedPath, "utf8") !== source.markdown) {
 			throw new Error(`${source.sourcePath} changed during preparation. Prepare the workflow again.`);
 		}
@@ -551,7 +584,9 @@ function formatRestorePrompt(state: ImplementationState): string {
 	const taskNumber = Math.min(state.nextTaskIndex + 1, state.tasks.length);
 	const lines = [
 		"Unfinished implementation found",
-		"Workflow: /implement-tasks",
+		`Workflow: ${state.preparedTasks ? "/implement-plan" : "/implement-tasks"}`,
+		`Source plan: ${state.originalPlanPath ?? "None"}`,
+		`Task file: ${state.sourcePath}`,
 		`Task: ${taskNumber}/${state.tasks.length}`,
 		`Status: ${state.status}`,
 		`Phase: ${state.phase}`,
@@ -596,8 +631,8 @@ async function handleExistingState(
 
 	if (!await confirmExecutionSummary({
 		...state,
-		command: "/implement-tasks",
-		sourcePlanPath: null,
+		command: state.preparedTasks ? "/implement-plan" : "/implement-tasks",
+		sourcePlanPath: state.originalPlanPath ?? null,
 		taskCount: state.tasks.length,
 		createBranch: state.phase === "setup" && state.setup?.step === "branch" && state.setup.createBranch === true,
 		initiallyDirty: state.phase === "setup" && state.setup?.initialCheckpoint === true &&
@@ -731,6 +766,10 @@ export default function implementExtension(pi: ExtensionAPI): void {
 				const destination = await snapshotGeneratedTasks(ctx.cwd);
 				let overwriteApproved = false;
 				if (destination !== null) {
+					const [planFile, taskFile] = await Promise.all([stat(input.resolvedPath), stat(generatedTasksPath(ctx.cwd))]);
+					if (planFile.dev === taskFile.dev && planFile.ino === taskFile.ino) {
+						throw new Error("The source plan must be separate from tasks.md so the original plan remains available for review.");
+					}
 					const overwrite = await ctx.ui.select(`${GENERATED_TASKS_FILE} already exists. Overwrite it?`, [
 						"Overwrite",
 						"Cancel",

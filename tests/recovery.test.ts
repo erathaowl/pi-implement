@@ -20,7 +20,7 @@ function runGit(cwd: string, args: string[]): string {
 }
 function taskState(cwd: string): ImplementationState {
 	return {
-		version: 2, phase: "tasks", review: { enabled: false }, cwd, sourcePath: "tasks.md",
+		version: 2, phase: "tasks", review: { enabled: false }, cwd, sourcePath: "tasks.md", originalPlanPath: null,
 		tasks: [{ title: "One", prompt: "Read tasks.md and implement task 1." }],
 		nextTaskIndex: 0, status: "running", checkpoint: true, branchName: "feature/implementation",
 		automaticCompaction: true, compactionThresholdPercent: 70,

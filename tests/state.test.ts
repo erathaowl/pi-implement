@@ -18,6 +18,7 @@ const state: ImplementationState = {
 	review: { enabled: false },
 	cwd: "/project",
 	sourcePath: "tasks.md",
+	originalPlanPath: null,
 	tasks: [{ title: "One", prompt: "Implement one" }],
 	nextTaskIndex: 0,
 	status: "running",
@@ -140,6 +141,32 @@ test("state validation rejects invalid implementation settings and compaction th
 			{ compactionThresholdPercent: 70.5 },
 		]) {
 			await writeFile(join(directory, STATE_FILE_NAME), JSON.stringify({ ...state, ...overrides }), "utf8");
+			await assert.rejects(loadState(directory), /Invalid implementation state/);
+		}
+	});
+});
+
+test("old states without provenance load with explicit absence rather than guessing a plan", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "plan.md"), "# Unrelated plan\n");
+		const { originalPlanPath: _plan, ...withoutProvenance } = state;
+		for (const version of [1, 2]) {
+			const raw = JSON.stringify({ ...withoutProvenance, version });
+			await writeFile(join(directory, STATE_FILE_NAME), raw);
+			const loaded = (await loadState(directory))!;
+			assert.equal(loaded.originalPlanPath, null);
+			assert.equal(loaded.sourcePath, "tasks.md");
+			assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), raw);
+			await saveState(directory, loaded);
+			assert.equal(JSON.parse(await readFile(join(directory, STATE_FILE_NAME), "utf8")).originalPlanPath, null);
+		}
+	});
+});
+
+test("state validation rejects malformed source-plan paths", async () => {
+	await withTempDir(async (directory) => {
+		for (const originalPlanPath of ["", "   ", 42, {}]) {
+			await writeFile(join(directory, STATE_FILE_NAME), JSON.stringify({ ...state, originalPlanPath }));
 			await assert.rejects(loadState(directory), /Invalid implementation state/);
 		}
 	});

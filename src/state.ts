@@ -139,6 +139,7 @@ export function validateState(value: unknown): ImplementationState {
 		return {
 			...common,
 			version: 2,
+			originalPlanPath: null,
 			phase: legacy.nextTaskIndex === legacy.tasks.length && !pendingCheckpoint ? "completed" : "tasks",
 			review: { enabled: false },
 			...(pendingCheckpoint ? { pendingCheckpoint: { purpose: "task", message: `Task ${legacy.nextTaskIndex}: ${title}` } } : {}),
@@ -176,7 +177,7 @@ export function validateState(value: unknown): ImplementationState {
 			(pending.purpose === "task" && (s.phase !== "tasks" || s.nextTaskIndex === 0)) ||
 			(pending.purpose === "review" && s.phase !== "review_checkpoint")) invalid();
 	}
-	return s as unknown as ImplementationState;
+	return { ...s, originalPlanPath: s.originalPlanPath ?? null } as unknown as ImplementationState;
 }
 
 export async function loadState(cwd: string): Promise<ImplementationState | undefined> {
@@ -194,11 +195,11 @@ export async function loadState(cwd: string): Promise<ImplementationState | unde
 	}
 }
 export async function saveState(cwd: string, state: ImplementationState): Promise<void> {
-	validateState(state);
+	const validated = validateState(state);
 	const path = await statePath(cwd);
 	const temporaryPath = `${path}.tmp`;
 	try {
-		await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+		await writeFile(temporaryPath, `${JSON.stringify(validated, null, 2)}\n`, "utf8");
 		await rename(temporaryPath, path);
 	} catch {
 		throw new Error(`Unable to save ${STATE_FILE_NAME}.`);

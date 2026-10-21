@@ -51,6 +51,9 @@ export function formatExecutionSummary(summary: ExecutionSummary): string {
 			`Review thinking: ${summary.review.thinkingLevel}`,
 			"Review scope: plan compliance, tests, and documentation",
 		);
+		if (summary.sourcePlanPath === null) {
+			lines.push("Review limitation: No source plan supplied; original-plan compliance cannot be independently verified.");
+		}
 	}
 	if (summary.preparedTasks) {
 		lines.push(`tasks.md: ${summary.preparedTasks.overwrite ? "Overwrite existing file (approved)" : "Create generated task file"}`);
