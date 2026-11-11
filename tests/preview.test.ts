@@ -323,3 +323,18 @@ test("RPC non-Git preview keeps its existing option order", async () => {
 	await selectTaskAction("Implement tasks", { tasks: manyTasks }, ["Implement", "Cancel"], 0, ctx);
 	assert.deepEqual(selectedOptions, ["Implement", "Cancel"]);
 });
+
+test("paused recovery summary displays the task and reason immediately after its heading", async () => {
+	const paused = { ...summary, pausedTask: { taskNumber: 4, reason: "User authorization is required." } };
+	const dialog = openDialog((ctx) => confirmExecutionSummary(paused, ctx, true));
+	assert.match(dialog.render(100).map((line) => line.trimEnd()).join("\n"), /^Execution summary\nPaused task 4: User authorization is required\./);
+	dialog.input("\r");
+	assert.equal(await dialog.result, false);
+	let received = "";
+	const confirmed = await confirmExecutionSummary(paused, {
+		mode: "rpc", hasUI: true,
+		ui: { select: async (title: string, choices: string[]) => { received = title; assert.deepEqual(choices, ["Cancel", "Resume"]); return "Resume"; } },
+	} as unknown as ExtensionCommandContext, true);
+	assert.equal(confirmed, true);
+	assert.match(received, /^Execution summary\nPaused task 4: User authorization is required\./);
+});

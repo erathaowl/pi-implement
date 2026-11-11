@@ -108,7 +108,27 @@ Before final confirmation, preparation does not create branches, stage/commit fi
 
 After confirmation, setup intent and prepared Markdown are saved, deferred Git setup and file writes run, and tasks execute sequentially in the active session. The implementation pair stays fixed through all tasks; review settings apply only at the final review stage. The extension waits for the full agent lifecycle, including tools and retries, to settle before advancing.
 
-Only a normal `stop` marks an implementation task complete. Failure, truncation, cancellation, or another terminal reason stops execution and preserves recovery state. Review additionally requires a valid structured result and any required remediation artifacts; `stop` alone is not review success. Preparation does not rewrite source requirements; execution and review are tool-enabled and can change project files.
+An implementation task completes only after the agent lifecycle settles successfully with `stop` and its final assistant text contains one valid task-completion result for that task. A bare `stop` is insufficient. Failure, truncation, cancellation, or another unsuccessful terminal reason stops execution and preserves recovery state. Review keeps its separate structured-result and artifact checks. Preparation does not rewrite source requirements; execution and review are tool-enabled and can change project files.
+
+### Authorization waits and unconfirmed completion
+
+While a blocking extension UI prompt is open, the current task stays active and shows **Waiting for user authorization**. Closing or approving the dialog lets Pi continue the same turn; it does not submit a duplicate task prompt. Ordinary mentions of permission and arbitrary tool errors do not identify an active authorization dialog.
+
+Task prompts require the final assistant message to end with exactly one result block, with the current one-based task number:
+
+```text
+<<<PI_IMPLEMENT_TASK_RESULT>>>
+{"status":"completed","taskNumber":1}
+<<<END_PI_IMPLEMENT_TASK_RESULT>>>
+```
+
+The agent must report `completed` only after implementing and checking that task. When user action is still required, it reports `waiting_for_user` instead, optionally with a short `reason` (1–500 characters). The reason is allowed only for `waiting_for_user`. Missing, malformed, duplicate, or wrong-task results leave completion unconfirmed. Text in tool results or earlier assistant messages cannot establish completion.
+
+A successfully settled turn reporting `waiting_for_user` pauses with type `approval_required`; an invalid or absent result pauses with type `completion_unconfirmed`. Both show **paused** progress, retain the unfinished task index, and stop before a success checkpoint, compaction, another task, or final review. Pause metadata stores a bounded, non-sensitive summary rather than raw model or tool inputs. Task completion is model-reported; the extension validates the result contract, not the truth of every completion claim.
+
+Resolve the required action or inspect the partial work, then explicitly run `/implement-tasks` or `/implement-plan` and choose **Resume** in both recovery dialogs. The pause reason appears in each dialog. The continuation tells the agent to inspect existing changes and verification results, finish outstanding work, and avoid repeating completed side effects. Saved model/thinking, source paths, task index, and Git settings are retained. Refused or still-required authorization pauses again; there is no automatic retry or permission grant.
+
+Authorization remains controlled by your permission extension. Pi 0.85.1 exposes no stable permission-specific `tool_result` field; arbitrary `isError` values and error wording are not classified as authorization denials. The conservative final-result rule applies when no identifiable permission signal is available. The dialog and result checks do not bypass permission rules.
 
 ### Local Git checkpoints
 
@@ -229,7 +249,7 @@ Active implementations are tracked in a single repository-local state file:
 
 Inside a Git repository, new workflows ask whether this file should be added to the repository-root `.gitignore`, with **Yes** as the default. Outside Git, the state file is still used but `.gitignore` is not created or modified.
 
-Version-2 state records the explicit phase (`setup`, `tasks`, `review`, `review_checkpoint`, or `completed`), deferred setup intent, prepared generated Markdown, source paths, task progress, implementation/review settings, validated review result, and pending checkpoint/compaction metadata. Writes are atomic; Git checkpoints exclude recovery metadata even if it is not ignored. Version-1 state migrates in memory with review disabled, retaining task and pending-operation progress without new review prompts.
+Version-2 state records the explicit phase (`setup`, `tasks`, `review`, `review_checkpoint`, or `completed`), deferred setup intent, prepared generated Markdown, source paths, task progress, implementation/review settings, validated review result, status (`running`, `failed`, or `paused`), optional pause type/reason, and pending checkpoint/compaction metadata. Writes are atomic; Git checkpoints exclude recovery metadata even if it is not ignored. Version-1 state migrates in memory with review disabled, retaining task and pending-operation progress without new review prompts.
 
 If unfinished state exists, starting any implementation command offers:
 
@@ -237,7 +257,7 @@ If unfinished state exists, starting any implementation command offers:
 - **Discard and start new**
 - **Cancel**
 
-Resume shows its own mandatory summary, then uses saved work directly without reconversion, reindexing, or model-selection prompts. It restores the exact settings needed for the remaining phase; unavailable models or incompatible thinking levels stop recovery with a clear error. A reviewer model is not required again after its validated result has been saved.
+Resume shows its own mandatory summary, then uses saved work without reconversion, reindexing, or model-selection prompts. A paused task receives the continuation described above; its original stored task prompt and task index remain intact until completion. It restores the exact settings needed for the remaining phase; unavailable models or incompatible thinking levels stop recovery with a clear error. A reviewer model is not required again after its validated result has been saved.
 
 Interrupted tasks or reviews without a validated completion marker may be retried. Completed tasks are not rerun for checkpoint/compaction failure, and a saved completed review is not rerun for checkpoint, restoration, reporting, or cleanup failure. Pending checkpoints use their saved purpose, message, and parent HEAD; already-finished commits are not duplicated. Deferred setup also recognizes completed branch creation/file writes/checkpoints instead of blindly repeating destructive operations.
 
@@ -245,7 +265,7 @@ After review and any review checkpoint succeed, the implementation pair is resto
 
 Resume must be started from the same resolved working directory as the original workflow. The current local branch must match the saved checkpoint branch or repository setup assumption, including implementation-only runs configured inside Git. The extension does not change either automatically.
 
-The state file is deleted only after all selected phases and required artifact validation/checkpoints complete. It is preserved after failure or interruption. A valid final `follow_up`/`blocked` report can finish the workflow with outstanding work for a separately initiated run.
+The state file is deleted only after all selected phases and required artifact validation/checkpoints complete. It is preserved after a pause, failure, or interruption. A valid final `follow_up`/`blocked` report can finish the workflow with outstanding work for a separately initiated run.
 
 ## Scope
 
@@ -282,5 +302,7 @@ git push origin HEAD --follow-tags
 npm test
 npm run typecheck
 ```
+
+On cloud machines with a protected `/tmp/.git` marker, run `TMPDIR=/var/tmp npm test` so temporary fixtures are outside that marker; allow writes to that temporary directory if the command sandbox requires it.
 
 The full test suite includes isolated local Git repositories and creates temporary commits; run it only when those operations are permitted. No test needs a remote. See [VALIDATION.md](VALIDATION.md) for acceptance coverage, the Windows 11/Linux manual UI matrix, and validation status. Automated component rendering is not a substitute for real-terminal smoke checks.

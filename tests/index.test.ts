@@ -12,7 +12,7 @@ import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from 
 import { snapshotGeneratedTasks } from "../src/plan.ts";
 import { PREFERENCES_FILE_NAME, loadImplementationPreference, loadReviewPreference, saveImplementationPreference, saveReviewPreference } from "../src/preferences.ts";
 import { REVIEW_RESULT_START, REVIEW_RESULT_END, SOURCE_PLAN_COMPLIANCE_CHECK, type ReviewResult } from "../src/review.ts";
-import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
+import { buildTaskFilePrompt, buildTaskContinuationPrompt, TASK_INDEX_PROMPT, TASK_RESULT_START, TASK_RESULT_END } from "../src/tasks.ts";
 
 initTheme("dark");
 
@@ -115,11 +115,17 @@ function reviewResponse(result: ReviewResult): string {
 	return `${REVIEW_RESULT_START}\n${JSON.stringify(result)}\n${REVIEW_RESULT_END}`;
 }
 
+function taskResponse(taskNumber: number, status = "completed", reason?: string): string {
+	return `${TASK_RESULT_START}\n${JSON.stringify({ status, taskNumber, ...(reason ? { reason } : {}) })}\n${TASK_RESULT_END}`;
+}
+const DEFAULT_TASK_RESPONSE = Symbol("default task completion");
+
 function fakeRuntime(options: {
 	cwd: string;
 	choices?: string[];
 	modelOutputs?: unknown[];
 	turnStopReasons?: string[];
+	taskResponses?: Array<string | undefined>;
 	gitResults?: Array<GitResult | Promise<GitResult>>;
 	gitUnavailable?: boolean;
 	inputs?: string[];
@@ -198,7 +204,8 @@ function fakeRuntime(options: {
 	const thresholdInputs = [...(options.thresholdInputs ?? [])];
 	const sessionHistory = [{ role: "user", content: "existing context" }];
 	const pendingTurnReasons: string[] = [];
-	const pendingTurnText: Array<string | undefined> = [];
+	const pendingTurnText: Array<string | undefined | typeof DEFAULT_TASK_RESPONSE> = [];
+	const taskResponses = [...(options.taskResponses ?? [])];
 
 	const emit = async (name: string, event: unknown = {}) => {
 		for (const handler of handlers.get(name) ?? []) {
@@ -207,7 +214,10 @@ function fakeRuntime(options: {
 	};
 
 	const settleTurn = async (override?: string) => {
-		const text = pendingTurnText.shift();
+		const response = pendingTurnText.shift();
+		const text = response === DEFAULT_TASK_RESPONSE
+			? taskResponse(((await loadState(options.cwd))?.nextTaskIndex ?? 0) + 1)
+			: response;
 		await options.onTurn?.(sent[sent.length - 1]);
 		const queuedStopReason = pendingTurnReasons.shift();
 		const stopReason = override ?? queuedStopReason ?? "stop";
@@ -267,7 +277,7 @@ function fakeRuntime(options: {
 			pendingTurnReasons.push(stopReasons.shift() ?? "stop");
 			pendingTurnText.push(message.startsWith("Perform one final implementation review")
 				? reviewResponses.length ? reviewResponses.shift() : reviewResponse(reviewResult(message.includes("No source plan was supplied")))
-				: undefined);
+				: taskResponses.length ? taskResponses.shift() : DEFAULT_TASK_RESPONSE);
 			if (!options.manualTurns) {
 				queueMicrotask(() => void settleTurn());
 			}
@@ -1921,7 +1931,7 @@ test("workflow state is saved before each task, advances without Git, and is del
 		assert.equal(started?.status, "running");
 		assert.equal(started?.nextTaskIndex, 0);
 		assert.deepEqual(started?.tasks.map(({ title }) => title), ["One", "Two"]);
-		assert.deepEqual(started?.tasks.map(({ prompt }) => prompt), [runtime.sent[0], runtime.sent[0].replace("#1 (\"One\")", "#2 (\"Two\")")]);
+		assert.deepEqual(started?.tasks.map(({ prompt }) => prompt), [buildTaskFilePrompt("tasks.md", 1, { title: "One" }), buildTaskFilePrompt("tasks.md", 2, { title: "Two" })]);
 
 		await runtime.settleTurn();
 		await waitFor(() => runtime.sent.length === 2);
@@ -3138,3 +3148,354 @@ test("/implement-plan cancellation does not overwrite an existing tasks.md", asy
 		assert.deepEqual(runtime.sent, []);
 	});
 });
+
+test("active-task UI prompts show and clear waiting without submitting another task", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", "No"],
+			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
+			manualTurns: true,
+		});
+		const execution = runtime.run("implement-tasks", "tasks.md");
+		await waitFor(() => runtime.sent.length === 1);
+		await runtime.emit("agent_start", { type: "agent_start" });
+		await runtime.emit("ui_prompt_start", { type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm" });
+		assert.equal(runtime.workingMessages.at(-1), "Waiting for user authorization");
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(runtime.sent.length, 1);
+		assert.equal((await loadState(directory))?.nextTaskIndex, 0);
+		await runtime.emit("ui_prompt_end", { type: "ui_prompt_end", reason: "ui_prompt", kind: "confirm" });
+		assert.equal(runtime.workingMessages.at(-1), undefined);
+		assert.equal(runtime.sent.length, 1);
+		await runtime.settleTurn();
+		await waitFor(() => runtime.sent.length === 2);
+		await runtime.settleTurn();
+		await execution;
+	});
+});
+
+for (const cancelAt of ["recovery", "summary"] as const) {
+	test(`paused recovery preserves metadata when cancelled at ${cancelAt}`, async () => {
+		await withTempDir(async (directory) => {
+			const state = savedState(directory, { status: "paused", pause: { type: "approval_required", reason: "User authorization is required." } });
+			await saveState(directory, state);
+			const before = await readFile(join(directory, STATE_FILE_NAME), "utf8");
+			const runtime = fakeRuntime({ cwd: directory, choices: [cancelAt === "recovery" ? "Cancel" : "Resume"], summaryActions: ["Cancel"] });
+			await runtime.run("implement-tasks", "missing.md");
+			assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), before);
+			assert.deepEqual(runtime.sent, []);
+		});
+	});
+}
+
+test("paused resume preflight failure preserves the original unfinished task and pause", async () => {
+	await withTempDir(async (directory) => {
+		const state = savedState(directory, {
+			status: "paused", pause: { type: "approval_required", reason: "User authorization is required." },
+			implementationModel: { provider: "selected", id: "implementation-model" },
+		});
+		await saveState(directory, state);
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], models: [fakeModel("selected", "implementation-model")], setModelOutcomes: [false],
+		});
+		await runtime.run("implement-tasks", "missing.md");
+		const loaded = (await loadState(directory))!;
+		assert.equal(loaded.status, "paused");
+		assert.deepEqual(loaded.pause, state.pause);
+		assert.equal(loaded.nextTaskIndex, state.nextTaskIndex);
+		assert.deepEqual(runtime.sent, []);
+		assert.match(loaded.error!, /Cannot use implementation model/);
+	});
+});
+
+test("explicit Resume clears pause only when the saved unfinished task starts", async () => {
+	await withTempDir(async (directory) => {
+		const state = savedState(directory, {
+			status: "paused", pause: { type: "completion_unconfirmed", reason: "Task completion has not been confirmed." },
+			tasks: [{ title: "One", prompt: "Implement one" }, { title: "Two", prompt: "Implement two" }], nextTaskIndex: 1,
+		});
+		await saveState(directory, state);
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], manualTurns: true,
+			onSummary: async () => { assert.deepEqual((await loadState(directory))?.pause, state.pause); },
+			onSetModel: async () => { assert.deepEqual((await loadState(directory))?.pause, state.pause); },
+		});
+		const execution = runtime.run("implement-tasks", "missing.md");
+		await waitFor(() => runtime.sent.length === 1);
+		const started = (await loadState(directory))!;
+		assert.equal(started.status, "running");
+		assert.equal(started.pause, undefined);
+		assert.equal(started.nextTaskIndex, 1);
+		assert.deepEqual(started.tasks, state.tasks);
+		assert.deepEqual(started.implementationModel, state.implementationModel);
+		assert.equal(started.implementationThinkingLevel, state.implementationThinkingLevel);
+		assert.deepEqual(runtime.sent, [buildTaskContinuationPrompt(state.sourcePath, 2, state.tasks[1])]);
+		await runtime.settleTurn();
+		await execution;
+		assert.equal(await loadState(directory), undefined);
+	});
+});
+
+test("progress keeps a paused task visible with an explicit label", () => {
+	const tasks = { tasks: [{ title: "One" }, { title: "Two" }, { title: "Three" }] };
+	assert.deepEqual(formatProgress("Implementation", tasks, ["completed", "paused", "pending"]), [
+		"Implementation", "Ⅱ 2/3 Two (paused)", "○ 3/3 Three",
+	]);
+});
+
+for (const command of ["implement-tasks", "implement-plan"]) {
+	for (const nextTaskIndex of [0, 2]) {
+		for (const result of ["waiting", "missing", "malformed", "wrong-task", "duplicate"] as const) {
+			test(`${command} pauses ${result} at task ${nextTaskIndex + 1} before any success side effects`, async () => {
+				await withTempDir(async (directory) => {
+					const state = savedState(directory, {
+						nextTaskIndex, checkpoint: true, branchName: "main", automaticCompaction: true,
+						review: { enabled: true, model: { provider: "test", id: "review" }, thinkingLevel: "high" },
+					});
+					await saveState(directory, state);
+					const valid = taskResponse(nextTaskIndex + 1);
+					const response = result === "waiting" ? taskResponse(nextTaskIndex + 1, "waiting_for_user", "Sensitive tool input must not be persisted")
+						: result === "missing" ? undefined
+						: result === "malformed" ? `${TASK_RESULT_START}invalid JSON${TASK_RESULT_END}`
+						: result === "wrong-task" ? taskResponse(nextTaskIndex + 2)
+						: valid + valid;
+					const runtime = fakeRuntime({
+						cwd: directory, choices: ["Resume"], models: reviewModels(), gitResults: [gitResult("main\n")],
+						taskResponses: [response], contextUsages: [{ tokens: 99, contextWindow: 100, percent: 99 }],
+					});
+					await runtime.run(command, "unused.md");
+					const paused = (await loadState(directory))!;
+					assert.equal(paused.status, "paused");
+					assert.equal(paused.phase, "tasks");
+					assert.equal(paused.nextTaskIndex, nextTaskIndex);
+					assert.equal(paused.pause?.type, result === "waiting" ? "approval_required" : "completion_unconfirmed");
+					assert.equal(paused.pendingCheckpoint, undefined);
+					assert.equal(paused.pendingCompaction, undefined);
+					assert.equal(paused.reviewStarted, undefined);
+					assert.equal(paused.reviewResult, undefined);
+					assert.equal(paused.error, undefined);
+					assert.deepEqual(paused.tasks, state.tasks);
+					assert.deepEqual(runtime.sent, [state.tasks[nextTaskIndex].prompt]);
+					assert.deepEqual(runtime.execCalls.map(({ args }) => args), [["branch", "--show-current"]]);
+					assert.equal(runtime.compactCalls.length, 0);
+					assert.equal(runtime.contextUsageCalls, 0);
+					assert.ok(!runtime.setModelCalls.some(({ id }) => id === "review"));
+					assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes(`Ⅱ ${nextTaskIndex + 1}/3`) && line.includes("(paused)")));
+					assert.ok(runtime.notifications.some(({ message, type }) => type === "warning" && message.includes("explicitly resume") && message.includes(result === "waiting" ? "authorization request" : "Inspect the unfinished task")));
+					assert.ok(!runtime.notifications.some(({ message }) => message.includes("Implementation complete")));
+					assert.ok(!(await readFile(join(directory, STATE_FILE_NAME), "utf8")).includes("Sensitive tool input"));
+				});
+			});
+		}
+	}
+}
+
+test("live authorization holds checkpoint, compaction, next task and review until validated completion", async () => {
+	await withSavedReview(async (directory, state) => {
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], models: reviewModels(), manualTurns: true,
+			contextUsages: [{ tokens: 99, contextWindow: 100, percent: 99 }, { tokens: 99, contextWindow: 100, percent: 99 }],
+			gitResults: [gitResult("main\n"), gitResult(), gitResult(), gitResult("", 1), gitResult(),
+				gitResult(), gitResult(), gitResult("", 1), gitResult(), gitResult("main\n"), gitResult(), gitResult(), gitResult()],
+		});
+		const execution = runtime.run("implement-tasks", "unused.md");
+		await waitFor(() => runtime.sent.length === 1);
+		await runtime.emit("agent_start");
+		await runtime.emit("ui_prompt_start", { type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm" });
+		assert.equal(runtime.workingMessages.at(-1), "Waiting for user authorization");
+		// Even a received settled event cannot advance while the dialog remains open.
+		await runtime.settleTurn();
+		assert.equal(runtime.sent.length, 1);
+		assert.equal((await loadState(directory))?.nextTaskIndex, state.nextTaskIndex);
+		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 0);
+		assert.equal(runtime.compactCalls.length, 0);
+		assert.ok(!runtime.setModelCalls.some(({ id }) => id === "review"));
+		await runtime.emit("ui_prompt_end", { type: "ui_prompt_end", reason: "ui_prompt", kind: "confirm" });
+		await waitFor(() => runtime.sent.length === 2);
+		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 1);
+		assert.equal(runtime.compactCalls.length, 1);
+		assert.equal((await loadState(directory))?.nextTaskIndex, 2);
+		await runtime.settleTurn();
+		await waitFor(() => runtime.sent.length === 3);
+		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 2);
+		assert.equal(runtime.compactCalls.length, 2);
+		assert.ok(runtime.sent[2].startsWith("Perform one final implementation review"));
+		await runtime.settleTurn();
+		await execution;
+		assert.equal(await loadState(directory), undefined);
+		assert.deepEqual(runtime.execCalls.filter(({ args }) => args[0] === "commit").map(({ args }) => args[2]), ["Task 2: Two", "Task 3: Three"]);
+	}, { phase: "tasks", nextTaskIndex: 1, checkpoint: true, branchName: "main", automaticCompaction: true });
+});
+
+for (const stopReason of ["error", "aborted", "length"]) {
+	test(`task ${stopReason} stays a failure even with a completed result`, async () => {
+		await withTempDir(async (directory) => {
+			await saveState(directory, savedState(directory));
+			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], turnStopReasons: [stopReason], taskResponses: [taskResponse(2)] });
+			await runtime.run("implement-tasks", "unused.md");
+			const failed = (await loadState(directory))!;
+			assert.equal(failed.status, "failed");
+			assert.equal(failed.nextTaskIndex, 1);
+			assert.equal(failed.pause, undefined);
+			assert.equal(runtime.sent.length, 1);
+			assert.equal(runtime.compactCalls.length, 0);
+		});
+	});
+}
+
+for (const command of ["implement-tasks", "implement-plan"]) {
+	test(`${command} explicitly resumes only the paused task and re-pauses without automatic retries`, async () => {
+		await withTempDir(async (directory) => {
+			await writeFile(join(directory, "partial.txt"), "Already applied work\n");
+			const state = savedState(directory, {
+				status: "paused", pause: { type: "approval_required", reason: "User authorization is required." },
+				checkpoint: true, branchName: "main", automaticCompaction: true, originalPlanPath: "original-plan.md",
+				sourcePath: "saved/tasks.md",
+			});
+			await saveState(directory, state);
+			const denied = fakeRuntime({
+				cwd: directory, choices: ["Resume"], gitResults: [gitResult("main\n")],
+				taskResponses: [taskResponse(2, "waiting_for_user", "Authorization is still refused.")],
+			});
+			await denied.run(command, "unrelated-plan.md");
+			const continuation = buildTaskContinuationPrompt(state.sourcePath, 2, state.tasks[1]);
+			assert.deepEqual(denied.sent, [continuation]);
+			for (const selection of denied.selections.filter(({ title }) => title.startsWith("Unfinished implementation found") || title.startsWith("Execution summary"))) {
+				assert.match(selection.title, /Paused task 2: User authorization is required\./);
+			}
+			assert.equal(denied.selections.filter(({ title }) => title.includes("Paused task 2:")).length, 2);
+			const pausedAgain = (await loadState(directory))!;
+			assert.equal(pausedAgain.status, "paused");
+			assert.equal(pausedAgain.nextTaskIndex, 1);
+			assert.equal(pausedAgain.pause?.type, "approval_required");
+			assert.deepEqual(pausedAgain.tasks, state.tasks);
+			assert.equal(pausedAgain.sourcePath, state.sourcePath);
+			assert.equal(pausedAgain.originalPlanPath, state.originalPlanPath);
+			assert.equal(pausedAgain.branchName, "main");
+			assert.equal(denied.completeCalls.length, 0);
+			assert.equal(denied.compactCalls.length, 0);
+			assert.ok(!denied.execCalls.some(({ args }) => ["commit", "switch", "add"].includes(args[0])));
+
+			// A new runtime represents a restarted session. Only a second explicit Resume retries.
+			const resumed = fakeRuntime({
+				cwd: directory, choices: ["Resume"], manualTurns: true,
+				currentModel: fakeModel("other", "active"), models: [fakeModel("other", "active"), fakeModel("test", "selected")], thinkingLevel: "low",
+				gitResults: [gitResult("main\n"), gitResult(), gitResult(), gitResult("", 1), gitResult(), gitResult(), gitResult(), gitResult("", 1), gitResult()],
+				onTurn: async () => { assert.equal(await readFile(join(directory, "partial.txt"), "utf8"), "Already applied work\n"); },
+			});
+			const execution = resumed.run(command, "unrelated-tasks.md");
+			await waitFor(() => resumed.sent.length === 1);
+			assert.deepEqual(resumed.sent, [continuation]);
+			assert.deepEqual(resumed.sentSettings, [{ model: "test/selected", thinkingLevel: "medium" }]);
+			assert.equal((await loadState(directory))?.nextTaskIndex, 1);
+			assert.equal((await loadState(directory))?.pause, undefined);
+			assert.equal(resumed.execCalls.filter(({ args }) => args[0] === "commit").length, 0);
+			await resumed.settleTurn();
+			await waitFor(() => resumed.sent.length === 2);
+			assert.deepEqual(resumed.sent, [continuation, state.tasks[2].prompt]);
+			assert.equal((await loadState(directory))?.nextTaskIndex, 2);
+			assert.deepEqual(resumed.execCalls.filter(({ args }) => args[0] === "commit").map(({ args }) => args[2]), ["Task 2: Two"]);
+			await resumed.settleTurn();
+			await execution;
+			assert.deepEqual(resumed.execCalls.filter(({ args }) => args[0] === "commit").map(({ args }) => args[2]), ["Task 2: Two", "Task 3: Three"]);
+			assert.equal(await loadState(directory), undefined);
+			assert.equal(resumed.completeCalls.length, 0);
+			assert.equal(await readFile(join(directory, "partial.txt"), "utf8"), "Already applied work\n");
+		});
+	});
+}
+
+test("a Resume command during a live permission dialog does not open recovery or send another prompt", async () => {
+	await withTempDir(async (directory) => {
+		await saveState(directory, savedState(directory, { nextTaskIndex: 2 }));
+		const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], manualTurns: true });
+		const execution = runtime.run("implement-tasks", "unused.md");
+		await waitFor(() => runtime.sent.length === 1);
+		await runtime.emit("agent_start");
+		await runtime.emit("ui_prompt_start", { type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm" });
+		const selections = runtime.selections.length;
+		await runtime.run("implement-plan", "unused.md");
+		assert.equal(runtime.selections.length, selections);
+		assert.equal(runtime.sent.length, 1);
+		assert.ok(runtime.notifications.some(({ message }) => message.includes("already running")));
+		await runtime.emit("ui_prompt_end", { type: "ui_prompt_end", reason: "ui_prompt", kind: "confirm" });
+		await runtime.settleTurn();
+		await execution;
+		assert.equal(runtime.sent.length, 1);
+		assert.equal(await loadState(directory), undefined);
+	});
+});
+
+test("paused recovery without recorded details displays a fallback reason and still uses a continuation", async () => {
+	await withTempDir(async (directory) => {
+		await saveState(directory, savedState(directory, { status: "paused", nextTaskIndex: 2 }));
+		const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], taskResponses: [undefined] });
+		await runtime.run("implement-tasks", "unused.md");
+		assert.equal(runtime.selections.filter(({ title }) => title.includes("Paused task 3: No pause reason was recorded.")).length, 2);
+		assert.match(runtime.sent[0], /^Resume the unfinished task #3/);
+		assert.equal((await loadState(directory))?.status, "paused");
+		assert.equal((await loadState(directory))?.nextTaskIndex, 2);
+	});
+});
+
+for (const command of ["implement-tasks", "implement-plan"]) {
+	test(`${command} session shutdown during approval preserves the unfinished task as failed`, async () => {
+		await withTempDir(async (directory) => {
+			const state = savedState(directory, {
+				checkpoint: true, branchName: "main", automaticCompaction: true,
+				review: { enabled: true, model: { provider: "test", id: "review" }, thinkingLevel: "high" },
+			});
+			await saveState(directory, state);
+			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], manualTurns: true, models: reviewModels(), gitResults: [gitResult("main\n")] });
+			const execution = runtime.run(command, "unused.md");
+			await waitFor(() => runtime.sent.length === 1);
+			await runtime.emit("agent_start");
+			await runtime.emit("ui_prompt_start", { type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm" });
+			assert.equal(runtime.workingMessages.at(-1), "Waiting for user authorization");
+			await runtime.emit("session_shutdown");
+			await execution;
+			const stopped = (await loadState(directory))!;
+			assert.equal(stopped.status, "failed");
+			assert.equal(stopped.phase, "tasks");
+			assert.equal(stopped.nextTaskIndex, state.nextTaskIndex);
+			assert.equal(stopped.pause, undefined);
+			assert.match(stopped.error!, /session changed/);
+			assert.equal(stopped.pendingCheckpoint, undefined);
+			assert.equal(runtime.compactCalls.length, 0);
+			assert.deepEqual(runtime.execCalls.map(({ args }) => args), [["branch", "--show-current"]]);
+			assert.equal(runtime.sent.length, 1);
+			assert.equal(runtime.workingMessages.at(-1), undefined);
+			// Late prompt closure/completion cannot resurrect the cancelled workflow.
+			await runtime.emit("ui_prompt_end");
+			await runtime.settleTurn();
+			assert.equal(runtime.sent.length, 1);
+			assert.equal((await loadState(directory))?.status, "failed");
+		});
+	});
+}
+
+for (const reverse of [false, true]) {
+	test(`arbitrary tool result details do not override the final task result (reverse: ${reverse})`, async () => {
+		await withTempDir(async (directory) => {
+			await saveState(directory, savedState(directory, { nextTaskIndex: 2 }));
+			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], manualTurns: true });
+			const execution = runtime.run("implement-tasks", "unused.md");
+			await waitFor(() => runtime.sent.length === 1);
+			await runtime.emit("agent_start");
+			const results = [
+				{ toolCallId: "a", toolName: "bash", isError: true, content: [{ type: "text", text: "Permission denied" }], details: {} },
+				{ toolCallId: "b", toolName: "custom", isError: true, content: [], details: { permission: "denied", blocked: true } },
+				{ toolCallId: "c", toolName: "read", isError: false, content: [{ type: "text", text: taskResponse(99) }], details: {} },
+			];
+			for (const result of reverse ? results.reverse() : results) await runtime.emit("tool_result", { type: "tool_result", ...result });
+			assert.ok(!runtime.workingMessages.includes("Waiting for user authorization"));
+			assert.equal((await loadState(directory))?.nextTaskIndex, 2);
+			await runtime.settleTurn();
+			await execution;
+			assert.equal(await loadState(directory), undefined);
+			assert.equal(runtime.sent.length, 1);
+		});
+	});
+}

@@ -51,18 +51,18 @@ test("text execution extracts only the settled final assistant text blocks", asy
 });
 
 for (const content of [undefined, [], [{ type: "thinking", thinking: "No final answer" }], [{ type: "text", text: " " }]]) {
-	test("text execution rejects a successful stop without final text while task execution remains compatible", async () => {
+	test("text execution rejects missing final text and task execution leaves completion unconfirmed", async () => {
 		const executor = new ActiveSessionExecutor(() => {});
 		const execution = executor.executeForText("review one");
 		executor.onAgentStart();
 		executor.onAgentEnd([{ role: "assistant", stopReason: "stop", content }]);
 		executor.onAgentSettled();
 		await assert.rejects(execution, /without final assistant text/);
-		const task = executor.execute("implement one");
+		const task = executor.executeTask("implement one", 1);
 		executor.onAgentStart();
 		executor.onAgentEnd([{ role: "assistant", stopReason: "stop", content }]);
 		executor.onAgentSettled();
-		assert.equal(await task, undefined);
+		assert.equal((await task).status, "completion_unconfirmed");
 	});
 }
 
@@ -91,4 +91,227 @@ test("active-session executor rejects overlapping prompts", async () => {
 	await assert.rejects(executor.execute("two"), /already running/);
 	executor.cancel("cancelled");
 	await assert.rejects(first, /cancelled/);
+});
+
+const completion = '<<<PI_IMPLEMENT_TASK_RESULT>>>\n{"status":"completed","taskNumber":1}\n<<<END_PI_IMPLEMENT_TASK_RESULT>>>';
+const assistant = (text: string, stopReason = "stop") => ({ role: "assistant", stopReason, content: [{ type: "text", text }] });
+
+test("executeTask waits for settlement and validates the final assistant result only", async () => {
+	const executor = new ActiveSessionExecutor(() => {});
+	let resolved = false;
+	const execution = executor.executeTask("task", 1).then((result) => { resolved = true; return result; });
+	executor.onAgentStart();
+	executor.onAgentEnd([assistant(completion)]);
+	await tick();
+	assert.equal(resolved, false);
+	executor.onAgentSettled();
+	assert.deepEqual(await execution, { status: "completed", taskNumber: 1 });
+});
+
+test("executeTask does not accept bare stops, earlier reports, or tool output as completion", async () => {
+	for (const messages of [
+		[{ role: "assistant", stopReason: "stop" }],
+		[assistant(completion), assistant("Please authorize the tool.")],
+		[assistant(""), { role: "toolResult", content: [{ type: "text", text: completion }] }],
+		[assistant(completion.replace('"taskNumber":1', '"taskNumber":2'))],
+		[assistant("<<<PI_IMPLEMENT_TASK_RESULT>>>bad JSON<<<END_PI_IMPLEMENT_TASK_RESULT>>>")],
+	]) {
+		const executor = new ActiveSessionExecutor(() => {});
+		const execution = executor.executeTask("task", 1);
+		executor.onAgentStart();
+		executor.onAgentEnd([assistant(completion)]);
+		executor.onAgentEnd(messages);
+		executor.onAgentSettled();
+		assert.equal((await execution).status, "completion_unconfirmed");
+	}
+});
+
+test("executeTask returns a waiting outcome without claiming success", async () => {
+	const executor = new ActiveSessionExecutor(() => {});
+	const execution = executor.executeTask("task", 1);
+	executor.onAgentStart();
+	executor.onAgentEnd([assistant(completion.replace('"completed"', '"waiting_for_user"'))]);
+	executor.onAgentSettled();
+	assert.deepEqual(await execution, { status: "waiting_for_user", taskNumber: 1 });
+});
+
+test("executeTask rejects unsuccessful lifecycle outcomes even with a completion block", async () => {
+	for (const stopReason of ["error", "length", "aborted", "toolUse", "stop"]) {
+		const executor = new ActiveSessionExecutor(() => {});
+		const execution = executor.executeTask("task", 1);
+		executor.onAgentStart();
+		executor.onAgentEnd([assistant(completion, stopReason)]);
+		executor.onAgentSettled({ aborted: stopReason === "stop" });
+		await assert.rejects(execution);
+	}
+});
+
+test("executeTask preserves overlap guards, cancellation, and validates task numbers", async () => {
+	const executor = new ActiveSessionExecutor(() => {});
+	await assert.rejects(executor.executeTask("task", 0), /Invalid task number/);
+	const execution = executor.executeTask("task", 1);
+	await assert.rejects(executor.executeForText("review"), /already running/);
+	await assert.rejects(executor.executeTask("task", 2), /already running/);
+	executor.cancel("Session shut down");
+	await assert.rejects(execution, /Session shut down/);
+});
+
+test("blocking prompts hold the same task until closed and settled without resubmission", async () => {
+	const sent: string[] = [];
+	const changes: boolean[] = [];
+	const executor = new ActiveSessionExecutor((prompt) => { sent.push(prompt); }, (waiting) => { changes.push(waiting); });
+	let resolved = false;
+	const task = executor.executeTask("implement", 1).then((outcome) => { resolved = true; return outcome; });
+	executor.onAgentStart();
+	executor.onUiPromptStart();
+	assert.equal(executor.waitingForUser, true);
+	executor.onAgentEnd([assistant(completion)]);
+	await tick();
+	assert.equal(resolved, false);
+	executor.onUiPromptEnd();
+	assert.equal(executor.waitingForUser, false);
+	await tick();
+	assert.equal(resolved, false);
+	executor.onAgentSettled();
+	assert.equal((await task).status, "completed");
+	assert.deepEqual(changes, [true, false]);
+	assert.deepEqual(sent, ["implement"]);
+});
+
+test("nested or overlapping prompts retain waiting until every prompt closes", async () => {
+	const changes: boolean[] = [];
+	const executor = new ActiveSessionExecutor(() => {}, (waiting) => { changes.push(waiting); });
+	const task = executor.executeTask("implement", 1);
+	executor.onAgentStart();
+	executor.onUiPromptStart();
+	executor.onUiPromptStart();
+	executor.onUiPromptEnd();
+	assert.equal(executor.waitingForUser, true);
+	executor.onUiPromptEnd();
+	executor.onUiPromptEnd(); // Unmatched ends cannot underflow the count.
+	assert.equal(executor.waitingForUser, false);
+	executor.onAgentEnd([assistant(completion)]);
+	executor.onAgentSettled();
+	await task;
+	assert.deepEqual(changes, [true, false]);
+});
+
+test("an early settled event cannot complete a task while a prompt is open", async () => {
+	const executor = new ActiveSessionExecutor(() => {});
+	let resolved = false;
+	const task = executor.executeTask("implement", 1).then((outcome) => { resolved = true; return outcome; });
+	executor.onAgentStart();
+	executor.onUiPromptStart();
+	executor.onAgentEnd([assistant(completion)]);
+	executor.onAgentSettled();
+	await tick();
+	assert.equal(resolved, false);
+	assert.equal(executor.waitingForUser, true);
+	executor.onUiPromptEnd();
+	assert.equal((await task).status, "completed");
+});
+
+test("setup, review, inactive and later prompt events do not leak into tasks", async () => {
+	const changes: boolean[] = [];
+	const executor = new ActiveSessionExecutor(() => {}, (waiting) => { changes.push(waiting); });
+	executor.onUiPromptStart(); // Setup dialog before execution.
+	const task = executor.executeTask("implement", 1);
+	executor.onUiPromptStart(); // The submitted agent has not started.
+	executor.onAgentStart();
+	assert.equal(executor.waitingForUser, false);
+	executor.onAgentEnd([assistant(completion)]);
+	executor.onAgentSettled();
+	await task;
+	executor.onUiPromptStart();
+	executor.onUiPromptEnd();
+	const review = executor.executeForText("review");
+	executor.onAgentStart();
+	executor.onUiPromptStart();
+	assert.equal(executor.waitingForUser, false);
+	executor.onUiPromptEnd();
+	executor.onAgentEnd([assistant("Review result")]);
+	executor.onAgentSettled();
+	assert.equal(await review, "Review result");
+	assert.deepEqual(changes, []);
+});
+
+test("cancellation and aborted settlement clear waiting and isolate the next task", async () => {
+	for (const abort of [false, true]) {
+		const changes: boolean[] = [];
+		const executor = new ActiveSessionExecutor(() => {}, (waiting) => { changes.push(waiting); });
+		const task = executor.executeTask("implement", 1);
+		executor.onAgentStart();
+		executor.onUiPromptStart();
+		if (abort) executor.onAgentSettled({ aborted: true });
+		else executor.cancel("Session shut down");
+		await assert.rejects(task);
+		assert.equal(executor.waitingForUser, false);
+		executor.onUiPromptEnd();
+		const next = executor.executeTask("next", 1);
+		executor.onAgentStart();
+		executor.onAgentEnd([assistant(completion)]);
+		executor.onAgentSettled();
+		assert.equal((await next).status, "completed");
+		assert.deepEqual(changes, [true, false]);
+	}
+});
+
+test("unstructured tool errors and permission wording do not invent an authorization wait", async () => {
+	for (const reverse of [false, true]) {
+		const executor = new ActiveSessionExecutor(() => {});
+		const task = executor.executeTask("implement", 1);
+		executor.onAgentStart();
+		const tools = [
+			{ role: "toolResult", toolCallId: "a", isError: true, content: [{ type: "text", text: "Permission denied" }] },
+			{ role: "toolResult", toolCallId: "b", isError: false, content: [{ type: "text", text: "Succeeded" }] },
+		];
+		executor.onAgentEnd([...(reverse ? tools.reverse() : tools), assistant("The permission error was handled.\n" + completion)]);
+		assert.equal(executor.waitingForUser, false);
+		executor.onAgentSettled();
+		assert.equal((await task).status, "completed");
+	}
+});
+
+test("installed Pi permission gate emits paired prompt events and holds the active task", async () => {
+	const { fileURLToPath } = await import("node:url");
+	const { ExtensionRunner, SessionManager, createEventBus } = await import("@earendil-works/pi-coding-agent");
+	const sdkEntry = import.meta.resolve("@earendil-works/pi-coding-agent");
+	const { loadExtensions, loadExtensionFromFactory } = await import(new URL("./core/extensions/loader.js", sdkEntry).href);
+	const gatePath = fileURLToPath(new URL("../examples/extensions/permission-gate.ts", sdkEntry));
+	for (const choice of ["Yes", "No", undefined]) {
+		const loaded = await loadExtensions([gatePath], process.cwd());
+		assert.deepEqual(loaded.errors, []);
+		const executor = new ActiveSessionExecutor(() => {});
+		const events: string[] = [];
+		const observer = await loadExtensionFromFactory((pi: any) => {
+			pi.on("ui_prompt_start", () => { events.push("start"); executor.onUiPromptStart(); });
+			pi.on("ui_prompt_end", () => { events.push("end"); executor.onUiPromptEnd(); });
+		}, process.cwd(), createEventBus(), loaded.runtime);
+		const runner = new ExtensionRunner([...loaded.extensions, observer], loaded.runtime, process.cwd(), SessionManager.inMemory(), {} as never);
+		const errors: unknown[] = [];
+		runner.onError((error: unknown) => { errors.push(error); });
+		let answer!: (value: string | undefined) => void;
+		runner.setUIContext({ select: () => new Promise((resolve) => { answer = resolve; }) } as never, "rpc");
+		let resolved = false;
+		const task = executor.executeTask("implement one", 1).then((outcome) => { resolved = true; return outcome; });
+		executor.onAgentStart();
+		// This invokes the actual installed gate, but never executes a shell command.
+		const gate = runner.emitToolCall({ type: "tool_call", toolName: "bash", toolCallId: "permission-test", input: { command: "sudo --version" } });
+		await tick();
+		assert.deepEqual(events, ["start"]);
+		assert.equal(executor.waitingForUser, true);
+		await tick(); // Deferred approval must leave the same turn alive.
+		assert.equal(resolved, false);
+		answer(choice);
+		const decision = await gate;
+		await tick();
+		assert.deepEqual(events, ["start", "end"]);
+		assert.equal(executor.waitingForUser, false);
+		assert.equal(resolved, false);
+		assert.equal(decision?.block === true, choice !== "Yes");
+		executor.onAgentEnd([assistant(choice === "Yes" ? completion : completion.replace('"completed"', '"waiting_for_user"'))]);
+		executor.onAgentSettled();
+		assert.equal((await task).status, choice === "Yes" ? "completed" : "waiting_for_user");
+		assert.deepEqual(errors, []);
+	}
 });

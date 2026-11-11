@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	COMPACTION_DISABLED_CHOICE,
 	COMPACTION_ENABLED_CHOICE,
@@ -42,7 +42,7 @@ import {
 } from "./state.ts";
 import { saveImplementationPreference, saveReviewPreference, selectPreferredImplementationSettings, selectPreferredReviewSettings } from "./preferences.ts";
 import { executeReview, formatReviewResult } from "./review.ts";
-import { buildTaskFilePrompt, indexTaskFile } from "./tasks.ts";
+import { buildTaskFilePrompt, buildTaskContinuationPrompt, indexTaskFile } from "./tasks.ts";
 import { confirmExecutionSummary, selectTaskAction } from "./preview.ts";
 export { formatPreview } from "./preview.ts";
 
@@ -178,9 +178,13 @@ export function formatProgress(
 		running: "●",
 		completed: "✓",
 		failed: "✗",
+		paused: "Ⅱ",
 	};
 
 	let currentIndex = tasks.tasks.findIndex((_, index) => statuses[index] === "running");
+	if (currentIndex < 0) {
+		currentIndex = tasks.tasks.findIndex((_, index) => statuses[index] === "paused");
+	}
 	if (currentIndex < 0) {
 		currentIndex = tasks.tasks.findIndex((_, index) => statuses[index] === "failed");
 	}
@@ -195,7 +199,7 @@ export function formatProgress(
 		title,
 		...tasks.tasks.slice(currentIndex, currentIndex + PROGRESS_TASK_LIMIT).map((task, visibleIndex) => {
 			const index = currentIndex + visibleIndex;
-			return `${symbols[statuses[index] ?? "pending"]} ${index + 1}/${tasks.tasks.length} ${task.title}`;
+			return `${symbols[statuses[index] ?? "pending"]} ${index + 1}/${tasks.tasks.length} ${task.title}${statuses[index] === "paused" ? " (paused)" : ""}`;
 		}),
 	];
 }
@@ -224,7 +228,7 @@ async function saveFailure(
 ): Promise<void> {
 	const message = error instanceof Error ? error.message : String(error);
 	state.nextTaskIndex = nextTaskIndex;
-	state.status = "failed";
+	if (state.status !== "paused") state.status = "failed";
 	state.error = message;
 	try {
 		await saveState(ctx.cwd, state);
@@ -285,7 +289,7 @@ async function executeReviewPhase(
 	modelController: ImplementationModelController,
 ): Promise<void> {
 	try {
-		if (state.phase !== "review" || !state.review.enabled || state.nextTaskIndex !== state.tasks.length || state.pendingCheckpoint) {
+		if (state.status === "paused" || state.phase !== "review" || !state.review.enabled || state.nextTaskIndex !== state.tasks.length || state.pendingCheckpoint) {
 			throw new Error("Cannot start final review before all tasks and task checkpoints complete.");
 		}
 		if (!state.reviewResult) {
@@ -359,7 +363,7 @@ async function executeTaskSet(
 				},
 			);
 			delete state.pendingCompaction;
-			state.status = "running";
+			if (state.status !== "paused") state.status = "running";
 			delete state.error;
 			await saveState(ctx.cwd, state);
 		} catch (error) {
@@ -369,9 +373,22 @@ async function executeTaskSet(
 	}
 
 	for (let index = state.nextTaskIndex; index < state.tasks.length; index++) {
+		try {
+			assertImplementationSettings(state, ctx, modelController);
+		} catch (error) {
+			statuses[index] = "failed";
+			update();
+			await saveFailure(ctx, commandName, state, index, error);
+			return;
+		}
 		statuses[index] = "running";
 		update();
+		const prompt = state.status === "paused"
+			? buildTaskContinuationPrompt(state.sourcePath, index + 1, state.tasks[index])
+			: state.tasks[index].prompt;
 		state.nextTaskIndex = index;
+		// Clear pause metadata only after resume preflight, as this task starts.
+		delete state.pause;
 		state.status = "running";
 		delete state.error;
 		try {
@@ -383,7 +400,26 @@ async function executeTaskSet(
 
 		try {
 			assertImplementationSettings(state, ctx, modelController);
-			await executor.execute(state.tasks[index].prompt);
+			const outcome = await executor.executeTask(prompt, index + 1);
+			switch (outcome.status) {
+				case "completed":
+					break;
+				case "waiting_for_user":
+				case "completion_unconfirmed": {
+					state.status = "paused";
+					// Persist a non-sensitive summary rather than raw model/tool text.
+					state.pause = outcome.status === "waiting_for_user"
+						? { type: "approval_required", reason: "User authorization or action is required before continuing." }
+						: { type: "completion_unconfirmed", reason: "Task completion has not been confirmed by a valid task result." };
+					statuses[index] = "paused";
+					update();
+					await saveState(ctx.cwd, state);
+					report(ctx, commandName, `Task ${index + 1} paused: ${state.pause.reason} ${outcome.status === "waiting_for_user"
+						? "Resolve the authorization request or required user action, then explicitly resume the workflow."
+						: "Inspect the unfinished task and its applied changes, then explicitly resume the workflow."}`, "warning");
+					return;
+				}
+			}
 		} catch (error) {
 			statuses[index] = "failed";
 			update();
@@ -668,6 +704,7 @@ function formatRestorePrompt(state: ImplementationState): string {
 	const taskNumber = Math.min(state.nextTaskIndex + 1, state.tasks.length);
 	const lines = [
 		"Unfinished implementation found",
+		...(state.status === "paused" ? [`Paused task ${taskNumber}: ${state.pause?.reason ?? "No pause reason was recorded."}`] : []),
 		`Workflow: ${state.preparedTasks ? "/implement-plan" : "/implement-tasks"}`,
 		`Source plan: ${state.originalPlanPath ?? "None"}`,
 		`Task file: ${state.sourcePath}`,
@@ -715,6 +752,10 @@ async function handleExistingState(
 
 	if (!await confirmExecutionSummary({
 		...state,
+		pausedTask: state.status === "paused" ? {
+			taskNumber: state.nextTaskIndex + 1,
+			reason: state.pause?.reason ?? "No pause reason was recorded.",
+		} : undefined,
 		command: state.preparedTasks ? "/implement-plan" : "/implement-tasks",
 		sourcePlanPath: state.originalPlanPath ?? null,
 		taskCount: state.tasks.length,
@@ -774,13 +815,27 @@ async function handleExistingState(
 
 export default function implementExtension(pi: ExtensionAPI): void {
 	let workflowRunning = false;
-	const executor = new ActiveSessionExecutor((message) => pi.sendUserMessage(message));
+	let activeContext: ExtensionContext | undefined;
+	const executor = new ActiveSessionExecutor(
+		(message) => pi.sendUserMessage(message),
+		(waiting) => {
+			if (activeContext?.hasUI) activeContext.ui.setWorkingMessage(waiting ? "Waiting for user authorization" : undefined);
+		},
+	);
 	const git = createLocalGit((command, args, options) => pi.exec(command, args, options));
 
-	pi.on("agent_start", () => executor.onAgentStart());
+	pi.on("agent_start", (_event, ctx) => {
+		activeContext = ctx;
+		executor.onAgentStart();
+	});
+	pi.on("ui_prompt_start", () => executor.onUiPromptStart());
+	pi.on("ui_prompt_end", () => executor.onUiPromptEnd());
 	pi.on("agent_end", (event) => executor.onAgentEnd(event.messages));
 	pi.on("agent_settled", () => executor.onAgentSettled());
-	pi.on("session_shutdown", () => executor.cancel("Task execution stopped because the session changed."));
+	pi.on("session_shutdown", () => {
+		executor.cancel("Task execution stopped because the session changed.");
+		activeContext = undefined;
+	});
 
 	const runCommand = async (
 		commandName: string,
@@ -795,7 +850,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 			report(ctx, commandName, "An implementation workflow is already running.", "warning");
 			return;
 		}
-		if (!ctx.isIdle()) {
+		if (!ctx.isIdle() || executor.waitingForUser) {
 			report(ctx, commandName, `Wait for the current agent turn to finish before using ${commandName}.`, "warning");
 			return;
 		}

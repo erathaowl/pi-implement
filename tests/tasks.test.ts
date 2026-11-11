@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	buildTaskFilePrompt,
+	buildTaskContinuationPrompt,
+	parseTaskResult, TASK_RESULT_START, TASK_RESULT_END,
 	indexTaskFile,
 	TASK_INDEX_PROMPT,
 	validateTaskIndex,
@@ -80,4 +82,60 @@ test("task index validation rejects malformed or empty indexes", () => {
 	assert.throws(() => validateTaskIndex({ wrong: [] }), /invalid tasks list/);
 	assert.throws(() => validateTaskIndex({ tasks: [] }), /No implementation tasks/);
 	assert.throws(() => validateTaskIndex({ tasks: [{ title: " " }] }), /empty title/);
+});
+
+test("task prompt requires one terminal result and distinguishes authorization waits", () => {
+	const prompt = buildTaskFilePrompt("tasks.md", 3, { title: "Example" });
+	assert.match(prompt, /exactly one task-result block/);
+	assert.match(prompt, /"taskNumber":3/);
+	assert.match(prompt, /only after implementing and checking/);
+	assert.match(prompt, /waiting_for_user/);
+	assert.match(prompt, /Never report completed while blocked/);
+});
+
+const resultBlock = (value: unknown) => `${TASK_RESULT_START}\n${JSON.stringify(value)}\n${TASK_RESULT_END}`;
+
+test("task result accepts only a flat completed or waiting result for the current task", () => {
+	assert.deepEqual(parseTaskResult("Implemented and checked.\n" + resultBlock({ status: "completed", taskNumber: 2 }), 2), { status: "completed", taskNumber: 2 });
+	assert.deepEqual(parseTaskResult(resultBlock({ status: "waiting_for_user", taskNumber: 2, reason: " Approve the tool " }), 2), { status: "waiting_for_user", taskNumber: 2, reason: "Approve the tool" });
+	assert.deepEqual(parseTaskResult(resultBlock({ status: "waiting_for_user", taskNumber: 2 }), 2), { status: "waiting_for_user", taskNumber: 2 });
+});
+
+test("task result rejects missing, malformed, duplicate, contradictory and wrong-task reports", () => {
+	const valid = resultBlock({ status: "completed", taskNumber: 2 });
+	for (const text of [
+		"", "Please approve access.", "Done!", valid + valid,
+		valid + resultBlock({ status: "waiting_for_user", taskNumber: 2 }),
+		valid + " more text", TASK_RESULT_END + TASK_RESULT_START,
+		`${TASK_RESULT_START}{invalid}${TASK_RESULT_END}`,
+		`${TASK_RESULT_START}{"status":"waiting_for_user","status":"completed","taskNumber":2}${TASK_RESULT_END}`,
+		`${TASK_RESULT_START}{"status":"completed","taskNumber":2,"taskNumber":2}${TASK_RESULT_END}`,
+		...[
+			null, [], { status: "completed" }, { status: "completed", taskNumber: "2" },
+			{ status: "completed", taskNumber: 1 }, { status: "failed", taskNumber: 2 },
+			{ status: "completed", taskNumber: 2, reason: "Awaiting approval" },
+			{ status: "completed", taskNumber: 2, extra: true },
+			{ status: "waiting_for_user", taskNumber: 2, reason: " " },
+			{ status: "waiting_for_user", taskNumber: 2, reason: 42 },
+			{ status: "waiting_for_user", taskNumber: 2, reason: "x".repeat(501) },
+		].map(resultBlock),
+	]) assert.equal(parseTaskResult(text, 2).status, "completion_unconfirmed", text);
+});
+
+
+test("continuation references the saved task and requires inspection instead of repeated side effects", () => {
+	const prompt = buildTaskContinuationPrompt("saved task files/tasks.md", 2, { title: "Finish API" });
+	assert.match(prompt, /Resume the unfinished task #2/);
+	assert.match(prompt, /Read "saved task files\/tasks.md" and implement task #2/);
+	assert.match(prompt, /Inspect already applied changes and existing verification results/);
+	assert.match(prompt, /Finish only the outstanding work/);
+	assert.match(prompt, /avoid repeating completed side effects/);
+	assert.match(prompt, /Resume confirmation is not authorization/);
+	assert.match(prompt, /Do not bypass permission rules/);
+	assert.match(prompt, /automatically retry denied actions/);
+	assert.match(prompt, /report waiting_for_user and stop/);
+	assert.ok(prompt.endsWith(buildTaskFilePrompt("saved task files/tasks.md", 2, { title: "Finish API" })));
+	assert.equal(prompt.split(TASK_RESULT_START).length, 2);
+	assert.equal(prompt.split(TASK_RESULT_END).length, 2);
+	assert.match(prompt, /"taskNumber":2/);
 });
