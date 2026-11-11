@@ -8,6 +8,13 @@ export type { ReviewResult } from "./review.ts";
 export const STATE_FILE_NAME = ".pi-implement-state.json";
 export const INITIAL_CHECKPOINT_MESSAGE = "chore: capture initial implementation state";
 
+export const MAX_PAUSE_REASON_LENGTH = 500;
+export interface TaskPause {
+	type: "approval_required" | "completion_unconfirmed";
+	// Store only a short non-sensitive summary, never credentials or raw tool inputs.
+	reason: string;
+}
+
 export type WorkflowPhase = "setup" | "tasks" | "review" | "review_checkpoint" | "completed";
 export type ReviewSettings = { enabled: false } | {
 	enabled: true;
@@ -33,7 +40,6 @@ interface CommonState extends ImplementationSettings {
 	sourcePath: string;
 	tasks: Array<{ title: string; prompt: string }>;
 	nextTaskIndex: number;
-	status: "running" | "failed";
 	error?: string;
 	checkpoint: boolean;
 	automaticCompaction: boolean;
@@ -42,10 +48,13 @@ interface CommonState extends ImplementationSettings {
 	branchName?: string;
 }
 export interface LegacyImplementationState extends CommonState {
+	status: "running" | "failed";
 	version: 1;
 	pendingCheckpoint?: boolean;
 }
 export interface ImplementationState extends CommonState {
+	status: "running" | "failed" | "paused";
+	pause?: TaskPause;
 	version: 2;
 	phase: WorkflowPhase;
 	setup?: SetupIntent;
@@ -107,7 +116,7 @@ export function validateState(value: unknown): ImplementationState {
 	if ((s.version !== 1 && s.version !== 2) || !text(s.cwd) || !text(s.sourcePath) ||
 		!Array.isArray(s.tasks) || !s.tasks.length || !s.tasks.every((task) => record(task) && text(task.title) && text(task.prompt)) ||
 		!Number.isInteger(s.nextTaskIndex) || (s.nextTaskIndex as number) < 0 || (s.nextTaskIndex as number) > s.tasks.length ||
-		!["running", "failed"].includes(String(s.status)) || typeof s.checkpoint !== "boolean" ||
+		!((s.status === "running" || s.status === "failed") || (s.version === 2 && s.status === "paused")) || typeof s.checkpoint !== "boolean" ||
 		typeof s.automaticCompaction !== "boolean" || !Number.isInteger(s.compactionThresholdPercent) ||
 		(s.compactionThresholdPercent as number) < 1 || (s.compactionThresholdPercent as number) > 100 ||
 		!model(s.implementationModel) || !isImplementationThinkingLevel(s.implementationThinkingLevel) ||
@@ -115,6 +124,17 @@ export function validateState(value: unknown): ImplementationState {
 		(s.branchName !== undefined && !text(s.branchName)) || (s.checkpoint && !text(s.branchName)) ||
 		(s.pendingCompaction !== undefined && typeof s.pendingCompaction !== "boolean") ||
 		(s.pendingCompaction === true && !s.automaticCompaction)) invalid();
+
+	if (s.pause !== undefined) {
+		const pause = s.pause;
+		if (s.version !== 2 || s.status !== "paused" || !record(pause) ||
+			Object.keys(pause).some((key) => key !== "type" && key !== "reason") ||
+			(pause.type !== "approval_required" && pause.type !== "completion_unconfirmed") ||
+			!text(pause.reason) || pause.reason.length > MAX_PAUSE_REASON_LENGTH ||
+			/[\u0000-\u001f\u007f]/.test(pause.reason)) invalid();
+	}
+	if (s.status === "paused" && (s.phase !== "tasks" ||
+		(s.nextTaskIndex as number) >= s.tasks.length || s.pendingCheckpoint !== undefined)) invalid();
 
 	if (s.version === 1) {
 		if ((s.pendingCheckpoint !== undefined && typeof s.pendingCheckpoint !== "boolean") ||

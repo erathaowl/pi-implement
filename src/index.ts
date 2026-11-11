@@ -224,7 +224,7 @@ async function saveFailure(
 ): Promise<void> {
 	const message = error instanceof Error ? error.message : String(error);
 	state.nextTaskIndex = nextTaskIndex;
-	state.status = "failed";
+	if (state.status !== "paused") state.status = "failed";
 	state.error = message;
 	try {
 		await saveState(ctx.cwd, state);
@@ -359,7 +359,7 @@ async function executeTaskSet(
 				},
 			);
 			delete state.pendingCompaction;
-			state.status = "running";
+			if (state.status !== "paused") state.status = "running";
 			delete state.error;
 			await saveState(ctx.cwd, state);
 		} catch (error) {
@@ -369,9 +369,19 @@ async function executeTaskSet(
 	}
 
 	for (let index = state.nextTaskIndex; index < state.tasks.length; index++) {
+		try {
+			assertImplementationSettings(state, ctx, modelController);
+		} catch (error) {
+			statuses[index] = "failed";
+			update();
+			await saveFailure(ctx, commandName, state, index, error);
+			return;
+		}
 		statuses[index] = "running";
 		update();
 		state.nextTaskIndex = index;
+		// Clear pause metadata only after resume preflight, as this task starts.
+		delete state.pause;
 		state.status = "running";
 		delete state.error;
 		try {

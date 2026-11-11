@@ -249,3 +249,29 @@ test("invalid phases, setup intent, review settings/results, and pending operati
 		{ preparedTasks: { markdown: "Generated", destination: "existing", overwriteApproved: false } },
 	]) assert.throws(() => validateState({ ...state, ...overrides }), /Invalid implementation state/);
 });
+
+test("paused recovery survives a fresh process and repeated pauses without changing task or Git history", async () => {
+	await withRepository(async (cwd, state) => {
+		const git = createLocalGit(async (_command, args) => executeGit(cwd, args));
+		await startExecutionSetup(cwd, git, state);
+		state.tasks.push({ title: "Two", prompt: "Read tasks.md and implement task 2." });
+		state.nextTaskIndex = 1;
+		state.status = "paused";
+		state.pause = { type: "approval_required", reason: "User authorization is required." };
+		await saveState(cwd, state);
+		const head = runGit(cwd, ["rev-parse", "HEAD"]);
+		const raw = await readFile(join(cwd, STATE_FILE_NAME), "utf8");
+		const restarted = spawnSync(process.execPath, ["--input-type=module", "-e",
+			`import { loadState } from ${JSON.stringify(new URL("../src/state.ts", import.meta.url).href)}; console.log(JSON.stringify(await loadState(process.argv[1])));`, cwd,
+		], { encoding: "utf8" });
+		assert.equal(restarted.status, 0, restarted.stderr);
+		assert.deepEqual(JSON.parse(restarted.stdout), state);
+		assert.equal(await readFile(join(cwd, STATE_FILE_NAME), "utf8"), raw);
+		const loaded = (await loadState(cwd))!;
+		loaded.pause = { type: "completion_unconfirmed", reason: "Task completion has not been confirmed." };
+		await saveState(cwd, loaded);
+		assert.deepEqual(await loadState(cwd), { ...state, pause: loaded.pause });
+		assert.equal(runGit(cwd, ["rev-parse", "HEAD"]), head);
+		assert.equal(runGit(cwd, ["branch", "--show-current"]).trim(), state.branchName);
+	});
+});

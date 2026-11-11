@@ -3165,3 +3165,65 @@ test("active-task UI prompts show and clear waiting without submitting another t
 		await execution;
 	});
 });
+
+for (const cancelAt of ["recovery", "summary"] as const) {
+	test(`paused recovery preserves metadata when cancelled at ${cancelAt}`, async () => {
+		await withTempDir(async (directory) => {
+			const state = savedState(directory, { status: "paused", pause: { type: "approval_required", reason: "User authorization is required." } });
+			await saveState(directory, state);
+			const before = await readFile(join(directory, STATE_FILE_NAME), "utf8");
+			const runtime = fakeRuntime({ cwd: directory, choices: [cancelAt === "recovery" ? "Cancel" : "Resume"], summaryActions: ["Cancel"] });
+			await runtime.run("implement-tasks", "missing.md");
+			assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), before);
+			assert.deepEqual(runtime.sent, []);
+		});
+	});
+}
+
+test("paused resume preflight failure preserves the original unfinished task and pause", async () => {
+	await withTempDir(async (directory) => {
+		const state = savedState(directory, {
+			status: "paused", pause: { type: "approval_required", reason: "User authorization is required." },
+			implementationModel: { provider: "selected", id: "implementation-model" },
+		});
+		await saveState(directory, state);
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], models: [fakeModel("selected", "implementation-model")], setModelOutcomes: [false],
+		});
+		await runtime.run("implement-tasks", "missing.md");
+		const loaded = (await loadState(directory))!;
+		assert.equal(loaded.status, "paused");
+		assert.deepEqual(loaded.pause, state.pause);
+		assert.equal(loaded.nextTaskIndex, state.nextTaskIndex);
+		assert.deepEqual(runtime.sent, []);
+		assert.match(loaded.error!, /Cannot use implementation model/);
+	});
+});
+
+test("explicit Resume clears pause only when the saved unfinished task starts", async () => {
+	await withTempDir(async (directory) => {
+		const state = savedState(directory, {
+			status: "paused", pause: { type: "completion_unconfirmed", reason: "Task completion has not been confirmed." },
+			tasks: [{ title: "One", prompt: "Implement one" }, { title: "Two", prompt: "Implement two" }], nextTaskIndex: 1,
+		});
+		await saveState(directory, state);
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], manualTurns: true,
+			onSummary: async () => { assert.deepEqual((await loadState(directory))?.pause, state.pause); },
+			onSetModel: async () => { assert.deepEqual((await loadState(directory))?.pause, state.pause); },
+		});
+		const execution = runtime.run("implement-tasks", "missing.md");
+		await waitFor(() => runtime.sent.length === 1);
+		const started = (await loadState(directory))!;
+		assert.equal(started.status, "running");
+		assert.equal(started.pause, undefined);
+		assert.equal(started.nextTaskIndex, 1);
+		assert.deepEqual(started.tasks, state.tasks);
+		assert.deepEqual(started.implementationModel, state.implementationModel);
+		assert.equal(started.implementationThinkingLevel, state.implementationThinkingLevel);
+		assert.deepEqual(runtime.sent, ["Implement two"]);
+		await runtime.settleTurn();
+		await execution;
+		assert.equal(await loadState(directory), undefined);
+	});
+});

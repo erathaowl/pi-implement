@@ -188,3 +188,58 @@ test("invalid state is rejected", async () => {
 		await assert.rejects(loadState(directory), /Invalid implementation state/);
 	});
 });
+
+for (const type of ["approval_required", "completion_unconfirmed"] as const) {
+	test(`paused state round-trips the unfinished task and ${type} reason`, async () => {
+		await withTempDir(async (directory) => {
+			const paused: ImplementationState = {
+				...state, status: "paused", pause: { type, reason: "User action is required before continuing." },
+				tasks: [...state.tasks, { title: "Two", prompt: "Implement two" }], nextTaskIndex: 1,
+				checkpoint: true, branchName: "feature/work", automaticCompaction: true,
+				originalPlanPath: "plan.md", pendingCompaction: true,
+			};
+			await saveState(directory, paused);
+			assert.deepEqual(await loadState(directory), paused);
+			assert.deepEqual(await loadState(directory), paused);
+			assert.equal((await readdir(directory)).includes(`${STATE_FILE_NAME}.tmp`), false);
+		});
+	});
+}
+
+test("paused state permits absent pause details and a bounded reason", async () => {
+	await withTempDir(async (directory) => {
+		for (const pause of [undefined, { type: "approval_required" as const, reason: "x".repeat(500) }]) {
+			const paused: ImplementationState = { ...state, status: "paused", ...(pause ? { pause } : {}) };
+			await saveState(directory, paused);
+			assert.deepEqual(await loadState(directory), paused);
+		}
+	});
+});
+
+test("paused state rejects completed tasks, other phases, pending checkpoints and invalid metadata atomically", async () => {
+	await withTempDir(async (directory) => {
+		const paused: ImplementationState = { ...state, status: "paused", pause: { type: "approval_required", reason: "Approval required." } };
+		await saveState(directory, paused);
+		const before = await readFile(join(directory, STATE_FILE_NAME), "utf8");
+		for (const overrides of [
+			{ version: 1 }, { status: "running" }, { status: "failed" },
+			{ phase: "setup" }, { phase: "review" }, { phase: "review_checkpoint" }, { phase: "completed" },
+			{ nextTaskIndex: 1 }, { nextTaskIndex: -1 },
+			{ checkpoint: true, branchName: "main", nextTaskIndex: 1, tasks: [...state.tasks, { title: "Two", prompt: "Do two" }], pendingCheckpoint: { purpose: "task", message: "Task 1: One" } },
+			{ pause: null }, { pause: [] }, { pause: {} },
+			{ pause: { type: "other", reason: "Wait" } },
+			{ pause: { type: "approval_required" } },
+			{ pause: { type: "approval_required", reason: " " } },
+			{ pause: { type: "approval_required", reason: 42 } },
+			{ pause: { type: "approval_required", reason: "x".repeat(501) } },
+			{ pause: { type: "approval_required", reason: "Wait\nRaw tool data" } },
+			{ pause: { type: "approval_required", reason: "Wait", toolInput: { token: "must-not-be-saved" } } },
+		]) {
+			await assert.rejects(saveState(directory, { ...paused, ...overrides } as never), /Invalid implementation state/);
+			assert.equal(await readFile(join(directory, STATE_FILE_NAME), "utf8"), before);
+			assert.equal((await readdir(directory)).includes(`${STATE_FILE_NAME}.tmp`), false);
+		}
+		// A legacy state must reject the new status even without pause metadata.
+		await assert.rejects(saveState(directory, { ...state, version: 1, status: "paused" } as never), /Invalid implementation state/);
+	});
+});
