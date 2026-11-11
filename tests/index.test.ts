@@ -3138,3 +3138,30 @@ test("/implement-plan cancellation does not overwrite an existing tasks.md", asy
 		assert.deepEqual(runtime.sent, []);
 	});
 });
+
+test("active-task UI prompts show and clear waiting without submitting another task", async () => {
+	await withTempDir(async (directory) => {
+		await writeFile(join(directory, "tasks.md"), "tasks");
+		const runtime = fakeRuntime({
+			cwd: directory,
+			choices: ["Implement", "No"],
+			modelOutputs: [{ tasks: [{ title: "One" }, { title: "Two" }] }],
+			manualTurns: true,
+		});
+		const execution = runtime.run("implement-tasks", "tasks.md");
+		await waitFor(() => runtime.sent.length === 1);
+		await runtime.emit("agent_start", { type: "agent_start" });
+		await runtime.emit("ui_prompt_start", { type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm" });
+		assert.equal(runtime.workingMessages.at(-1), "Waiting for user input");
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(runtime.sent.length, 1);
+		assert.equal((await loadState(directory))?.nextTaskIndex, 0);
+		await runtime.emit("ui_prompt_end", { type: "ui_prompt_end", reason: "ui_prompt", kind: "confirm" });
+		assert.equal(runtime.workingMessages.at(-1), undefined);
+		assert.equal(runtime.sent.length, 1);
+		await runtime.settleTurn();
+		await waitFor(() => runtime.sent.length === 2);
+		await runtime.settleTurn();
+		await execution;
+	});
+});

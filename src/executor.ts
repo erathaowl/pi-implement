@@ -11,6 +11,9 @@ type AssistantTurn = {
 
 type PendingTurn = {
 	started: boolean;
+	observePrompts: boolean;
+	openPrompts: number;
+	settled?: { aborted?: boolean };
 	lastAssistant?: AssistantTurn;
 	resolve: (message: AssistantTurn) => void;
 	reject: (error: Error) => void;
@@ -60,16 +63,21 @@ function assistantText(message: AssistantTurn): string {
 export class ActiveSessionExecutor {
 	private readonly sendUserMessage: (message: string) => void;
 	private pending?: PendingTurn;
+	private readonly onWaitingForUserChange: (waiting: boolean) => void;
 
-	constructor(sendUserMessage: (message: string) => void) {
+	constructor(
+		sendUserMessage: (message: string) => void,
+		onWaitingForUserChange: (waiting: boolean) => void = () => {},
+	) {
 		this.sendUserMessage = sendUserMessage;
+		this.onWaitingForUserChange = onWaitingForUserChange;
 	}
 
-	execute = (prompt: string): Promise<void> => this.executeTurn(prompt).then(() => {});
+	execute = (prompt: string): Promise<void> => this.executeTurn(prompt, true).then(() => {});
 
 	executeTask = async (prompt: string, taskNumber: number): Promise<TaskOutcome> => {
 		if (!Number.isSafeInteger(taskNumber) || taskNumber < 1) throw new Error("Invalid task number.");
-		const message = await this.executeTurn(prompt);
+		const message = await this.executeTurn(prompt, true);
 		return parseTaskResult(assistantText(message), taskNumber);
 	};
 
@@ -80,13 +88,13 @@ export class ActiveSessionExecutor {
 		return text;
 	};
 
-	private executeTurn(prompt: string): Promise<AssistantTurn> {
+	private executeTurn(prompt: string, observePrompts = false): Promise<AssistantTurn> {
 		if (this.pending) {
 			return Promise.reject(new Error("Another implementation task is already running."));
 		}
 
 		return new Promise<AssistantTurn>((resolve, reject) => {
-			this.pending = { started: false, resolve, reject };
+			this.pending = { started: false, observePrompts, openPrompts: 0, resolve, reject };
 			try {
 				this.sendUserMessage(prompt);
 			} catch (error) {
@@ -95,6 +103,30 @@ export class ActiveSessionExecutor {
 			}
 		});
 	}
+
+	get waitingForUser(): boolean {
+		return !!this.pending?.openPrompts;
+	}
+
+	onUiPromptStart(): void {
+		const pending = this.pending;
+		if (!pending?.started || !pending.observePrompts) return;
+		if (pending.openPrompts++ === 0) this.onWaitingForUserChange(true);
+	}
+
+	onUiPromptEnd(): void {
+		const pending = this.pending;
+		if (!pending?.openPrompts) return;
+		if (--pending.openPrompts === 0) {
+			this.onWaitingForUserChange(false);
+			if (pending.settled) this.onAgentSettled(pending.settled);
+		}
+	}
+
+	// Pi 0.85.1 tool_result exposes isError and arbitrary details/text, but no
+	// permission-specific contract (even blocked calls use a plain error result).
+	// Do not infer authorization from error strings or completion order of tools:
+	// executeTask relies on the final explicit task result instead.
 
 	onAgentStart(): void {
 		if (this.pending) {
@@ -114,7 +146,14 @@ export class ActiveSessionExecutor {
 		}
 
 		const pending = this.pending;
+		if (pending.openPrompts > 0 && !event?.aborted) {
+			// A live prompt must close before a submitted task can resolve. Retain
+			// the settlement barrier without submitting another agent prompt.
+			pending.settled = event ?? {};
+			return;
+		}
 		this.pending = undefined;
+		if (pending.openPrompts > 0) this.onWaitingForUserChange(false);
 		const error = event?.aborted ? new Error("Task execution was cancelled.") : turnError(pending.lastAssistant);
 		if (error) {
 			pending.reject(error);
@@ -126,6 +165,7 @@ export class ActiveSessionExecutor {
 	cancel(message: string): void {
 		const pending = this.pending;
 		this.pending = undefined;
+		if (pending?.openPrompts) this.onWaitingForUserChange(false);
 		pending?.reject(new Error(message));
 	}
 }

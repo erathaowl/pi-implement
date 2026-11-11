@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	COMPACTION_DISABLED_CHOICE,
 	COMPACTION_ENABLED_CHOICE,
@@ -774,13 +774,27 @@ async function handleExistingState(
 
 export default function implementExtension(pi: ExtensionAPI): void {
 	let workflowRunning = false;
-	const executor = new ActiveSessionExecutor((message) => pi.sendUserMessage(message));
+	let activeContext: ExtensionContext | undefined;
+	const executor = new ActiveSessionExecutor(
+		(message) => pi.sendUserMessage(message),
+		(waiting) => {
+			if (activeContext?.hasUI) activeContext.ui.setWorkingMessage(waiting ? "Waiting for user input" : undefined);
+		},
+	);
 	const git = createLocalGit((command, args, options) => pi.exec(command, args, options));
 
-	pi.on("agent_start", () => executor.onAgentStart());
+	pi.on("agent_start", (_event, ctx) => {
+		activeContext = ctx;
+		executor.onAgentStart();
+	});
+	pi.on("ui_prompt_start", () => executor.onUiPromptStart());
+	pi.on("ui_prompt_end", () => executor.onUiPromptEnd());
 	pi.on("agent_end", (event) => executor.onAgentEnd(event.messages));
 	pi.on("agent_settled", () => executor.onAgentSettled());
-	pi.on("session_shutdown", () => executor.cancel("Task execution stopped because the session changed."));
+	pi.on("session_shutdown", () => {
+		executor.cancel("Task execution stopped because the session changed.");
+		activeContext = undefined;
+	});
 
 	const runCommand = async (
 		commandName: string,
