@@ -12,7 +12,7 @@ import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from 
 import { snapshotGeneratedTasks } from "../src/plan.ts";
 import { PREFERENCES_FILE_NAME, loadImplementationPreference, loadReviewPreference, saveImplementationPreference, saveReviewPreference } from "../src/preferences.ts";
 import { REVIEW_RESULT_START, REVIEW_RESULT_END, SOURCE_PLAN_COMPLIANCE_CHECK, type ReviewResult } from "../src/review.ts";
-import { buildTaskFilePrompt, TASK_INDEX_PROMPT } from "../src/tasks.ts";
+import { buildTaskFilePrompt, TASK_INDEX_PROMPT, TASK_RESULT_START, TASK_RESULT_END } from "../src/tasks.ts";
 
 initTheme("dark");
 
@@ -115,11 +115,17 @@ function reviewResponse(result: ReviewResult): string {
 	return `${REVIEW_RESULT_START}\n${JSON.stringify(result)}\n${REVIEW_RESULT_END}`;
 }
 
+function taskResponse(taskNumber: number, status = "completed", reason?: string): string {
+	return `${TASK_RESULT_START}\n${JSON.stringify({ status, taskNumber, ...(reason ? { reason } : {}) })}\n${TASK_RESULT_END}`;
+}
+const DEFAULT_TASK_RESPONSE = Symbol("default task completion");
+
 function fakeRuntime(options: {
 	cwd: string;
 	choices?: string[];
 	modelOutputs?: unknown[];
 	turnStopReasons?: string[];
+	taskResponses?: Array<string | undefined>;
 	gitResults?: Array<GitResult | Promise<GitResult>>;
 	gitUnavailable?: boolean;
 	inputs?: string[];
@@ -198,7 +204,8 @@ function fakeRuntime(options: {
 	const thresholdInputs = [...(options.thresholdInputs ?? [])];
 	const sessionHistory = [{ role: "user", content: "existing context" }];
 	const pendingTurnReasons: string[] = [];
-	const pendingTurnText: Array<string | undefined> = [];
+	const pendingTurnText: Array<string | undefined | typeof DEFAULT_TASK_RESPONSE> = [];
+	const taskResponses = [...(options.taskResponses ?? [])];
 
 	const emit = async (name: string, event: unknown = {}) => {
 		for (const handler of handlers.get(name) ?? []) {
@@ -207,7 +214,10 @@ function fakeRuntime(options: {
 	};
 
 	const settleTurn = async (override?: string) => {
-		const text = pendingTurnText.shift();
+		const response = pendingTurnText.shift();
+		const text = response === DEFAULT_TASK_RESPONSE
+			? taskResponse(((await loadState(options.cwd))?.nextTaskIndex ?? 0) + 1)
+			: response;
 		await options.onTurn?.(sent[sent.length - 1]);
 		const queuedStopReason = pendingTurnReasons.shift();
 		const stopReason = override ?? queuedStopReason ?? "stop";
@@ -267,7 +277,7 @@ function fakeRuntime(options: {
 			pendingTurnReasons.push(stopReasons.shift() ?? "stop");
 			pendingTurnText.push(message.startsWith("Perform one final implementation review")
 				? reviewResponses.length ? reviewResponses.shift() : reviewResponse(reviewResult(message.includes("No source plan was supplied")))
-				: undefined);
+				: taskResponses.length ? taskResponses.shift() : DEFAULT_TASK_RESPONSE);
 			if (!options.manualTurns) {
 				queueMicrotask(() => void settleTurn());
 			}
@@ -3152,7 +3162,7 @@ test("active-task UI prompts show and clear waiting without submitting another t
 		await waitFor(() => runtime.sent.length === 1);
 		await runtime.emit("agent_start", { type: "agent_start" });
 		await runtime.emit("ui_prompt_start", { type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm" });
-		assert.equal(runtime.workingMessages.at(-1), "Waiting for user input");
+		assert.equal(runtime.workingMessages.at(-1), "Waiting for user authorization");
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		assert.equal(runtime.sent.length, 1);
 		assert.equal((await loadState(directory))?.nextTaskIndex, 0);
@@ -3227,3 +3237,110 @@ test("explicit Resume clears pause only when the saved unfinished task starts", 
 		assert.equal(await loadState(directory), undefined);
 	});
 });
+
+test("progress keeps a paused task visible with an explicit label", () => {
+	const tasks = { tasks: [{ title: "One" }, { title: "Two" }, { title: "Three" }] };
+	assert.deepEqual(formatProgress("Implementation", tasks, ["completed", "paused", "pending"]), [
+		"Implementation", "Ⅱ 2/3 Two (paused)", "○ 3/3 Three",
+	]);
+});
+
+for (const command of ["implement-tasks", "implement-plan"]) {
+	for (const nextTaskIndex of [0, 2]) {
+		for (const result of ["waiting", "missing", "malformed", "wrong-task", "duplicate"] as const) {
+			test(`${command} pauses ${result} at task ${nextTaskIndex + 1} before any success side effects`, async () => {
+				await withTempDir(async (directory) => {
+					const state = savedState(directory, {
+						nextTaskIndex, checkpoint: true, branchName: "main", automaticCompaction: true,
+						review: { enabled: true, model: { provider: "test", id: "review" }, thinkingLevel: "high" },
+					});
+					await saveState(directory, state);
+					const valid = taskResponse(nextTaskIndex + 1);
+					const response = result === "waiting" ? taskResponse(nextTaskIndex + 1, "waiting_for_user", "Sensitive tool input must not be persisted")
+						: result === "missing" ? undefined
+						: result === "malformed" ? `${TASK_RESULT_START}invalid JSON${TASK_RESULT_END}`
+						: result === "wrong-task" ? taskResponse(nextTaskIndex + 2)
+						: valid + valid;
+					const runtime = fakeRuntime({
+						cwd: directory, choices: ["Resume"], models: reviewModels(), gitResults: [gitResult("main\n")],
+						taskResponses: [response], contextUsages: [{ tokens: 99, contextWindow: 100, percent: 99 }],
+					});
+					await runtime.run(command, "unused.md");
+					const paused = (await loadState(directory))!;
+					assert.equal(paused.status, "paused");
+					assert.equal(paused.phase, "tasks");
+					assert.equal(paused.nextTaskIndex, nextTaskIndex);
+					assert.equal(paused.pause?.type, result === "waiting" ? "approval_required" : "completion_unconfirmed");
+					assert.equal(paused.pendingCheckpoint, undefined);
+					assert.equal(paused.pendingCompaction, undefined);
+					assert.equal(paused.reviewStarted, undefined);
+					assert.equal(paused.reviewResult, undefined);
+					assert.equal(paused.error, undefined);
+					assert.deepEqual(paused.tasks, state.tasks);
+					assert.deepEqual(runtime.sent, [state.tasks[nextTaskIndex].prompt]);
+					assert.deepEqual(runtime.execCalls.map(({ args }) => args), [["branch", "--show-current"]]);
+					assert.equal(runtime.compactCalls.length, 0);
+					assert.equal(runtime.contextUsageCalls, 0);
+					assert.ok(!runtime.setModelCalls.some(({ id }) => id === "review"));
+					assert.ok(runtime.widgets.at(-1)?.some((line) => line.includes(`Ⅱ ${nextTaskIndex + 1}/3`) && line.includes("(paused)")));
+					assert.ok(runtime.notifications.some(({ message, type }) => type === "warning" && message.includes("explicitly resume") && message.includes(result === "waiting" ? "authorization request" : "Inspect the unfinished task")));
+					assert.ok(!runtime.notifications.some(({ message }) => message.includes("Implementation complete")));
+					assert.ok(!(await readFile(join(directory, STATE_FILE_NAME), "utf8")).includes("Sensitive tool input"));
+				});
+			});
+		}
+	}
+}
+
+test("live authorization holds checkpoint, compaction, next task and review until validated completion", async () => {
+	await withSavedReview(async (directory, state) => {
+		const runtime = fakeRuntime({
+			cwd: directory, choices: ["Resume"], models: reviewModels(), manualTurns: true,
+			contextUsages: [{ tokens: 99, contextWindow: 100, percent: 99 }, { tokens: 99, contextWindow: 100, percent: 99 }],
+			gitResults: [gitResult("main\n"), gitResult(), gitResult(), gitResult("", 1), gitResult(),
+				gitResult(), gitResult(), gitResult("", 1), gitResult(), gitResult("main\n"), gitResult(), gitResult(), gitResult()],
+		});
+		const execution = runtime.run("implement-tasks", "unused.md");
+		await waitFor(() => runtime.sent.length === 1);
+		await runtime.emit("agent_start");
+		await runtime.emit("ui_prompt_start", { type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm" });
+		assert.equal(runtime.workingMessages.at(-1), "Waiting for user authorization");
+		// Even a received settled event cannot advance while the dialog remains open.
+		await runtime.settleTurn();
+		assert.equal(runtime.sent.length, 1);
+		assert.equal((await loadState(directory))?.nextTaskIndex, state.nextTaskIndex);
+		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 0);
+		assert.equal(runtime.compactCalls.length, 0);
+		assert.ok(!runtime.setModelCalls.some(({ id }) => id === "review"));
+		await runtime.emit("ui_prompt_end", { type: "ui_prompt_end", reason: "ui_prompt", kind: "confirm" });
+		await waitFor(() => runtime.sent.length === 2);
+		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 1);
+		assert.equal(runtime.compactCalls.length, 1);
+		assert.equal((await loadState(directory))?.nextTaskIndex, 2);
+		await runtime.settleTurn();
+		await waitFor(() => runtime.sent.length === 3);
+		assert.equal(runtime.execCalls.filter(({ args }) => args[0] === "commit").length, 2);
+		assert.equal(runtime.compactCalls.length, 2);
+		assert.ok(runtime.sent[2].startsWith("Perform one final implementation review"));
+		await runtime.settleTurn();
+		await execution;
+		assert.equal(await loadState(directory), undefined);
+		assert.deepEqual(runtime.execCalls.filter(({ args }) => args[0] === "commit").map(({ args }) => args[2]), ["Task 2: Two", "Task 3: Three"]);
+	}, { phase: "tasks", nextTaskIndex: 1, checkpoint: true, branchName: "main", automaticCompaction: true });
+});
+
+for (const stopReason of ["error", "aborted", "length"]) {
+	test(`task ${stopReason} stays a failure even with a completed result`, async () => {
+		await withTempDir(async (directory) => {
+			await saveState(directory, savedState(directory));
+			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], turnStopReasons: [stopReason], taskResponses: [taskResponse(2)] });
+			await runtime.run("implement-tasks", "unused.md");
+			const failed = (await loadState(directory))!;
+			assert.equal(failed.status, "failed");
+			assert.equal(failed.nextTaskIndex, 1);
+			assert.equal(failed.pause, undefined);
+			assert.equal(runtime.sent.length, 1);
+			assert.equal(runtime.compactCalls.length, 0);
+		});
+	});
+}

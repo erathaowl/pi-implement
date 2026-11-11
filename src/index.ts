@@ -178,9 +178,13 @@ export function formatProgress(
 		running: "●",
 		completed: "✓",
 		failed: "✗",
+		paused: "Ⅱ",
 	};
 
 	let currentIndex = tasks.tasks.findIndex((_, index) => statuses[index] === "running");
+	if (currentIndex < 0) {
+		currentIndex = tasks.tasks.findIndex((_, index) => statuses[index] === "paused");
+	}
 	if (currentIndex < 0) {
 		currentIndex = tasks.tasks.findIndex((_, index) => statuses[index] === "failed");
 	}
@@ -195,7 +199,7 @@ export function formatProgress(
 		title,
 		...tasks.tasks.slice(currentIndex, currentIndex + PROGRESS_TASK_LIMIT).map((task, visibleIndex) => {
 			const index = currentIndex + visibleIndex;
-			return `${symbols[statuses[index] ?? "pending"]} ${index + 1}/${tasks.tasks.length} ${task.title}`;
+			return `${symbols[statuses[index] ?? "pending"]} ${index + 1}/${tasks.tasks.length} ${task.title}${statuses[index] === "paused" ? " (paused)" : ""}`;
 		}),
 	];
 }
@@ -285,7 +289,7 @@ async function executeReviewPhase(
 	modelController: ImplementationModelController,
 ): Promise<void> {
 	try {
-		if (state.phase !== "review" || !state.review.enabled || state.nextTaskIndex !== state.tasks.length || state.pendingCheckpoint) {
+		if (state.status === "paused" || state.phase !== "review" || !state.review.enabled || state.nextTaskIndex !== state.tasks.length || state.pendingCheckpoint) {
 			throw new Error("Cannot start final review before all tasks and task checkpoints complete.");
 		}
 		if (!state.reviewResult) {
@@ -393,7 +397,26 @@ async function executeTaskSet(
 
 		try {
 			assertImplementationSettings(state, ctx, modelController);
-			await executor.execute(state.tasks[index].prompt);
+			const outcome = await executor.executeTask(state.tasks[index].prompt, index + 1);
+			switch (outcome.status) {
+				case "completed":
+					break;
+				case "waiting_for_user":
+				case "completion_unconfirmed": {
+					state.status = "paused";
+					// Persist a non-sensitive summary rather than raw model/tool text.
+					state.pause = outcome.status === "waiting_for_user"
+						? { type: "approval_required", reason: "User authorization or action is required before continuing." }
+						: { type: "completion_unconfirmed", reason: "Task completion has not been confirmed by a valid task result." };
+					statuses[index] = "paused";
+					update();
+					await saveState(ctx.cwd, state);
+					report(ctx, commandName, `Task ${index + 1} paused: ${state.pause.reason} ${outcome.status === "waiting_for_user"
+						? "Resolve the authorization request or required user action, then explicitly resume the workflow."
+						: "Inspect the unfinished task and its applied changes, then explicitly resume the workflow."}`, "warning");
+					return;
+				}
+			}
 		} catch (error) {
 			statuses[index] = "failed";
 			update();
@@ -788,7 +811,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 	const executor = new ActiveSessionExecutor(
 		(message) => pi.sendUserMessage(message),
 		(waiting) => {
-			if (activeContext?.hasUI) activeContext.ui.setWorkingMessage(waiting ? "Waiting for user input" : undefined);
+			if (activeContext?.hasUI) activeContext.ui.setWorkingMessage(waiting ? "Waiting for user authorization" : undefined);
 		},
 	);
 	const git = createLocalGit((command, args, options) => pi.exec(command, args, options));

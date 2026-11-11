@@ -1,6 +1,6 @@
 import { parseTaskResult, type TaskOutcome } from "./tasks.ts";
 
-export type TaskStatus = "pending" | "running" | "completed" | "failed";
+export type TaskStatus = "pending" | "running" | "completed" | "failed" | "paused";
 
 type AssistantTurn = {
 	role?: unknown;
