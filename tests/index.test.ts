@@ -12,7 +12,7 @@ import { STATE_FILE_NAME, loadState, saveState, type ImplementationState } from 
 import { snapshotGeneratedTasks } from "../src/plan.ts";
 import { PREFERENCES_FILE_NAME, loadImplementationPreference, loadReviewPreference, saveImplementationPreference, saveReviewPreference } from "../src/preferences.ts";
 import { REVIEW_RESULT_START, REVIEW_RESULT_END, SOURCE_PLAN_COMPLIANCE_CHECK, type ReviewResult } from "../src/review.ts";
-import { TASK_INDEX_PROMPT } from "../src/tasks.ts";
+import { buildTaskFilePrompt, TASK_INDEX_PROMPT } from "../src/tasks.ts";
 
 initTheme("dark");
 
@@ -1921,7 +1921,7 @@ test("workflow state is saved before each task, advances without Git, and is del
 		assert.equal(started?.status, "running");
 		assert.equal(started?.nextTaskIndex, 0);
 		assert.deepEqual(started?.tasks.map(({ title }) => title), ["One", "Two"]);
-		assert.deepEqual(started?.tasks.map(({ prompt }) => prompt), [runtime.sent[0], runtime.sent[0].replace("#1 (\"One\")", "#2 (\"Two\")")]);
+		assert.deepEqual(started?.tasks.map(({ prompt }) => prompt), [buildTaskFilePrompt("tasks.md", 1, { title: "One" }), buildTaskFilePrompt("tasks.md", 2, { title: "Two" })]);
 
 		await runtime.settleTurn();
 		await waitFor(() => runtime.sent.length === 2);

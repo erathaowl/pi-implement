@@ -92,3 +92,66 @@ test("active-session executor rejects overlapping prompts", async () => {
 	executor.cancel("cancelled");
 	await assert.rejects(first, /cancelled/);
 });
+
+const completion = '<<<PI_IMPLEMENT_TASK_RESULT>>>\n{"status":"completed","taskNumber":1}\n<<<END_PI_IMPLEMENT_TASK_RESULT>>>';
+const assistant = (text: string, stopReason = "stop") => ({ role: "assistant", stopReason, content: [{ type: "text", text }] });
+
+test("executeTask waits for settlement and validates the final assistant result only", async () => {
+	const executor = new ActiveSessionExecutor(() => {});
+	let resolved = false;
+	const execution = executor.executeTask("task", 1).then((result) => { resolved = true; return result; });
+	executor.onAgentStart();
+	executor.onAgentEnd([assistant(completion)]);
+	await tick();
+	assert.equal(resolved, false);
+	executor.onAgentSettled();
+	assert.deepEqual(await execution, { status: "completed", taskNumber: 1 });
+});
+
+test("executeTask does not accept bare stops, earlier reports, or tool output as completion", async () => {
+	for (const messages of [
+		[{ role: "assistant", stopReason: "stop" }],
+		[assistant(completion), assistant("Please authorize the tool.")],
+		[assistant(""), { role: "toolResult", content: [{ type: "text", text: completion }] }],
+		[assistant(completion.replace('"taskNumber":1', '"taskNumber":2'))],
+		[assistant("<<<PI_IMPLEMENT_TASK_RESULT>>>bad JSON<<<END_PI_IMPLEMENT_TASK_RESULT>>>")],
+	]) {
+		const executor = new ActiveSessionExecutor(() => {});
+		const execution = executor.executeTask("task", 1);
+		executor.onAgentStart();
+		executor.onAgentEnd([assistant(completion)]);
+		executor.onAgentEnd(messages);
+		executor.onAgentSettled();
+		assert.equal((await execution).status, "completion_unconfirmed");
+	}
+});
+
+test("executeTask returns a waiting outcome without claiming success", async () => {
+	const executor = new ActiveSessionExecutor(() => {});
+	const execution = executor.executeTask("task", 1);
+	executor.onAgentStart();
+	executor.onAgentEnd([assistant(completion.replace('"completed"', '"waiting_for_user"'))]);
+	executor.onAgentSettled();
+	assert.deepEqual(await execution, { status: "waiting_for_user", taskNumber: 1 });
+});
+
+test("executeTask rejects unsuccessful lifecycle outcomes even with a completion block", async () => {
+	for (const stopReason of ["error", "length", "aborted", "toolUse", "stop"]) {
+		const executor = new ActiveSessionExecutor(() => {});
+		const execution = executor.executeTask("task", 1);
+		executor.onAgentStart();
+		executor.onAgentEnd([assistant(completion, stopReason)]);
+		executor.onAgentSettled({ aborted: stopReason === "stop" });
+		await assert.rejects(execution);
+	}
+});
+
+test("executeTask preserves overlap guards, cancellation, and validates task numbers", async () => {
+	const executor = new ActiveSessionExecutor(() => {});
+	await assert.rejects(executor.executeTask("task", 0), /Invalid task number/);
+	const execution = executor.executeTask("task", 1);
+	await assert.rejects(executor.executeForText("review"), /already running/);
+	await assert.rejects(executor.executeTask("task", 2), /already running/);
+	executor.cancel("Session shut down");
+	await assert.rejects(execution, /Session shut down/);
+});

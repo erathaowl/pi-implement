@@ -1,3 +1,5 @@
+import { parseTaskResult, type TaskOutcome } from "./tasks.ts";
+
 export type TaskStatus = "pending" | "running" | "completed" | "failed";
 
 type AssistantTurn = {
@@ -48,6 +50,12 @@ function turnError(message: AssistantTurn | undefined): Error | undefined {
 	return new Error(detail || `Task execution failed (${stopReason}).`);
 }
 
+function assistantText(message: AssistantTurn): string {
+	return Array.isArray(message.content) ? message.content
+		.filter((block) => typeof block === "object" && block !== null && block.type === "text" && typeof block.text === "string")
+		.map((block) => block.text as string).join("\n").trim() : "";
+}
+
 /** Waits for the complete active pi agent lifecycle for one submitted prompt. */
 export class ActiveSessionExecutor {
 	private readonly sendUserMessage: (message: string) => void;
@@ -59,11 +67,15 @@ export class ActiveSessionExecutor {
 
 	execute = (prompt: string): Promise<void> => this.executeTurn(prompt).then(() => {});
 
+	executeTask = async (prompt: string, taskNumber: number): Promise<TaskOutcome> => {
+		if (!Number.isSafeInteger(taskNumber) || taskNumber < 1) throw new Error("Invalid task number.");
+		const message = await this.executeTurn(prompt);
+		return parseTaskResult(assistantText(message), taskNumber);
+	};
+
 	executeForText = async (prompt: string): Promise<string> => {
 		const message = await this.executeTurn(prompt);
-		const text = Array.isArray(message.content) ? message.content
-			.filter((block) => typeof block === "object" && block !== null && block.type === "text" && typeof block.text === "string")
-			.map((block) => block.text as string).join("\n").trim() : "";
+		const text = assistantText(message);
 		if (!text) throw new Error("Agent turn ended without final assistant text.");
 		return text;
 	};
@@ -96,14 +108,14 @@ export class ActiveSessionExecutor {
 		}
 	}
 
-	onAgentSettled(): void {
+	onAgentSettled(event?: { aborted?: boolean }): void {
 		if (!this.pending?.started) {
 			return;
 		}
 
 		const pending = this.pending;
 		this.pending = undefined;
-		const error = turnError(pending.lastAssistant);
+		const error = event?.aborted ? new Error("Task execution was cancelled.") : turnError(pending.lastAssistant);
 		if (error) {
 			pending.reject(error);
 		} else {
