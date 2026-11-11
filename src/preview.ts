@@ -5,6 +5,7 @@ import type { ImplementationSettings } from "./model.ts";
 type TaskList = { tasks: readonly { title: string }[] };
 
 export type ExecutionSummary = ImplementationSettings & {
+	pausedTask?: { taskNumber: number; reason: string };
 	command: "/implement-tasks" | "/implement-plan";
 	cwd: string;
 	sourcePlanPath: string | null;
@@ -28,6 +29,7 @@ export type ExecutionSummary = ImplementationSettings & {
 export function formatExecutionSummary(summary: ExecutionSummary): string {
 	const lines = [
 		"Execution summary",
+		...(summary.pausedTask ? [`Paused task ${summary.pausedTask.taskNumber}: ${summary.pausedTask.reason}`] : []),
 		`Command: ${summary.command}`,
 		`Working directory: ${summary.cwd}`,
 		`Source plan: ${summary.sourcePlanPath ?? "None"}`,

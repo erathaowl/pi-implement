@@ -42,7 +42,7 @@ import {
 } from "./state.ts";
 import { saveImplementationPreference, saveReviewPreference, selectPreferredImplementationSettings, selectPreferredReviewSettings } from "./preferences.ts";
 import { executeReview, formatReviewResult } from "./review.ts";
-import { buildTaskFilePrompt, indexTaskFile } from "./tasks.ts";
+import { buildTaskFilePrompt, buildTaskContinuationPrompt, indexTaskFile } from "./tasks.ts";
 import { confirmExecutionSummary, selectTaskAction } from "./preview.ts";
 export { formatPreview } from "./preview.ts";
 
@@ -383,6 +383,9 @@ async function executeTaskSet(
 		}
 		statuses[index] = "running";
 		update();
+		const prompt = state.status === "paused"
+			? buildTaskContinuationPrompt(state.sourcePath, index + 1, state.tasks[index])
+			: state.tasks[index].prompt;
 		state.nextTaskIndex = index;
 		// Clear pause metadata only after resume preflight, as this task starts.
 		delete state.pause;
@@ -397,7 +400,7 @@ async function executeTaskSet(
 
 		try {
 			assertImplementationSettings(state, ctx, modelController);
-			const outcome = await executor.executeTask(state.tasks[index].prompt, index + 1);
+			const outcome = await executor.executeTask(prompt, index + 1);
 			switch (outcome.status) {
 				case "completed":
 					break;
@@ -701,6 +704,7 @@ function formatRestorePrompt(state: ImplementationState): string {
 	const taskNumber = Math.min(state.nextTaskIndex + 1, state.tasks.length);
 	const lines = [
 		"Unfinished implementation found",
+		...(state.status === "paused" ? [`Paused task ${taskNumber}: ${state.pause?.reason ?? "No pause reason was recorded."}`] : []),
 		`Workflow: ${state.preparedTasks ? "/implement-plan" : "/implement-tasks"}`,
 		`Source plan: ${state.originalPlanPath ?? "None"}`,
 		`Task file: ${state.sourcePath}`,
@@ -748,6 +752,10 @@ async function handleExistingState(
 
 	if (!await confirmExecutionSummary({
 		...state,
+		pausedTask: state.status === "paused" ? {
+			taskNumber: state.nextTaskIndex + 1,
+			reason: state.pause?.reason ?? "No pause reason was recorded.",
+		} : undefined,
 		command: state.preparedTasks ? "/implement-plan" : "/implement-tasks",
 		sourcePlanPath: state.originalPlanPath ?? null,
 		taskCount: state.tasks.length,
@@ -842,7 +850,7 @@ export default function implementExtension(pi: ExtensionAPI): void {
 			report(ctx, commandName, "An implementation workflow is already running.", "warning");
 			return;
 		}
-		if (!ctx.isIdle()) {
+		if (!ctx.isIdle() || executor.waitingForUser) {
 			report(ctx, commandName, `Wait for the current agent turn to finish before using ${commandName}.`, "warning");
 			return;
 		}

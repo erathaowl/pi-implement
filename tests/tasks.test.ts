@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	buildTaskFilePrompt,
+	buildTaskContinuationPrompt,
 	parseTaskResult, TASK_RESULT_START, TASK_RESULT_END,
 	indexTaskFile,
 	TASK_INDEX_PROMPT,
@@ -119,4 +120,22 @@ test("task result rejects missing, malformed, duplicate, contradictory and wrong
 			{ status: "waiting_for_user", taskNumber: 2, reason: "x".repeat(501) },
 		].map(resultBlock),
 	]) assert.equal(parseTaskResult(text, 2).status, "completion_unconfirmed", text);
+});
+
+
+test("continuation references the saved task and requires inspection instead of repeated side effects", () => {
+	const prompt = buildTaskContinuationPrompt("saved task files/tasks.md", 2, { title: "Finish API" });
+	assert.match(prompt, /Resume the unfinished task #2/);
+	assert.match(prompt, /Read "saved task files\/tasks.md" and implement task #2/);
+	assert.match(prompt, /Inspect already applied changes and existing verification results/);
+	assert.match(prompt, /Finish only the outstanding work/);
+	assert.match(prompt, /avoid repeating completed side effects/);
+	assert.match(prompt, /Resume confirmation is not authorization/);
+	assert.match(prompt, /Do not bypass permission rules/);
+	assert.match(prompt, /automatically retry denied actions/);
+	assert.match(prompt, /report waiting_for_user and stop/);
+	assert.ok(prompt.endsWith(buildTaskFilePrompt("saved task files/tasks.md", 2, { title: "Finish API" })));
+	assert.equal(prompt.split(TASK_RESULT_START).length, 2);
+	assert.equal(prompt.split(TASK_RESULT_END).length, 2);
+	assert.match(prompt, /"taskNumber":2/);
 });

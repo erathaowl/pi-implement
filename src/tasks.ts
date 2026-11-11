@@ -119,3 +119,14 @@ with taskNumber ${taskNumber} and an optional short reason (1–500 characters) 
 The JSON must contain only status, taskNumber, and (only when waiting) reason; do not emit duplicate keys or result blocks.
 Never report completed while blocked or awaiting authorization.`;
 }
+
+export function buildTaskContinuationPrompt(sourcePath: string, taskNumber: number, task: TaskReference): string {
+	return `Resume the unfinished task #${taskNumber} from the saved task file.
+Inspect already applied changes and existing verification results before making further changes.
+Finish only the outstanding work; preserve prior changes and avoid repeating completed side effects.
+Resume confirmation is not authorization for a blocked operation. Do not bypass permission rules,
+automatically retry denied actions, or assume that an earlier authorization request was approved.
+If authorization is still refused or required, report waiting_for_user and stop for explicit user action.
+
+${buildTaskFilePrompt(sourcePath, taskNumber, task)}`;
+}

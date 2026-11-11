@@ -3,6 +3,8 @@ import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
+import { ActiveSessionExecutor } from "../src/executor.ts";
+import { buildTaskContinuationPrompt, TASK_RESULT_START, TASK_RESULT_END } from "../src/tasks.ts";
 import { completeCheckpoint } from "../src/checkpoint.ts";
 import { snapshotFile } from "../src/files.ts";
 import { createLocalGit } from "../src/git.ts";
@@ -273,5 +275,55 @@ test("paused recovery survives a fresh process and repeated pauses without chang
 		assert.deepEqual(await loadState(cwd), { ...state, pause: loaded.pause });
 		assert.equal(runGit(cwd, ["rev-parse", "HEAD"]), head);
 		assert.equal(runGit(cwd, ["branch", "--show-current"]).trim(), state.branchName);
+	});
+});
+
+test("restarted paused task retains partial changes and creates its checkpoint exactly once after completion", async () => {
+	await withRepository(async (cwd, state) => {
+		const git = createLocalGit(async (_command, args) => executeGit(cwd, args));
+		await startExecutionSetup(cwd, git, state);
+		state.tasks.push({ title: "Two", prompt: "Read tasks.md and implement task 2." });
+		state.nextTaskIndex = 1;
+		state.status = "paused";
+		state.pause = { type: "approval_required", reason: "User authorization is required." };
+		await writeFile(join(cwd, "tracked.txt"), "Partial task 2 work\n");
+		await saveState(cwd, state);
+		const head = runGit(cwd, ["rev-parse", "HEAD"]).trim();
+		const restarted = spawnSync(process.execPath, ["--input-type=module", "-e",
+			`import { loadState } from ${JSON.stringify(new URL("../src/state.ts", import.meta.url).href)};
+			import { buildTaskContinuationPrompt } from ${JSON.stringify(new URL("../src/tasks.ts", import.meta.url).href)};
+			const state = await loadState(process.argv[1]);
+			console.log(JSON.stringify(buildTaskContinuationPrompt(state.sourcePath, state.nextTaskIndex + 1, state.tasks[state.nextTaskIndex])));`, cwd,
+		], { encoding: "utf8" });
+		assert.equal(restarted.status, 0, restarted.stderr);
+		const prompt = JSON.parse(restarted.stdout);
+		assert.equal(prompt, buildTaskContinuationPrompt(state.sourcePath, 2, state.tasks[1]));
+		assert.match(prompt, /Inspect already applied changes/);
+		const loaded = (await loadState(cwd))!;
+		const sent: string[] = [];
+		const executor = new ActiveSessionExecutor((message) => { sent.push(message); });
+		loaded.status = "running";
+		delete loaded.pause;
+		await saveState(cwd, loaded);
+		const execution = executor.executeTask(prompt, loaded.nextTaskIndex + 1);
+		executor.onAgentStart();
+		assert.equal(runGit(cwd, ["rev-parse", "HEAD"]).trim(), head);
+		assert.equal(await readFile(join(cwd, "tracked.txt"), "utf8"), "Partial task 2 work\n");
+		executor.onAgentEnd([{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: `${TASK_RESULT_START}\n{"status":"completed","taskNumber":2}\n${TASK_RESULT_END}` }] }]);
+		executor.onAgentSettled();
+		assert.equal((await execution).status, "completed");
+		assert.equal((await loadState(cwd))?.nextTaskIndex, 1);
+		loaded.nextTaskIndex = 2;
+		loaded.pendingCheckpoint = { purpose: "task", message: "Task 2: Two" };
+		await saveState(cwd, loaded);
+		await completeCheckpoint(cwd, git, loaded);
+		await completeCheckpoint(cwd, git, (await loadState(cwd))!);
+		assert.deepEqual(sent, [prompt]);
+		assert.equal(runGit(cwd, ["log", "-1", "--format=%P"]).trim(), head);
+		assert.equal(runGit(cwd, ["log", "-1", "--format=%s"]).trim(), "Task 2: Two");
+		assert.equal(runGit(cwd, ["rev-list", "--count", "HEAD"]).trim(), "3");
+		assert.equal(runGit(cwd, ["show", "HEAD:tracked.txt"]), "Partial task 2 work\n");
+		assert.equal((await loadState(cwd))?.nextTaskIndex, 2);
+		assert.ok(!runGit(cwd, ["ls-tree", "-r", "--name-only", "HEAD"]).includes(STATE_FILE_NAME));
 	});
 });
