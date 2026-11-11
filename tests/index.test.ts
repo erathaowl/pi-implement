@@ -3439,3 +3439,63 @@ test("paused recovery without recorded details displays a fallback reason and st
 		assert.equal((await loadState(directory))?.nextTaskIndex, 2);
 	});
 });
+
+for (const command of ["implement-tasks", "implement-plan"]) {
+	test(`${command} session shutdown during approval preserves the unfinished task as failed`, async () => {
+		await withTempDir(async (directory) => {
+			const state = savedState(directory, {
+				checkpoint: true, branchName: "main", automaticCompaction: true,
+				review: { enabled: true, model: { provider: "test", id: "review" }, thinkingLevel: "high" },
+			});
+			await saveState(directory, state);
+			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], manualTurns: true, models: reviewModels(), gitResults: [gitResult("main\n")] });
+			const execution = runtime.run(command, "unused.md");
+			await waitFor(() => runtime.sent.length === 1);
+			await runtime.emit("agent_start");
+			await runtime.emit("ui_prompt_start", { type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm" });
+			assert.equal(runtime.workingMessages.at(-1), "Waiting for user authorization");
+			await runtime.emit("session_shutdown");
+			await execution;
+			const stopped = (await loadState(directory))!;
+			assert.equal(stopped.status, "failed");
+			assert.equal(stopped.phase, "tasks");
+			assert.equal(stopped.nextTaskIndex, state.nextTaskIndex);
+			assert.equal(stopped.pause, undefined);
+			assert.match(stopped.error!, /session changed/);
+			assert.equal(stopped.pendingCheckpoint, undefined);
+			assert.equal(runtime.compactCalls.length, 0);
+			assert.deepEqual(runtime.execCalls.map(({ args }) => args), [["branch", "--show-current"]]);
+			assert.equal(runtime.sent.length, 1);
+			assert.equal(runtime.workingMessages.at(-1), undefined);
+			// Late prompt closure/completion cannot resurrect the cancelled workflow.
+			await runtime.emit("ui_prompt_end");
+			await runtime.settleTurn();
+			assert.equal(runtime.sent.length, 1);
+			assert.equal((await loadState(directory))?.status, "failed");
+		});
+	});
+}
+
+for (const reverse of [false, true]) {
+	test(`arbitrary tool result details do not override the final task result (reverse: ${reverse})`, async () => {
+		await withTempDir(async (directory) => {
+			await saveState(directory, savedState(directory, { nextTaskIndex: 2 }));
+			const runtime = fakeRuntime({ cwd: directory, choices: ["Resume"], manualTurns: true });
+			const execution = runtime.run("implement-tasks", "unused.md");
+			await waitFor(() => runtime.sent.length === 1);
+			await runtime.emit("agent_start");
+			const results = [
+				{ toolCallId: "a", toolName: "bash", isError: true, content: [{ type: "text", text: "Permission denied" }], details: {} },
+				{ toolCallId: "b", toolName: "custom", isError: true, content: [], details: { permission: "denied", blocked: true } },
+				{ toolCallId: "c", toolName: "read", isError: false, content: [{ type: "text", text: taskResponse(99) }], details: {} },
+			];
+			for (const result of reverse ? results.reverse() : results) await runtime.emit("tool_result", { type: "tool_result", ...result });
+			assert.ok(!runtime.workingMessages.includes("Waiting for user authorization"));
+			assert.equal((await loadState(directory))?.nextTaskIndex, 2);
+			await runtime.settleTurn();
+			await execution;
+			assert.equal(await loadState(directory), undefined);
+			assert.equal(runtime.sent.length, 1);
+		});
+	});
+}

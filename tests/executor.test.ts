@@ -51,18 +51,18 @@ test("text execution extracts only the settled final assistant text blocks", asy
 });
 
 for (const content of [undefined, [], [{ type: "thinking", thinking: "No final answer" }], [{ type: "text", text: " " }]]) {
-	test("text execution rejects a successful stop without final text while task execution remains compatible", async () => {
+	test("text execution rejects missing final text and task execution leaves completion unconfirmed", async () => {
 		const executor = new ActiveSessionExecutor(() => {});
 		const execution = executor.executeForText("review one");
 		executor.onAgentStart();
 		executor.onAgentEnd([{ role: "assistant", stopReason: "stop", content }]);
 		executor.onAgentSettled();
 		await assert.rejects(execution, /without final assistant text/);
-		const task = executor.execute("implement one");
+		const task = executor.executeTask("implement one", 1);
 		executor.onAgentStart();
 		executor.onAgentEnd([{ role: "assistant", stopReason: "stop", content }]);
 		executor.onAgentSettled();
-		assert.equal(await task, undefined);
+		assert.equal((await task).status, "completion_unconfirmed");
 	});
 }
 
@@ -269,5 +269,49 @@ test("unstructured tool errors and permission wording do not invent an authoriza
 		assert.equal(executor.waitingForUser, false);
 		executor.onAgentSettled();
 		assert.equal((await task).status, "completed");
+	}
+});
+
+test("installed Pi permission gate emits paired prompt events and holds the active task", async () => {
+	const { fileURLToPath } = await import("node:url");
+	const { ExtensionRunner, SessionManager, createEventBus } = await import("@earendil-works/pi-coding-agent");
+	const sdkEntry = import.meta.resolve("@earendil-works/pi-coding-agent");
+	const { loadExtensions, loadExtensionFromFactory } = await import(new URL("./core/extensions/loader.js", sdkEntry).href);
+	const gatePath = fileURLToPath(new URL("../examples/extensions/permission-gate.ts", sdkEntry));
+	for (const choice of ["Yes", "No", undefined]) {
+		const loaded = await loadExtensions([gatePath], process.cwd());
+		assert.deepEqual(loaded.errors, []);
+		const executor = new ActiveSessionExecutor(() => {});
+		const events: string[] = [];
+		const observer = await loadExtensionFromFactory((pi: any) => {
+			pi.on("ui_prompt_start", () => { events.push("start"); executor.onUiPromptStart(); });
+			pi.on("ui_prompt_end", () => { events.push("end"); executor.onUiPromptEnd(); });
+		}, process.cwd(), createEventBus(), loaded.runtime);
+		const runner = new ExtensionRunner([...loaded.extensions, observer], loaded.runtime, process.cwd(), SessionManager.inMemory(), {} as never);
+		const errors: unknown[] = [];
+		runner.onError((error: unknown) => { errors.push(error); });
+		let answer!: (value: string | undefined) => void;
+		runner.setUIContext({ select: () => new Promise((resolve) => { answer = resolve; }) } as never, "rpc");
+		let resolved = false;
+		const task = executor.executeTask("implement one", 1).then((outcome) => { resolved = true; return outcome; });
+		executor.onAgentStart();
+		// This invokes the actual installed gate, but never executes a shell command.
+		const gate = runner.emitToolCall({ type: "tool_call", toolName: "bash", toolCallId: "permission-test", input: { command: "sudo --version" } });
+		await tick();
+		assert.deepEqual(events, ["start"]);
+		assert.equal(executor.waitingForUser, true);
+		await tick(); // Deferred approval must leave the same turn alive.
+		assert.equal(resolved, false);
+		answer(choice);
+		const decision = await gate;
+		await tick();
+		assert.deepEqual(events, ["start", "end"]);
+		assert.equal(executor.waitingForUser, false);
+		assert.equal(resolved, false);
+		assert.equal(decision?.block === true, choice !== "Yes");
+		executor.onAgentEnd([assistant(choice === "Yes" ? completion : completion.replace('"completed"', '"waiting_for_user"'))]);
+		executor.onAgentSettled();
+		assert.equal((await task).status, choice === "Yes" ? "completed" : "waiting_for_user");
+		assert.deepEqual(errors, []);
 	}
 });
